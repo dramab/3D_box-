@@ -1,0 +1,5 @@
+.agentes/
+.codex/
+data/
+__pycache__/
+outputs/
