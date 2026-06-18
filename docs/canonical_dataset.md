@@ -86,6 +86,44 @@ python tools/convert_hope_to_canonical.py \
     --max-frames 5
 ```
 
+## DOPose 转换
+
+```bash
+python tools/convert_dopose_to_canonical.py \
+    --root-dir /data/jiajun.xie/Spatial-Affordance/data/dopose \
+    --output-dir /data/jiajun.xie/3D_Box/data/dopose \
+    --point-cloud-stride 4
+```
+
+DOPose 转换会读取 `test_bin/` 和 `test_table/` 下的 BOP 风格场景。深度图按 `scene_camera.json` 中的 `depth_scale` 从 mm 转为 cm；物体位姿从 `scene_gt.json` 的 object->camera 转为 object->world；相机外参优先使用 `scene_transformations.json` 中的 `zivid_optical_frame -> scene_link`，缺失时退回相机坐标系。由于 `scene_link` 不保证以支撑面法向为 world-Z，转换时会先在 raw `scene_link`/world 中由深度图反投影生成点云，再用 RANSAC 拟合支撑面；随后将该支撑面法向对齐到 canonical world-Z，并对相机外参、物体位姿和点云同时施加该变换。支撑面拟合失败时该帧会直接转换失败，不再回退到物体 OBB 多数共识；每个 sample 的 `preprocess.coordinate_normalization` 会记录支撑面法向、inlier 数、残差、旋转角度和 z 平移等统计。
+
+支撑面拟合相关参数可用于调试：
+
+```bash
+python tools/convert_dopose_to_canonical.py \
+    --root-dir /data/jiajun.xie/Spatial-Affordance/data/dopose \
+    --output-dir /data/jiajun.xie/3D_Box/data/dopose \
+    --point-cloud-stride 4 \
+    --support-plane-distance-thresh-cm 1.0 \
+    --support-plane-ransac-iters 512 \
+    --support-plane-min-inliers 500 \
+    --support-plane-min-inlier-ratio 0.03 \
+    --support-plane-max-points 50000
+```
+
+## YCBV 转换
+
+```bash
+python tools/convert_ycbv_to_canonical.py \
+    --root-dir /data/wenhao.hai/ycb_video/ycbv_test_all/test \
+    --model-dir /data/wenhao.hai/ycb_video/ycbv_models/models \
+    --output-dir /data/jiajun.xie/3D_Box/data/ycbv \
+    --frame-step 5 \
+    --point-cloud-stride 4
+```
+
+YCBV 转换会读取 test 目录下的 BOP 风格场景。`--frame-step` 按帧 ID 取模采样，语义与 HOPE 转换一致。深度图按 `scene_camera.json` 中的 `depth_scale` 从 mm 转为 cm；相机外参由 `cam_R_w2c/cam_t_w2c` 求逆得到 camera->world；物体位姿从 `scene_gt.json` 的 object->camera 转为 object->world。只做调试时可以加 `--max-frames 2`。
+
 ## RGB 3D Box 投影检查
 
 导出指定帧中所有物体 3D box 在 RGB 图像上的投影：
@@ -109,3 +147,5 @@ python tools/export_canonical_rgb_bbox_vis.py \
 ```text
 data/canonical/hope/rgb_bbox_vis/
 ```
+
+> Omni6DPose 转换会在转换每帧时自动生成同名投影图到输出目录的 `rgb_bbox_vis/`，无需再单独运行此工具；被跳过的帧（pose 与 mask 横向偏差超阈值等）不会生成。

@@ -84,6 +84,17 @@ def _object_bbox_world_corners(objects: list) -> np.ndarray:
     return np.vstack(all_corners)
 
 
+def _object_obb_voxel_mask(objects: list, vp: dict, grid_shape: tuple[int, int, int]) -> np.ndarray:
+    """构建所有场景物体 OBB 的占用 mask，用于排除实体内部支撑面候选。"""
+    mask = np.zeros(tuple(grid_shape), dtype=bool)
+    grid_shape_arr = np.asarray(grid_shape, dtype=int)
+    for obj in objects:
+        voxels = voxelize_obb(obj.bbox3d_canonical, obj.pose_world, vp, grid_shape_arr)
+        if len(voxels) > 0:
+            mask[voxels[:, 0], voxels[:, 1], voxels[:, 2]] = True
+    return mask
+
+
 def _compute_placed_transform(
     anchor_xy: np.ndarray,
     landing_z: int,
@@ -189,6 +200,7 @@ class FreeBBoxPipeline:
         )
         vp = make_voxel_params(grid_min, voxel_size)
         grid_base = prepare_grid_base(grid_scene, scene.objects, vp)
+        entity_voxel_mask = _object_obb_voxel_mask(scene.objects, vp, grid_base.shape)
         frame_support_mask = np.zeros(grid_scene.shape, dtype=bool)
 
         camera = scene.camera
@@ -250,6 +262,7 @@ class FreeBBoxPipeline:
                 min_area=cfg.min_surface_area,
                 points_world=voxel_points,
                 target_voxels=target_voxels,
+                exclude_voxel_mask=entity_voxel_mask,
             )
             if table_z is None or surface_mask is None:
                 all_results[obj.obj_id] = FreeBBoxResult(

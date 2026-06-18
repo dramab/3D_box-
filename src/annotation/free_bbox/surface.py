@@ -46,6 +46,27 @@ def _make_surface_voxels(surface_mask_2d: np.ndarray, surface_z: int) -> np.ndar
     ).astype(np.float64)
 
 
+def _remove_excluded_surface_voxels(
+    surface_mask_2d: np.ndarray,
+    surface_z: int,
+    exclude_voxel_mask: np.ndarray | None,
+    min_voxels: int,
+) -> list:
+    """扣除实体 OBB 内的支撑面体素，并重新提取有效连通域。"""
+    if exclude_voxel_mask is None:
+        return [(int(surface_mask_2d.sum()), surface_mask_2d)]
+
+    z = int(surface_z)
+    if z < 0 or z >= exclude_voxel_mask.shape[2]:
+        return [(int(surface_mask_2d.sum()), surface_mask_2d)]
+
+    surface_mask = np.asarray(surface_mask_2d, dtype=bool)
+    filtered_mask = surface_mask & ~exclude_voxel_mask[:, :, z]
+    if not np.any(filtered_mask):
+        return []
+    return _extract_components(filtered_mask, min_voxels, apply_opening=False)
+
+
 def _build_target_tree(target_voxels: np.ndarray | None) -> cKDTree | None:
     """为目标物体体素构建最近邻查询树。"""
     if target_voxels is None:
@@ -129,6 +150,7 @@ def _detect_support_surfaces_from_grid(
     grid: np.ndarray,
     min_voxels: int,
     target_voxels: np.ndarray | None = None,
+    exclude_voxel_mask: np.ndarray | None = None,
 ) -> tuple[int | None, np.ndarray | None]:
     """在占据栅格中逐层搜索支撑面。"""
     occ = grid == OCCUPIED
@@ -140,16 +162,23 @@ def _detect_support_surfaces_from_grid(
     for z in active_zs:
         components = _extract_components(occ[:, :, z], min_voxels, apply_opening=True)
         for area, component in components:
-            distance = _surface_distance_to_object(component, int(z), target_tree)
-            candidate = _make_surface_candidate(
-                int(z),
+            filtered_components = _remove_excluded_surface_voxels(
                 component,
-                area,
-                quality=float(area),
-                distance=distance,
+                int(z),
+                exclude_voxel_mask,
+                min_voxels,
             )
-            if _is_better_surface_candidate(candidate, best_candidate, use_distance):
-                best_candidate = candidate
+            for filtered_area, filtered_component in filtered_components:
+                distance = _surface_distance_to_object(filtered_component, int(z), target_tree)
+                candidate = _make_surface_candidate(
+                    int(z),
+                    filtered_component,
+                    filtered_area,
+                    quality=float(filtered_area),
+                    distance=distance,
+                )
+                if _is_better_surface_candidate(candidate, best_candidate, use_distance):
+                    best_candidate = candidate
 
     if best_candidate is None:
         return None, None
@@ -193,6 +222,7 @@ def _detect_support_surfaces_from_pointcloud(
     normal_z_min: float = 0.9848,
     random_seed: int = 0,
     target_voxels: np.ndarray | None = None,
+    exclude_voxel_mask: np.ndarray | None = None,
 ) -> tuple[int | None, np.ndarray | None]:
     """在体素点云中用 RANSAC 检测近似水平平面。"""
     points = np.asarray(points_world, dtype=np.float64)
@@ -259,17 +289,24 @@ def _detect_support_surfaces_from_pointcloud(
 
         z_spread = float(np.std(plane_points[:, 2])) if len(plane_points) > 1 else 0.0
         for area, surface_mask in surface_components:
-            distance = _surface_distance_to_object(surface_mask, table_z, target_tree)
-            quality = float(area) - z_spread / max(voxel_size, 1e-6)
-            candidate = _make_surface_candidate(
-                table_z,
+            filtered_components = _remove_excluded_surface_voxels(
                 surface_mask,
-                area,
-                quality=quality,
-                distance=distance,
+                table_z,
+                exclude_voxel_mask,
+                min_voxels,
             )
-            if _is_better_surface_candidate(candidate, best_candidate, use_distance):
-                best_candidate = candidate
+            for filtered_area, filtered_surface_mask in filtered_components:
+                distance = _surface_distance_to_object(filtered_surface_mask, table_z, target_tree)
+                quality = float(filtered_area) - z_spread / max(voxel_size, 1e-6)
+                candidate = _make_surface_candidate(
+                    table_z,
+                    filtered_surface_mask,
+                    filtered_area,
+                    quality=quality,
+                    distance=distance,
+                )
+                if _is_better_surface_candidate(candidate, best_candidate, use_distance):
+                    best_candidate = candidate
 
     if best_candidate is None:
         return None, None
@@ -286,14 +323,21 @@ def detect_support_surfaces(
     normal_z_min: float = 0.9848,
     random_seed: int = 0,
     target_voxels: np.ndarray | None = None,
+    exclude_voxel_mask: np.ndarray | None = None,
 ) -> tuple[int | None, np.ndarray | None]:
     """
     检测当前目标物体对应的支撑面。
 
     若提供 target_voxels，则在多个水平面候选中优先选择距离目标物体最近的面。
+    若提供 exclude_voxel_mask，则候选面会先扣除实体 OBB 内的体素。
     """
     voxel_size = float(vp["voxel_size"])
     min_voxels = max(1, int(float(min_area) / (voxel_size * voxel_size)))
+    exclude_mask = None
+    if exclude_voxel_mask is not None:
+        exclude_mask = np.asarray(exclude_voxel_mask, dtype=bool)
+        if exclude_mask.shape != grid.shape:
+            raise ValueError("exclude_voxel_mask must have the same shape as grid")
 
     if points_world is not None:
         best_z, best_mask = _detect_support_surfaces_from_pointcloud(
@@ -306,8 +350,14 @@ def detect_support_surfaces(
             normal_z_min=normal_z_min,
             random_seed=random_seed,
             target_voxels=target_voxels,
+            exclude_voxel_mask=exclude_mask,
         )
         if best_z is not None:
             return best_z, best_mask
 
-    return _detect_support_surfaces_from_grid(grid, min_voxels, target_voxels=target_voxels)
+    return _detect_support_surfaces_from_grid(
+        grid,
+        min_voxels,
+        target_voxels=target_voxels,
+        exclude_voxel_mask=exclude_mask,
+    )
