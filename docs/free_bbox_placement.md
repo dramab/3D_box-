@@ -9,10 +9,11 @@
 ## 主要规则
 
 - 支撑面检测沿用旧 `free_bbox` 逻辑：优先在体素点云中 RANSAC 检测水平面，失败时回退到体素栅格逐层连通域。
-- 支撑面候选会先扣除所有场景物体 OBB 内的体素，避免把目标物体或其它实体表面误选为可放置平面。
+- 支撑面候选会扣除 `table_z±1` 范围内所有场景物体 OBB 的 XY 投影，避免把薄物体或其它实体表面误选为可放置平面。
+- OBB 体素化使用体素 AABB 与 OBB 的相交判断，边界接触也按占据处理，避免薄物体因没有覆盖体素中心而漏检。
 - 3D box 的候选底层放在支撑面本层，不再使用 `table_z + 1`。
 - 聚类仍使用 DBSCAN，但每个簇只输出一个最优 3D box。
-- 簇内最优选择顺序为：支撑面积最大、距离碰撞障碍最近距离最大、距离簇中心更近。
+- 簇内最优选择顺序为：支撑面积最大、距离簇中心最近、距离碰撞障碍最近距离最大。
 - 聚类前会强制过滤：候选 3D box 的底面中心体素必须落在支撑面 mask 上。
 
 ## 输出文件
@@ -52,6 +53,8 @@ conda run -n spatial python tools/run_free_bbox_placement.py \
 ```bash
 conda run -n spatial python tools/run_free_bbox_placement.py \
     --dataset-dir /data/jiajun.xie/3D_Box/data/hope \
-    --all --max-frames 5 \
+    --all --max-frames 5 --workers 4 \
     --output-dir outputs/free_bbox_hope
 ```
+
+批量任务默认使用最多 4 个进程并发处理不同帧；可通过 `--workers` 调整并发数，设置为 `1` 时串行运行。每个进程会独立创建 pipeline，避免跨进程共享计算状态。

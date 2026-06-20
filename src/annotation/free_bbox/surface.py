@@ -52,7 +52,7 @@ def _remove_excluded_surface_voxels(
     exclude_voxel_mask: np.ndarray | None,
     min_voxels: int,
 ) -> list:
-    """扣除实体 OBB 内的支撑面体素，并重新提取有效连通域。"""
+    """扣除支撑层上下一个体素范围内实体 OBB 的 XY 投影。"""
     if exclude_voxel_mask is None:
         return [(int(surface_mask_2d.sum()), surface_mask_2d)]
 
@@ -60,8 +60,12 @@ def _remove_excluded_surface_voxels(
     if z < 0 or z >= exclude_voxel_mask.shape[2]:
         return [(int(surface_mask_2d.sum()), surface_mask_2d)]
 
+    # RANSAC 会接收 table_z±1 的平面点，因此 OBB 排除必须覆盖相同的 Z 范围。
+    z_start = max(0, z - 1)
+    z_stop = min(exclude_voxel_mask.shape[2], z + 2)
+    excluded_xy = np.any(exclude_voxel_mask[:, :, z_start:z_stop], axis=2)
     surface_mask = np.asarray(surface_mask_2d, dtype=bool)
-    filtered_mask = surface_mask & ~exclude_voxel_mask[:, :, z]
+    filtered_mask = surface_mask & ~excluded_xy
     if not np.any(filtered_mask):
         return []
     return _extract_components(filtered_mask, min_voxels, apply_opening=False)

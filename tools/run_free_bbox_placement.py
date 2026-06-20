@@ -12,23 +12,33 @@ tools/run_free_bbox_placement.py
 
     conda run -n spatial python tools/run_free_bbox_placement.py \
         --dataset-dir /data/jiajun.xie/3D_Box/data/hope \
-        --all --max-frames 5 \
+        --all --max-frames 5 --workers 4 \
         --output-dir outputs/free_bbox_hope
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import multiprocessing
+import os
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if "MPLCONFIGDIR" not in os.environ:
+    mpl_config_dir = PROJECT_ROOT / "outputs" / ".matplotlib"
+    mpl_config_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = os.fspath(mpl_config_dir)
 
 from src.annotation.free_bbox import FreeBBoxConfig, FreeBBoxPipeline
 from src.datasets.canonical import load_canonical_scene
+
+
+DEFAULT_WORKERS = min(4, os.cpu_count() or 1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--all", action="store_true", help="从 manifest.json 运行全部帧。")
     parser.add_argument("--max-frames", type=int, default=None, help="最多处理多少帧，用于批量调试。")
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"并发进程数；默认 {DEFAULT_WORKERS}，设为 1 可串行运行。",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("outputs/free_bbox_hope"),
@@ -83,7 +99,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="不保留原始 roll/pitch，仅使用 yaw-only 平放姿态。",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    return args
 
 
 def resolve_sample_paths(args: argparse.Namespace) -> list[Path]:
@@ -148,18 +167,56 @@ def make_config(args: argparse.Namespace) -> FreeBBoxConfig:
     )
 
 
+def process_sample(
+    sample_path: Path,
+    dataset_dir: Path,
+    output_dir: Path,
+    config: FreeBBoxConfig,
+) -> tuple[str, int]:
+    """在独立进程中处理一个样本，并返回样本 ID 与输出框数量。"""
+    scene = load_canonical_scene(sample_path, dataset_root=dataset_dir)
+    print(f"[free_bbox] Processing {scene.sample_id}", flush=True)
+    results = FreeBBoxPipeline(config).run(scene, output_dir=output_dir)
+    n_boxes = sum(len(result.placements) for result in results.values())
+    return scene.sample_id, n_boxes
+
+
 def main() -> None:
     """执行 free_bbox 放置标注。"""
     args = parse_args()
-    pipeline = FreeBBoxPipeline(make_config(args))
     sample_paths = resolve_sample_paths(args)
+    config = make_config(args)
+    workers = min(args.workers, len(sample_paths))
 
-    for sample_path in sample_paths:
-        scene = load_canonical_scene(sample_path, dataset_root=args.dataset_dir)
-        print(f"[free_bbox] Processing {scene.sample_id}")
-        results = pipeline.run(scene, output_dir=args.output_dir)
-        n_boxes = sum(len(result.placements) for result in results.values())
-        print(f"[free_bbox] Saved {n_boxes} best boxes for {scene.sample_id}")
+    print(f"[free_bbox] Running {len(sample_paths)} sample(s) with {workers} worker(s).")
+    if workers == 1:
+        for sample_path in sample_paths:
+            sample_id, n_boxes = process_sample(sample_path, args.dataset_dir, args.output_dir, config)
+            print(f"[free_bbox] Saved {n_boxes} best boxes for {sample_id}")
+    else:
+        # spawn 避免科学计算库在 fork 后继承线程池状态。
+        mp_context = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp_context,
+        ) as executor:
+            future_to_path = {
+                executor.submit(
+                    process_sample,
+                    sample_path,
+                    args.dataset_dir,
+                    args.output_dir,
+                    config,
+                ): sample_path
+                for sample_path in sample_paths
+            }
+            for future in concurrent.futures.as_completed(future_to_path):
+                sample_path = future_to_path[future]
+                try:
+                    sample_id, n_boxes = future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to process sample: {sample_path}") from exc
+                print(f"[free_bbox] Saved {n_boxes} best boxes for {sample_id}")
 
     print(f"[free_bbox] Processed {len(sample_paths)} sample(s). Output: {args.output_dir.resolve()}")
 

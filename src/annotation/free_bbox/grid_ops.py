@@ -47,27 +47,43 @@ def voxelize_obb(
     """
     将物体 OBB 转换为体素索引集合。
 
-    该实现与旧 free_bbox 一致：枚举 OBB 世界坐标包围盒内的体素中心，
-    再逆变换到 canonical/object 坐标系检查是否落入 AABB。
+    枚举 OBB 世界坐标包围盒附近的体素，再使用分离轴定理检查体素 AABB
+    是否与 OBB 相交。边界接触也视为相交，避免薄物体因体素中心位于 OBB
+    外部而完全漏检。
     """
     origin = np.asarray(vp["origin"], dtype=np.float64)
     voxel_size = float(vp["voxel_size"])
     bbox = np.asarray(bbox3d, dtype=np.float64)
     bmin, bmax = bbox[:3], bbox[3:]
-    center = (bmin + bmax) * 0.5
-    size = np.maximum(bmax - bmin, voxel_size)
-    bbox_for_voxel = np.concatenate([center - size * 0.5, center + size * 0.5])
+    center_obj = (bmin + bmax) * 0.5
+    half_extent_obj = (bmax - bmin) * 0.5
+    transform = np.asarray(T_obj2world, dtype=np.float64)
+    rotation_scale = transform[:3, :3]
+    axis_scales = np.linalg.norm(rotation_scale, axis=0)
+    if np.any(axis_scales < 1e-12):
+        return np.empty((0, 3), dtype=int)
 
-    corners_world = transform_points(get_bbox_corners(bbox_for_voxel), T_obj2world)
+    obb_axes = rotation_scale / axis_scales[None, :]
+    half_extent_world = half_extent_obj * axis_scales
+    center_world = transform_points(center_obj[None, :], transform)[0]
+    corners_world = transform_points(get_bbox_corners(bbox), transform)
     indices = _enumerate_voxel_candidates(corners_world, origin, voxel_size, grid_shape)
     if len(indices) == 0:
         return indices
 
+    world_axes = np.eye(3, dtype=np.float64)
+    cross_axes = np.cross(world_axes[:, None, :], obb_axes.T[None, :, :]).reshape(-1, 3)
+    separating_axes = np.vstack([world_axes, obb_axes.T, cross_axes])
+    axis_norms = np.linalg.norm(separating_axes, axis=1)
+    separating_axes = separating_axes[axis_norms > 1e-12]
+    separating_axes /= np.linalg.norm(separating_axes, axis=1, keepdims=True)
+
     centers_world = origin + (indices + 0.5) * voxel_size
-    centers_obj = transform_points(centers_world, np.linalg.inv(T_obj2world))
-    bmin, bmax = bbox_for_voxel[:3], bbox_for_voxel[3:]
-    inside = np.all((centers_obj >= bmin) & (centers_obj <= bmax), axis=1)
-    return indices[inside]
+    center_distances = np.abs((centers_world - center_world) @ separating_axes.T)
+    voxel_radii = 0.5 * voxel_size * np.abs(separating_axes).sum(axis=1)
+    obb_radii = np.abs(separating_axes @ obb_axes) @ half_extent_world
+    intersects = np.all(center_distances <= voxel_radii + obb_radii + 1e-9, axis=1)
+    return indices[intersects]
 
 
 def prepare_grid_base(grid: np.ndarray, objects: list, vp: dict) -> np.ndarray:

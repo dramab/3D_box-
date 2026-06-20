@@ -7,8 +7,8 @@ DBSCAN 聚类与每簇最优 3D box 选择。
 旧实现会在每个簇内选多个分散代表；这里每个簇只选一个最优候选。
 最优规则为：
     1. 支撑面积最大；
-    2. 与碰撞障碍的最小距离最大，即碰撞危险最低；
-    3. 与簇中心距离更近作为稳定 tie-break。
+    2. 与簇中心距离最近；
+    3. 与碰撞障碍的最小距离最大，即碰撞危险最低。
 """
 
 from __future__ import annotations
@@ -265,11 +265,11 @@ def cluster_placements_best(
         centroid = member_world.mean(axis=0)
         centroid_distances = np.linalg.norm(member_world - centroid[None, :], axis=1)
 
-        # lexsort 最后一列优先，因此这里按：支撑面积降序、clearance 降序、中心距离升序。
+        # lexsort 最后一列优先：支撑面积降序、中心距离升序、clearance 降序。
         order = np.lexsort(
             (
-                centroid_distances,
                 -clearance_voxels[member_indices],
+                centroid_distances,
                 -support_counts[member_indices],
             )
         )
