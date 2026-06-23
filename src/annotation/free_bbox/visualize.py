@@ -219,12 +219,12 @@ def save_freebox_visualization(
     ax_rgb = fig.add_axes([0.02, 0.10, 0.47, 0.82])
     ax_rgb.imshow(np.asarray(rgb, dtype=np.uint8))
     _draw_bbox_2d(ax_rgb, orig_world, K, E_w2c, CLR_ORIG, lw=2.5, label=f"Original: {obj_name}")
-    _draw_bbox_2d(ax_rgb, placed_world, K, E_w2c, CLR_PLACE, lw=2.2, label="Freebox", alpha=0.85)
+    _draw_bbox_2d(ax_rgb, placed_world, K, E_w2c, CLR_PLACE, lw=2.2, label="Yaw-only freebox", alpha=0.85)
     img_h, img_w = rgb.shape[:2]
     ax_rgb.set_xlim(0, img_w)
     ax_rgb.set_ylim(img_h, 0)
     ax_rgb.set_title(
-        "RGB Image - 3-D Bbox Projection\nOrange = current position | Green = selected freebox",
+        "RGB Image - 3-D Bbox Projection\nOrange = current position | Green = yaw-only freebox",
         color=CLR_TEXT,
         fontsize=11,
         pad=8,
@@ -285,7 +285,7 @@ def save_freebox_visualization(
             )
 
     _draw_bbox_3d(ax3d, orig_world, CLR_ORIG, lw=2.5, label=f"Original: {obj_name}")
-    _draw_bbox_3d(ax3d, placed_world, CLR_PLACE, lw=2.2, label="Freebox", alpha=0.86)
+    _draw_bbox_3d(ax3d, placed_world, CLR_PLACE, lw=2.2, label="Yaw-only freebox", alpha=0.86)
     ax3d.quiver(
         orig_center[0],
         orig_center[1],
@@ -322,7 +322,7 @@ def save_freebox_visualization(
     ax3d.set_ylabel("Y (cm)", color=CLR_TEXT, labelpad=8)
     ax3d.set_zlabel("Z (cm)", color=CLR_TEXT, labelpad=6)
     ax3d.set_title(
-        "3-D World View\nOrange = current position | Green = selected freebox",
+        "3-D World View\nOrange = current position | Green = yaw-only freebox",
         color=CLR_TEXT,
         fontsize=10,
         pad=6,
@@ -340,6 +340,7 @@ def save_freebox_visualization(
     info = (
         f"Target        : {obj_name}\n"
         f"Freebox ID    : {placement.get('sample_id', '')}\n"
+        f"Mode          : {placement.get('supervision_mode', 'unknown')}\n"
         f"Cluster ID    : {placement.get('cluster_id')}\n"
         f"Cluster size  : {placement.get('cluster_size')}\n"
         f"Support area  : {placement.get('support_area', 0.0):.1f} cm^2\n"

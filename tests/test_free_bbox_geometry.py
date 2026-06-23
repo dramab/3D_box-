@@ -3,6 +3,7 @@
 import numpy as np
 
 from src.annotation.free_bbox.cluster import cluster_placements_best
+from src.annotation.free_bbox.geometry import build_yaw_only_upright_box, rotation_z_3x3
 from src.annotation.free_bbox.grid_ops import voxelize_obb
 from src.annotation.free_bbox.occupancy import OCCUPIED
 from src.annotation.free_bbox.surface import _remove_excluded_surface_voxels
@@ -37,6 +38,43 @@ def test_voxelize_obb_includes_intersecting_voxels_without_center_inside() -> No
     voxels = voxelize_obb(bbox, transform, vp, np.array([3, 3, 3]))
 
     assert set(map(tuple, voxels)) == {(0, 0, 0), (0, 0, 1)}
+
+
+def test_yaw_only_upright_box_moves_vertical_local_axis_to_z() -> None:
+    """yaw-only 监督框应把最接近 world-Z 的局部尺寸作为输出高度。"""
+    bbox = np.array([-5.0, -1.0, -2.0, 5.0, 1.0, 2.0], dtype=np.float64)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    box = build_yaw_only_upright_box(bbox, transform, np.array([10.0, 20.0, 5.0]))
+    corners = box["corners_world"]
+
+    assert box["axis_mapping"] == {"x": 1, "y": 2, "z": 0}
+    np.testing.assert_allclose(box["dimensions"], [2.0, 4.0, 10.0])
+    np.testing.assert_allclose(box["center_world"], [10.0, 20.0, 10.0])
+    np.testing.assert_allclose(box["transform_world"][:3, 2], [0.0, 0.0, 1.0])
+    assert np.isclose(corners[:, 2].min(), 5.0)
+    assert np.isclose(corners[:, 2].max(), 15.0)
+
+
+def test_yaw_only_upright_box_keeps_xy_order_when_canonical_z_is_up() -> None:
+    """canonical Z 已竖直时不应额外交换 X/Y 尺寸。"""
+    bbox = np.array([-1.0, -2.0, -3.0, 1.0, 2.0, 3.0], dtype=np.float64)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation_z_3x3(np.deg2rad(30.0))
+
+    box = build_yaw_only_upright_box(bbox, transform, np.array([0.0, 0.0, 1.0]))
+
+    assert box["axis_mapping"] == {"x": 0, "y": 1, "z": 2}
+    np.testing.assert_allclose(box["dimensions"], [2.0, 4.0, 6.0])
+    assert np.isclose(box["yaw_degrees"], 30.0)
 
 
 def _make_single_voxel_yaw_data() -> dict:

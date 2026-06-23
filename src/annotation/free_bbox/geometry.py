@@ -146,3 +146,64 @@ def compute_placed_transform_with_orientation(
     transform[:3, :3] = rotation
     transform[:3, 3] = np.asarray(center_world, dtype=np.float64) - rotation @ obj_center
     return transform
+
+
+def build_yaw_only_upright_box(
+    bbox3d_canonical: np.ndarray,
+    transform_world: np.ndarray,
+    bottom_center_world: np.ndarray,
+) -> dict:
+    """将任意 OBB 转为模型监督使用的 yaw-only 竖直框。"""
+    bbox = np.asarray(bbox3d_canonical, dtype=np.float64)
+    dims = bbox[3:] - bbox[:3]
+    transform = np.asarray(transform_world, dtype=np.float64)
+    rotation_scale = transform[:3, :3]
+    axis_norms = np.linalg.norm(rotation_scale, axis=0)
+    if np.any(axis_norms < 1e-12):
+        raise ValueError("transform_world contains a degenerate rotation axis")
+
+    axes = rotation_scale / axis_norms[None, :]
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    up_axis = int(np.argmax(np.abs(axes.T @ world_up)))
+    horizontal_axes = [axis for axis in range(3) if axis != up_axis]
+    x_axis, y_axis = horizontal_axes
+
+    x_dir_xy = np.array([axes[0, x_axis], axes[1, x_axis]], dtype=np.float64)
+    x_dir_norm = float(np.linalg.norm(x_dir_xy))
+    if x_dir_norm < 1e-12:
+        x_dir_xy = np.array([1.0, 0.0], dtype=np.float64)
+    else:
+        x_dir_xy /= x_dir_norm
+    yaw = float(np.arctan2(x_dir_xy[1], x_dir_xy[0]))
+
+    dims_yaw = np.array([dims[x_axis], dims[y_axis], dims[up_axis]], dtype=np.float64)
+    bottom_center = np.asarray(bottom_center_world, dtype=np.float64)
+    center_world = np.array(
+        [
+            bottom_center[0],
+            bottom_center[1],
+            bottom_center[2] + dims_yaw[2] * 0.5,
+        ],
+        dtype=np.float64,
+    )
+
+    local_bbox = np.concatenate([-dims_yaw * 0.5, dims_yaw * 0.5])
+    yaw_transform = np.eye(4, dtype=np.float64)
+    yaw_transform[:3, :3] = rotation_z_3x3(yaw)
+    yaw_transform[:3, 3] = center_world
+    corners_world = transform_points(get_bbox_corners(local_bbox), yaw_transform)
+    aabb_world = np.concatenate([corners_world.min(axis=0), corners_world.max(axis=0)])
+
+    return {
+        "center_world": center_world,
+        "yaw_degrees": float(np.degrees(yaw) % 360.0),
+        "transform_world": yaw_transform,
+        "corners_world": corners_world,
+        "aabb_world": aabb_world,
+        "dimensions": dims_yaw,
+        "axis_mapping": {
+            "x": int(x_axis),
+            "y": int(y_axis),
+            "z": int(up_axis),
+        },
+    }

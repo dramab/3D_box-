@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-preserve-orientation",
         action="store_true",
-        help="不保留原始 roll/pitch，仅使用 yaw-only 平放姿态。",
+        help="搜索阶段不保留原始 roll/pitch，仅使用 yaw-only 姿态；最终导出框始终为 yaw-only upright 监督框。",
     )
     args = parser.parse_args()
     if args.workers < 1:

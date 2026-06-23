@@ -27,7 +27,7 @@ from src.annotation.free_bbox.filters import (
     filter_visible_placements,
     is_fully_visible,
 )
-from src.annotation.free_bbox.geometry import get_bbox_corners, transform_points
+from src.annotation.free_bbox.geometry import build_yaw_only_upright_box, get_bbox_corners, transform_points
 from src.annotation.free_bbox.grid_ops import prepare_grid_base, voxelize_obb
 from src.annotation.free_bbox.io_utils import (
     load_ply,
@@ -130,26 +130,38 @@ def _build_saved_placements(
     yaw_data: dict,
     vp: dict,
 ) -> list[dict]:
-    """将每簇最优候选转换为可保存的 3D box 标注。"""
+    """将每簇最优候选转换为 yaw-only 监督框标注。"""
     corners_obj = get_bbox_corners(obj.bbox3d_canonical)
     placements = []
     for rank, (rep, info) in enumerate(zip(reps, cluster_infos)):
         yaw_idx = int(rep[2])
-        transform = _compute_placed_transform(rep[:2], landing_z, yaw_data, yaw_idx, vp)
-        placed_world = transform_points(corners_obj, transform)
-        aabb_world = np.concatenate([placed_world.min(axis=0), placed_world.max(axis=0)])
-        center_world = placed_world.mean(axis=0)
+        obb6d_transform = _compute_placed_transform(rep[:2], landing_z, yaw_data, yaw_idx, vp)
+        obb6d_corners = transform_points(corners_obj, obb6d_transform)
+        obb6d_aabb = np.concatenate([obb6d_corners.min(axis=0), obb6d_corners.max(axis=0)])
+        yaw_box = build_yaw_only_upright_box(
+            obj.bbox3d_canonical,
+            obb6d_transform,
+            np.asarray(info["bottom_center_world"], dtype=np.float64),
+        )
         cluster_id = int(info["cluster_id"])
         placements.append(
             {
                 "sample_id": f"{scene_prefix}_{obj.obj_id}_cluster_{cluster_id:03d}",
                 "rank": int(rank),
                 "cluster_id": cluster_id,
-                "center_world": center_world.tolist(),
-                "yaw_degrees": float(info["yaw_degrees"]),
-                "transform_world": transform.tolist(),
-                "aabb_world": aabb_world.tolist(),
-                "corners_world": placed_world.tolist(),
+                "supervision_mode": "yaw_only_upright",
+                "center_world": yaw_box["center_world"].tolist(),
+                "yaw_degrees": float(yaw_box["yaw_degrees"]),
+                "transform_world": yaw_box["transform_world"].tolist(),
+                "aabb_world": yaw_box["aabb_world"].tolist(),
+                "corners_world": yaw_box["corners_world"].tolist(),
+                "yaw_only_dimensions": yaw_box["dimensions"].tolist(),
+                "yaw_only_axis_mapping": yaw_box["axis_mapping"],
+                "search_yaw_degrees": float(info["yaw_degrees"]),
+                "obb6d_center_world": obb6d_corners.mean(axis=0).tolist(),
+                "obb6d_transform_world": obb6d_transform.tolist(),
+                "obb6d_aabb_world": obb6d_aabb.tolist(),
+                "obb6d_corners_world": obb6d_corners.tolist(),
                 "anchor_voxel": info["anchor_voxel"],
                 "bottom_center_voxel": info["bottom_center_voxel"],
                 "bottom_center_world": info["bottom_center_world"],
