@@ -6,9 +6,10 @@ DBSCAN 聚类与每簇最优 3D box 选择。
 相对旧 free_bbox 的变化：
 旧实现会在每个簇内选多个分散代表；这里每个簇只选一个最优候选。
 最优规则为：
-    1. 支撑面积最大；
-    2. 与簇中心距离最近；
-    3. 与碰撞障碍的最小距离最大，即碰撞危险最低。
+    1. 底面中心热力计数最大；
+    2. 支撑面积最大；
+    3. 与簇中心距离最近；
+    4. 与碰撞障碍的最小距离最大，即碰撞危险最低。
 """
 
 from __future__ import annotations
@@ -264,13 +265,21 @@ def cluster_placements_best(
         member_world = centers_world[member_indices]
         centroid = member_world.mean(axis=0)
         centroid_distances = np.linalg.norm(member_world - centroid[None, :], axis=1)
+        _, center_inverse, center_counts = np.unique(
+            member_centers,
+            axis=0,
+            return_inverse=True,
+            return_counts=True,
+        )
+        member_heat_counts = center_counts[center_inverse]
 
-        # lexsort 最后一列优先：支撑面积降序、中心距离升序、clearance 降序。
+        # lexsort 最后一列优先：热力、支撑面积降序，中心距离升序，clearance 降序。
         order = np.lexsort(
             (
                 -clearance_voxels[member_indices],
                 centroid_distances,
                 -support_counts[member_indices],
+                -member_heat_counts,
             )
         )
         best_local = int(order[0])

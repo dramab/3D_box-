@@ -91,15 +91,16 @@ def save_binary_mask_ply(
     """
     将整体体素点云保存为二值 mask PLY。
 
-    OCCUPIED 体素都会输出，mask=True 的支撑面体素为白色，其余为深灰色。
+    OCCUPIED 和 mask=True 的体素都会输出；支撑面体素为白色，
+    其余为深灰色。这会保留形态学运算补出的非占据体素。
     """
-    occ_idx = np.argwhere(grid == OCCUPIED)
     mask = np.asarray(mask_3d, dtype=bool)
-    colors = np.full((len(occ_idx), 3), [55, 55, 55], dtype=np.uint8)
-    if len(occ_idx) > 0:
-        active = mask[occ_idx[:, 0], occ_idx[:, 1], occ_idx[:, 2]]
+    output_idx = np.argwhere((grid == OCCUPIED) | mask)
+    colors = np.full((len(output_idx), 3), [55, 55, 55], dtype=np.uint8)
+    if len(output_idx) > 0:
+        active = mask[output_idx[:, 0], output_idx[:, 1], output_idx[:, 2]]
         colors[active] = np.array([255, 255, 255], dtype=np.uint8)
-    save_ply(path, voxel_to_world(occ_idx, vp), colors)
+    save_ply(path, voxel_to_world(output_idx, vp), colors)
 
 
 def save_heatmap_ply(
@@ -113,18 +114,23 @@ def save_heatmap_ply(
     将整体体素点云保存为热力 PLY。
 
     heat_counts>0 的支撑面体素按黄到红着色；支撑面但计数为 0 的体素为蓝色；
-    其他 OCCUPIED 体素为灰色。
+    其他 OCCUPIED 体素为灰色。输出点集是 OCCUPIED、支撑面和正热力
+    体素的并集，以保留形态学运算补出的体素。
     """
-    occ_idx = np.argwhere(grid == OCCUPIED)
     counts = np.asarray(heat_counts, dtype=np.int64)
-    colors = np.full((len(occ_idx), 3), [60, 60, 60], dtype=np.uint8)
+    output_mask = (grid == OCCUPIED) | (counts > 0)
+    if support_mask_3d is not None:
+        output_mask |= np.asarray(support_mask_3d, dtype=bool)
+    output_idx = np.argwhere(output_mask)
+    colors = np.full((len(output_idx), 3), [60, 60, 60], dtype=np.uint8)
 
-    if len(occ_idx) > 0 and support_mask_3d is not None:
-        support = support_mask_3d[occ_idx[:, 0], occ_idx[:, 1], occ_idx[:, 2]]
+    if len(output_idx) > 0 and support_mask_3d is not None:
+        support_mask = np.asarray(support_mask_3d, dtype=bool)
+        support = support_mask[output_idx[:, 0], output_idx[:, 1], output_idx[:, 2]]
         colors[support] = np.array([55, 120, 210], dtype=np.uint8)
 
-    if len(occ_idx) > 0:
-        values = counts[occ_idx[:, 0], occ_idx[:, 1], occ_idx[:, 2]]
+    if len(output_idx) > 0:
+        values = counts[output_idx[:, 0], output_idx[:, 1], output_idx[:, 2]]
         active = values > 0
         if np.any(active):
             denom = max(float(values[active].max()), 1.0)
@@ -135,7 +141,7 @@ def save_heatmap_ply(
             heat_colors[:, 2] = 30
             colors[active] = heat_colors
 
-    save_ply(path, voxel_to_world(occ_idx, vp), colors)
+    save_ply(path, voxel_to_world(output_idx, vp), colors)
 
 
 def _json_default(value: Any) -> Any:

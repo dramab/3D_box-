@@ -48,8 +48,42 @@ def _make_single_voxel_yaw_data() -> dict:
     }
 
 
+def test_cluster_selects_box_at_heatmap_peak_before_support_area() -> None:
+    """最优框应优先落在簇内候选底面中心的热力峰值。"""
+    grid = np.zeros((16, 8, 2), dtype=np.uint8)
+    surface = np.ones(grid.shape[:2], dtype=bool)
+    footprints = [
+        np.array([[0, 0]], dtype=int),
+        np.array([[0, 0], [1, 0]], dtype=int),
+        np.array([[0, 0], [1, 0], [2, 0], [3, 0]], dtype=int),
+    ]
+    yaw_data = {
+        "yaw_angles": np.array([0.0, 0.1, 0.2]),
+        "footprints": footprints,
+        "rel_voxels": [
+            np.column_stack([footprint, np.zeros(len(footprint), dtype=int)])
+            for footprint in footprints
+        ],
+    }
+    # 前两个候选的底面中心同为 (2, 2)；第三个支撑面积更大但热力为 1。
+    candidates = np.array([[2, 2, 0], [1, 2, 1], [7, 2, 2]], dtype=int)
+
+    reps, infos, _, _ = cluster_placements_best(
+        candidates,
+        grid,
+        yaw_data,
+        landing_z=0,
+        surface_mask_2d=surface,
+        vp={"origin": [0.0, 0.0, 0.0], "voxel_size": 1.0},
+        eps=20.0,
+    )
+
+    assert reps.tolist() == [[1, 2, 1]]
+    assert infos[0]["bottom_center_voxel"] == [2, 2, 0]
+
+
 def test_cluster_prefers_centroid_distance_before_clearance() -> None:
-    """支撑面积相同时，距簇中心更近应优先于更大的障碍物净空。"""
+    """热力和支撑面积相同时，距簇中心更近应优先于更大净空。"""
     grid = np.zeros((12, 6, 2), dtype=np.uint8)
     grid[4, 2, 1] = OCCUPIED
     surface = np.ones(grid.shape[:2], dtype=bool)
@@ -69,7 +103,7 @@ def test_cluster_prefers_centroid_distance_before_clearance() -> None:
 
 
 def test_cluster_uses_clearance_when_centroid_distance_ties() -> None:
-    """支撑面积和中心距离相同时，应选择障碍物净空更大的候选。"""
+    """热力、支撑面积和中心距离相同时，应选择净空更大的候选。"""
     grid = np.zeros((10, 6, 2), dtype=np.uint8)
     grid[2, 2, 1] = OCCUPIED
     surface = np.ones(grid.shape[:2], dtype=bool)
