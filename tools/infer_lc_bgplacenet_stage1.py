@@ -42,6 +42,7 @@ from src.training.lc_bgplacenet_stage1 import (
     build_stage1_index,
     load_config,
     move_batch_to_device,
+    normalize_stage1_split,
     stage1_collate,
 )
 from src.visualization.bbox_projection import BOX_EDGES, project_world
@@ -58,9 +59,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True, help="Checkpoint path, usually best.pt or last.pt.")
     parser.add_argument(
         "--split",
-        choices=("val", "train", "all"),
-        default="val",
-        help="Inference split. The project has no standalone test split, so val is the default held-out set.",
+        choices=("valid", "val", "train", "test", "all"),
+        default="valid",
+        help="Inference split. val is accepted as an alias of valid.",
     )
     parser.add_argument("--batch-size", type=int, default=None, help="Inference batch size. Defaults to training.batch_size.")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit sample count for smoke tests.")
@@ -94,16 +95,19 @@ def build_inference_loader(
 ) -> DataLoader:
     """Build a non-shuffled inference dataloader."""
     items = select_all_items(cfg)
-    dataset_split = "train" if split == "all" else split
-    val_fraction = 0.0 if split == "all" else float(cfg["data"]["val_fraction"])
+    data_cfg = cfg["data"]
+    dataset_split = "train" if split == "all" else normalize_stage1_split(split)
+    valid_fraction = float(data_cfg.get("valid_fraction", data_cfg.get("val_fraction", 0.1)))
+    split_dir = None if split == "all" else data_cfg.get("split_dir")
     dataset = LCBGPlaceNetStage1Dataset(
         sources=None,
         split=dataset_split,
-        val_fraction=val_fraction,
-        seed=int(cfg["data"].get("split_seed", 0)),
-        support_align_threshold_cm=float(cfg["data"]["support_align_threshold_cm"]),
+        val_fraction=0.0 if split == "all" else valid_fraction,
+        seed=int(data_cfg.get("split_seed", 0)),
+        support_align_threshold_cm=float(data_cfg["support_align_threshold_cm"]),
         max_samples=None if sample_id is not None or object_id is not None else max_samples,
         items=items,
+        split_dir=split_dir,
     )
     if sample_id is not None or object_id is not None:
         dataset.items = [
@@ -283,7 +287,8 @@ def run_inference(args: argparse.Namespace) -> None:
         cfg = deepcopy(cfg)
         cfg["training"]["batch_size"] = int(args.batch_size)
 
-    output_dir = args.output_dir or Path(cfg["training"]["output_dir"]) / f"inference_rgb_{args.split}"
+    output_split = "all" if args.split == "all" else normalize_stage1_split(args.split)
+    output_dir = args.output_dir or Path(cfg["training"]["output_dir"]) / f"inference_rgb_{output_split}"
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = output_dir / "predictions.jsonl"
     if predictions_path.exists():
@@ -349,7 +354,7 @@ def run_inference(args: argparse.Namespace) -> None:
                 print(f"Saved {vis_path}")
 
     summary = {
-        "split": args.split,
+        "split": output_split,
         "samples": total,
         "source_iou_mean": float(np.mean(ious)) if ious else 0.0,
         "source_center_mae_cm_mean": float(np.mean(center_maes)) if center_maes else 0.0,

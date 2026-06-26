@@ -3,14 +3,18 @@ data:
   voxel_size_cm: 1.0
   # active voxel 到 free_bbox 支撑面 mask 点的最大匹配距离，小于等于该值标为 support=1。
   support_align_threshold_cm: 1.5
-  # 样本确定性打乱后划入验证集的比例。
-  val_fraction: 0.1
-  # 仅用于训练集/验证集划分复现的随机种子。
+  # 固定 train/valid/test 划分文件目录；先运行 tools/generate_lc_bgplacenet_stage1_splits.py 生成。
+  split_dir: data/splits/lc_bgplacenet_stage1
+  # 生成固定 split 时，按 canonical sample 分组划入验证集的比例。
+  valid_fraction: 0.1
+  # 生成固定 split 时，按 canonical sample 分组划入测试集的比例。
+  test_fraction: 0.1
+  # 仅用于固定 split 生成；生成后训练/推理直接读取 split 文件。
   split_seed: 20260624
   # 可选的训练样本数量上限；留空表示使用全部训练样本。
   max_train_samples:
   # 可选的验证样本数量上限；留空表示使用全部验证样本。
-  max_val_samples:
+  max_valid_samples:
   # canonical 数据源，以及对应生成的 free_bbox 和 auto-label 结果。
   sources:
     - name: dopose

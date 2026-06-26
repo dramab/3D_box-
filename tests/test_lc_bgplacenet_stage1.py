@@ -13,7 +13,10 @@ from src.models.lc_bgplacenet.stage1 import aabb_iou_3d
 from src.training.lc_bgplacenet_stage1 import (
     LCBGPlaceNetStage1Dataset,
     Stage1DataSource,
+    STAGE1_SPLIT_SCHEMA_VERSION,
+    build_stage1_index,
     compute_stage1_metrics,
+    stage1_item_to_split_record,
     stage1_collate,
     source_box_loss,
 )
@@ -143,6 +146,34 @@ def test_stage1_dataset_aligns_support_mask_to_active_voxels(tmp_path) -> None:
     np.testing.assert_allclose(sample["source_box_gt"], [1.0, 2.0, 3.0, 2.0, 4.0, 6.0])
     np.testing.assert_array_equal(sample["support_label"], [0.0, 1.0, 0.0])
     assert sample["instruction"] == "Move toy object to the right of the block."
+
+
+def test_stage1_dataset_reads_fixed_split_file(tmp_path) -> None:
+    """A fixed split file selects samples without re-running random splitting."""
+    source = _make_tiny_stage1_source(tmp_path)
+    items = build_stage1_index([source])
+    split_dir = tmp_path / "splits"
+    _write_json(
+        split_dir / "train.json",
+        {
+            "schema_version": STAGE1_SPLIT_SCHEMA_VERSION,
+            "split": "train",
+            "group_by": ["source_name", "sample_id"],
+            "item_count": 1,
+            "items": [stage1_item_to_split_record(items[0])],
+        },
+    )
+
+    dataset = LCBGPlaceNetStage1Dataset(
+        [source],
+        split="train",
+        val_fraction=0.5,
+        support_align_threshold_cm=0.25,
+        split_dir=split_dir,
+    )
+
+    assert len(dataset) == 1
+    assert dataset[0]["sample_id"] == "toy__scene_0000__0000"
 
 
 def test_stage1_collate_builds_sparse_batch(tmp_path) -> None:

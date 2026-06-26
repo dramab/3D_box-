@@ -27,6 +27,33 @@ Support 监督生成规则：
 5. 最近距离 <= 1.5cm 的 active voxel 标为 support=1，否则为 0。
 ```
 
+## 固定数据划分
+
+Stage 1 使用固定的 `train/valid/test` 清单，不在每次训练时重新随机划分。
+划分粒度是 `(source_name, sample_id)`，同一 canonical frame 下的所有物体和语言样本
+会落在同一个 split，避免同一帧同时出现在训练和验证/测试中。
+
+首次生成：
+
+```bash
+conda run -n spatial python tools/generate_lc_bgplacenet_stage1_splits.py \
+    --config configs/lc_bgplacenet_stage1.yaml
+```
+
+默认输出：
+
+```text
+data/splits/lc_bgplacenet_stage1/
+  manifest.json
+  train.json
+  valid.json
+  test.json
+```
+
+已有 split 文件时脚本会直接报错，避免误覆盖。确实需要重新划分时显式添加
+`--overwrite`。训练和推理默认读取 `configs/lc_bgplacenet_stage1.yaml` 中的
+`data.split_dir`，因此生成后不需要每次重新生成。
+
 ## 运行
 
 小步验证：
@@ -66,8 +93,8 @@ outputs/lc_bgplacenet_stage1/
 
 ## 推理和 RGB 可视化
 
-当前配置没有独立的 `test` split；推理脚本默认使用训练时按 `val_fraction`
-和 `split_seed` 留出的验证集，作为测试效果检查集。
+推理脚本默认使用固定 `valid` split；也可以显式选择 `train` 或 `test`。
+`--split val` 仍可作为 `valid` 的兼容别名。
 
 ```bash
 conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
@@ -78,7 +105,7 @@ conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
 输出默认保存到：
 
 ```text
-outputs/lc_bgplacenet_stage1/inference_rgb_val/
+outputs/lc_bgplacenet_stage1/inference_rgb_valid/
   *.png              # RGB 上投影的预测 source box；默认同时绘制 GT source box
   predictions.jsonl  # 每条样本的预测框、GT 框、IoU 和可视化路径
   summary.json        # 汇总指标
@@ -96,6 +123,12 @@ conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
     --config configs/lc_bgplacenet_stage1.yaml \
     --checkpoint outputs/lc_bgplacenet_stage1/best.pt \
     --split all
+
+# 推理固定测试集
+conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
+    --config configs/lc_bgplacenet_stage1.yaml \
+    --checkpoint outputs/lc_bgplacenet_stage1/best.pt \
+    --split test
 
 # 只跑少量样本验证输出
 conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
