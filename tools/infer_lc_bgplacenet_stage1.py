@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Run LC-BGPlaceNet Stage 1 inference and export RGB visualizations.
+Run LC-BGPlaceNet Stage 1 inference and export RGB / support point-cloud visualizations.
 
 使用示例:
     conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
@@ -11,6 +11,12 @@ Run LC-BGPlaceNet Stage 1 inference and export RGB visualizations.
         --config configs/lc_bgplacenet_stage1.yaml \
         --checkpoint outputs/lc_bgplacenet_stage1/best.pt \
         --split all --max-samples 20
+
+    conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
+        --config configs/lc_bgplacenet_stage1.yaml \
+        --checkpoint outputs/lc_bgplacenet_stage1/best.pt \
+        --split test --export-pointcloud --no-rgb \
+        --output-dir outputs/lc_bgplacenet_stage1/inference_support_mask_3d_test
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 os.environ.setdefault("MPLCONFIGDIR", os.fspath(PROJECT_ROOT / "outputs" / ".matplotlib"))
 
+from src.annotation.free_bbox.io_utils import save_ply
 from src.datasets.canonical import ObjectInfo, load_canonical_scene
 from src.models.lc_bgplacenet.stage1 import LCBGPlaceNetStage1, aabb_iou_3d
 from src.training.lc_bgplacenet_stage1 import (
@@ -60,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split",
         choices=("valid", "val", "train", "test", "all"),
-        default="valid",
+        default="test",
         help="Inference split. val is accepted as an alias of valid.",
     )
     parser.add_argument("--batch-size", type=int, default=None, help="Inference batch size. Defaults to training.batch_size.")
@@ -75,6 +82,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--line-width", type=int, default=3, help="Projected 3D box line width.")
     parser.add_argument("--no-gt", action="store_true", help="Only draw predicted source boxes.")
+    parser.add_argument("--no-rgb", action="store_true", help="Skip RGB source-box visualization PNG export.")
+    parser.add_argument("--export-pointcloud", action="store_true", help="Export predicted support mask as 3D PLY point clouds.")
+    parser.add_argument(
+        "--pointcloud-dir",
+        type=Path,
+        default=None,
+        help="Support PLY output directory. Defaults to output-dir/support_pointclouds.",
+    )
+    parser.add_argument("--support-threshold", type=float, default=0.5, help="Support probability threshold for mask coloring.")
     parser.add_argument("--device", default=None, help="Override config training.device, for example cuda:0.")
     return parser.parse_args()
 
@@ -274,6 +290,46 @@ def save_rgb_visualization(
     image.save(output_path)
 
 
+def support_prob_to_colors(features: np.ndarray, probs: np.ndarray, threshold: float) -> np.ndarray:
+    """Color active voxels, highlighting predicted support points in orange-red."""
+    base_colors = np.rint(features[:, 3:6] * 255.0).clip(0, 255).astype(np.uint8)
+    colors = np.rint(base_colors.astype(np.float32) * 0.35 + 45.0).clip(0, 255).astype(np.uint8)
+
+    support = probs >= float(threshold)
+    if np.any(support):
+        support_probs = probs[support].clip(0.0, 1.0)
+        support_colors = np.zeros((int(support.sum()), 3), dtype=np.uint8)
+        support_colors[:, 0] = 255
+        support_colors[:, 1] = np.rint(190.0 * (1.0 - support_probs) + 45.0).astype(np.uint8)
+        support_colors[:, 2] = 30
+        colors[support] = support_colors
+    return colors
+
+
+def save_support_pointcloud_visualization(
+    points: torch.Tensor,
+    features: torch.Tensor,
+    support_probs: torch.Tensor,
+    output_path: Path,
+    threshold: float,
+) -> dict[str, Any]:
+    """Save one predicted support mask point-cloud PLY and return summary stats."""
+    points_np = points.detach().cpu().numpy()
+    features_np = features.detach().cpu().numpy()
+    probs_np = support_probs.detach().cpu().numpy()
+    colors = support_prob_to_colors(features_np, probs_np, threshold)
+    save_ply(output_path, points_np, colors)
+    pred_mask = probs_np >= float(threshold)
+    return {
+        "pointcloud_ply": str(output_path),
+        "point_count": int(len(points_np)),
+        "pred_support_voxels": int(pred_mask.sum()),
+        "support_prob_min": float(probs_np.min()) if len(probs_np) else 0.0,
+        "support_prob_max": float(probs_np.max()) if len(probs_np) else 0.0,
+        "support_prob_mean": float(probs_np.mean()) if len(probs_np) else 0.0,
+    }
+
+
 def tensor_row_to_list(tensor: torch.Tensor, index: int) -> list[float]:
     """Convert one tensor row to JSON-friendly floats."""
     return [float(x) for x in tensor[index].detach().cpu().tolist()]
@@ -290,6 +346,9 @@ def run_inference(args: argparse.Namespace) -> None:
     output_split = "all" if args.split == "all" else normalize_stage1_split(args.split)
     output_dir = args.output_dir or Path(cfg["training"]["output_dir"]) / f"inference_rgb_{output_split}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    pointcloud_dir = args.pointcloud_dir or output_dir / "support_pointclouds"
+    if args.export_pointcloud:
+        pointcloud_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = output_dir / "predictions.jsonl"
     if predictions_path.exists():
         predictions_path.unlink()
@@ -314,28 +373,45 @@ def run_inference(args: argparse.Namespace) -> None:
             outputs = model(batch)
             pred_boxes = outputs["source_box"].detach().cpu()
             gt_boxes = batch["source_box_gt"].detach().cpu()
+            support_probs = torch.sigmoid(outputs["support_logits"].detach())
             batch_ious = aabb_iou_3d(pred_boxes, gt_boxes).cpu()
             batch_center_mae = torch.mean(torch.abs(pred_boxes[:, :3] - gt_boxes[:, :3]), dim=1).cpu()
 
             for index, sample_id in enumerate(batch["sample_ids"]):
+                item_id = batch["item_ids"][index]
                 source_name = batch["source_names"][index]
                 object_id = batch["object_ids"][index]
                 pred_box = pred_boxes[index].numpy()
                 gt_box = gt_boxes[index].numpy()
-                vis_path = output_dir / f"{source_name}__{sample_id}__{object_id}.png"
-                save_rgb_visualization(
-                    cfg=cfg,
-                    sample_id=str(sample_id),
-                    source_name=str(source_name),
-                    object_id=str(object_id),
-                    pred_box=pred_box,
-                    gt_box=gt_box,
-                    output_path=vis_path,
-                    line_width=int(args.line_width),
-                    draw_gt=not args.no_gt,
-                )
+                vis_path = None
+                if not args.no_rgb:
+                    vis_path = output_dir / f"{item_id}__{sample_id}__{object_id}.png"
+                    save_rgb_visualization(
+                        cfg=cfg,
+                        sample_id=str(sample_id),
+                        source_name=str(source_name),
+                        object_id=str(object_id),
+                        pred_box=pred_box,
+                        gt_box=gt_box,
+                        output_path=vis_path,
+                        line_width=int(args.line_width),
+                        draw_gt=not args.no_gt,
+                    )
+
+                pointcloud_stats = {}
+                if args.export_pointcloud:
+                    sample_mask = batch["batch_indices"] == index
+                    ply_path = pointcloud_dir / f"{item_id}__{sample_id}__{object_id}__support_pred.ply"
+                    pointcloud_stats = save_support_pointcloud_visualization(
+                        points=batch["world_coords"][sample_mask],
+                        features=batch["features"][sample_mask],
+                        support_probs=support_probs[sample_mask],
+                        output_path=ply_path,
+                        threshold=float(args.support_threshold),
+                    )
 
                 row = {
+                    "item_id": str(item_id),
                     "source_name": str(source_name),
                     "sample_id": str(sample_id),
                     "object_id": str(object_id),
@@ -344,14 +420,17 @@ def run_inference(args: argparse.Namespace) -> None:
                     "gt_source_box_cxcycz_dxdydz_cm": tensor_row_to_list(gt_boxes, index),
                     "source_iou": float(batch_ious[index]),
                     "source_center_mae_cm": float(batch_center_mae[index]),
-                    "visualization_png": str(vis_path),
+                    "visualization_png": str(vis_path) if vis_path is not None else None,
                     "visualization_rotation_source": "gt_pose",
+                    "support_threshold": float(args.support_threshold),
                 }
+                row.update(pointcloud_stats)
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
                 total += 1
                 ious.append(float(batch_ious[index]))
                 center_maes.append(float(batch_center_mae[index]))
-                print(f"Saved {vis_path}")
+                saved_path = pointcloud_stats.get("pointcloud_ply") or str(vis_path)
+                print(f"Saved {saved_path}")
 
     summary = {
         "split": output_split,
@@ -360,6 +439,8 @@ def run_inference(args: argparse.Namespace) -> None:
         "source_center_mae_cm_mean": float(np.mean(center_maes)) if center_maes else 0.0,
         "predictions_jsonl": str(predictions_path),
         "output_dir": str(output_dir),
+        "pointcloud_dir": str(pointcloud_dir) if args.export_pointcloud else None,
+        "support_threshold": float(args.support_threshold),
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False))

@@ -115,6 +115,32 @@ outputs/lc_bgplacenet_stage1/inference_rgb_valid/
 预测框和 GT 框都使用 canonical sample 中该源物体的 `pose_world` 方向绘制，
 `predictions.jsonl` 会记录 `visualization_rotation_source=gt_pose`。
 
+## Support Mask 3D 可视化
+
+测试集 support mask 点云可视化：
+
+```bash
+conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
+    --config configs/lc_bgplacenet_stage1.yaml \
+    --checkpoint outputs/lc_bgplacenet_stage1/best.pt \
+    --split test \
+    --export-pointcloud \
+    --no-rgb \
+    --output-dir outputs/lc_bgplacenet_stage1/inference_support_mask_3d_test
+```
+
+默认输出：
+
+```text
+outputs/lc_bgplacenet_stage1/inference_support_mask_3d_test/
+  support_pointclouds/
+    *__support_pred.ply  # 每条 Stage 1 样本一份；灰色为非 support active voxel，橙红色为预测 support voxel
+  predictions.jsonl      # 每条样本的 PLY 路径、support 概率统计和 source box 指标
+  summary.json
+```
+
+`--support-threshold` 控制 support mask 着色阈值，默认 `0.5`。
+
 常用参数：
 
 ```bash

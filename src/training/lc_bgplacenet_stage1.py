@@ -468,6 +468,7 @@ class LCBGPlaceNetStage1Dataset(Dataset):
         support_align_coverage = float(np.mean(support_to_active_dist <= self.support_align_threshold_cm))
 
         return {
+            "item_id": item.item_id,
             "source_name": item.source_name,
             "sample_id": item.sample_id,
             "object_id": item.object_id,
@@ -492,6 +493,7 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
     scene_max = []
     source_boxes = []
     instructions = []
+    item_ids = []
     source_names = []
     sample_ids = []
     object_ids = []
@@ -521,6 +523,7 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         scene_max.append(point_max.astype(np.float32))
         source_boxes.append(np.asarray(item["source_box_gt"], dtype=np.float32))
         instructions.append(str(item["instruction"]))
+        item_ids.append(str(item["item_id"]))
         source_names.append(str(item["source_name"]))
         sample_ids.append(str(item["sample_id"]))
         object_ids.append(str(item["object_id"]))
@@ -538,6 +541,7 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         "scene_min": torch.from_numpy(np.stack(scene_min, axis=0)),
         "scene_max": torch.from_numpy(np.stack(scene_max, axis=0)),
         "instructions": instructions,
+        "item_ids": item_ids,
         "source_names": source_names,
         "sample_ids": sample_ids,
         "object_ids": object_ids,
