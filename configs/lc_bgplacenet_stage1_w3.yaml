@@ -67,6 +67,11 @@ model:
     num_heads: 8
     # 融合模块内部使用的 dropout。
     dropout: 0.1
+  w3:
+    # W³ 文本路由:三路 role query（what/where/whole）池化文本 token 的注意力头数量。
+    num_heads: 8
+    # W³ 路由注意力池化内部使用的 dropout。
+    dropout: 0.1
   source_grounding:
     # 源物体 grounding decoder 的注意力头数量。
     num_heads: 8
@@ -76,9 +81,9 @@ model:
     dropout: 0.1
 
 loss:
-  # Support finetune 阶段源物体框
+  # 源物体框回归 loss 在 Stage 1 总 loss 中的权重。
   lambda_src: 1.0
-  # 新 support GT 支撑区域分割 loss 权重
+  # 目标支撑区域分割 loss 权重；W³ where 路 FiLM 增强后侧重 support。
   lambda_sup: 1.0
   source:
     # 源物体框中心点 L1 loss 权重。
@@ -93,13 +98,13 @@ loss:
 
 training:
   # 保存 metrics.jsonl、last.pt 和 best.pt 的输出目录。
-  output_dir: outputs/lc_bgplacenet_stage1_support
+  output_dir: outputs/lc_bgplacenet_stage1_w3
   # auto 表示优先使用 CUDA，CUDA 不可用时使用 CPU。
   device: auto
   # 用于训练复现的随机种子。
   seed: 20260624
-  # 对训练集完整遍历的总轮数；从旧 last.pt(epoch=24) resume 时会继续跑到 35。
-  epochs: 35
+  # 对训练集完整遍历的总轮数。
+  epochs: 25
   # 每次优化器更新使用的样本数。
   batch_size: 15
   # DataLoader worker 进程数量。

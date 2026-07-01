@@ -5,6 +5,19 @@ Stage 1 只训练两个分支：
 - Source Grounding：根据语言指令预测源物体 `(cx, cy, cz, l, w, h)`。
 - Support Surface：预测每个 active voxel 是否属于该条指令对应的目标支撑区域。
 
+文本侧使用 **W³ Language Routing**：RoBERTa 输出的 token 特征经三个可学习 role query
+池化为 `what/where/whole` 三路角色表征——`what` 注入 Source Grounding 的 query，
+`where` 以 FiLM 调制 Support Head，`whole` 作为 `outputs["text_whole"]` 透传给 Stage 2。
+`whole` 路在 Stage 1 无直接监督，留待 Stage 2 训练。
+
+点云侧使用 **CamPE（Camera-Relative Positional Encoding）**：因为自动标注生成的
+`left/right/front/back` 方位词是按拍摄该帧时的相机视角描述的（世界坐标系的 X/Y 轴
+本身与相机朝向无关），所以每个 active voxel 的位置编码改用该帧相机系坐标
+`R_w2c @ (point_world - camera_center)`，而不是世界坐标。CamPE 替代了原来的世界系
+`pos_mlp`，Source Grounding 的 query 位置编码和 Support Head 的输入统一使用同一份
+`pos_embed_cam`。上下方向（top/below）仍由 world Z 轴决定，但 CamPE 本身不单独保留
+世界 Z 分量，垂直语义完全由相机系三轴隐式承载。
+
 本阶段不训练 placement heatmap 和 yaw。Stage 1 训练完成后，先查看验证指标和可视化效果，再决定是否进入 Stage 2。
 
 ## 数据输入
@@ -18,6 +31,11 @@ point_clouds_voxel_1cm/*.ply
 不要把 `point_clouds/*.ply` 直接作为 Stage 1 输入。Stage 1 会通过 `all_labels.json` 中的
 `placement_sample_id/cluster_id` 回连 free_bbox placement，并使用该 placement 的
 `corners_world` 和对应帧的 `support_mask_ply` 生成文本条件目标支撑区域监督。
+
+Stage 1 现在还需要每帧的相机外参 `samples/<sample_id>.json` 中的 `camera.E_c2w`，用于
+计算 CamPE（见下文）。5 个数据源（dopose/hope/housecat/omni/ycbv）的 canonical 转换
+流程都会写出该字段；如果自定义数据源缺失 `camera.E_c2w`，`build_stage1_index` 会直接
+报错，不做静默兜底。
 
 Support 监督生成规则：
 
@@ -81,6 +99,18 @@ conda run -n spatial python tools/train_lc_bgplacenet_stage1.py \
 conda run -n spatial python tools/train_lc_bgplacenet_stage1.py \
     --config configs/lc_bgplacenet_stage1.yaml
 ```
+
+W³ 版训练使用专门配置 `configs/lc_bgplacenet_stage1_w3.yaml`（显式 `model.w3` 段，
+并把 `lambda_sup` 提到 1.0 侧重 support），输出到 `outputs/lc_bgplacenet_stage1_w3/`：
+
+```bash
+conda run -n spatial python tools/train_lc_bgplacenet_stage1.py \
+    --config configs/lc_bgplacenet_stage1_w3.yaml
+```
+
+模型结构变更（Support Head 改为 FiLM 版、新增 W³ 路由、文本编码器移除 mask-mean 全局向量），
+旧 checkpoint 无法直接 resume，需从头训练。旧配置 `lc_bgplacenet_stage1.yaml` 未写 `w3` 段时，
+W³ 会退回默认超参（`num_heads=8, dropout=0.1`）仍可加载。
 
 多卡 Stage 1：
 

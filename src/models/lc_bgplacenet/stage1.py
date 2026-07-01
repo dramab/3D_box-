@@ -89,7 +89,7 @@ class TransformerTextEncoder(nn.Module):
             for param in self.encoder.parameters():
                 param.requires_grad_(False)
 
-    def forward(self, instructions: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, instructions: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = self.tokenizer(
             instructions,
             padding=True,
@@ -102,10 +102,40 @@ class TransformerTextEncoder(nn.Module):
         with context:
             encoded = self.encoder(**tokens)
         token_features = self.proj(encoded.last_hidden_state)
-        attention_mask = tokens["attention_mask"].to(dtype=token_features.dtype)
-        denom = attention_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        text_global = (token_features * attention_mask.unsqueeze(-1)).sum(dim=1) / denom
-        return token_features, text_global, tokens["attention_mask"].bool()
+        return token_features, tokens["attention_mask"].bool()
+
+
+class W3LanguageRouting(nn.Module):
+    """W³ 文本路由:三个可学习 role query 将文本 token 特征池化为三路角色表征。
+
+    what  -> 源物体身份与几何信息,注入 source grounding head 的 query
+    where -> 支撑面方位信息,FiLM 调制 support head
+    whole -> 指令整体语义,透传给 Stage 2
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        # 三路 role query,顺序固定为 what / where / whole
+        self.role_queries = nn.Parameter(torch.randn(1, 3, hidden_dim) * 0.02)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        text_tokens: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = text_tokens.shape[0]
+        query = self.role_queries.repeat(batch_size, 1, 1)
+        pooled, _ = self.attn(
+            query=query,
+            key=text_tokens,
+            value=text_tokens,
+            key_padding_mask=~text_attention_mask,
+            need_weights=False,
+        )
+        pooled = self.norm(pooled)
+        return pooled[:, 0], pooled[:, 1], pooled[:, 2]
 
 
 class VoxelLanguageFusion(nn.Module):
@@ -178,7 +208,7 @@ class SingleQuerySourceGroundingHead(nn.Module):
         self,
         voxel_features: torch.Tensor,
         voxel_pos_embed: torch.Tensor,
-        text_global: torch.Tensor,
+        text_what: torch.Tensor,
         voxel_padding_mask: torch.Tensor,
         scene_min: torch.Tensor,
         scene_max: torch.Tensor,
@@ -186,7 +216,7 @@ class SingleQuerySourceGroundingHead(nn.Module):
         batch_size = voxel_features.shape[0]
         memory = voxel_features + voxel_pos_embed
         query = self.source_query.repeat(batch_size, 1, 1)
-        query = query + self.text_proj(text_global).unsqueeze(1)
+        query = query + self.text_proj(text_what).unsqueeze(1)
         source_feature = self.decoder(
             tgt=query,
             memory=memory,
@@ -203,18 +233,28 @@ class SingleQuerySourceGroundingHead(nn.Module):
 
 
 class SupportHead(nn.Module):
-    """Per-active-voxel target support region classifier."""
+    """逐 voxel 支撑区域分类,叠加 CamPE 相机方位编码,并用 W³ where 向量做 FiLM 调制。"""
 
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.pre = nn.Linear(hidden_dim, hidden_dim)
+        # where 向量生成逐通道的 (gamma, beta) 调制系数
+        self.film = nn.Linear(hidden_dim, hidden_dim * 2)
+        self.act = nn.ReLU(inplace=True)
+        self.head = nn.Linear(hidden_dim, 1)
 
-    def forward(self, voxel_features: torch.Tensor) -> torch.Tensor:
-        return self.mlp(voxel_features).squeeze(-1)
+    def forward(
+        self,
+        voxel_features: torch.Tensor,
+        pos_embed_cam: torch.Tensor,
+        where_embed: torch.Tensor,
+        batch_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = self.pre(voxel_features + pos_embed_cam)
+        gamma, beta = self.film(where_embed).chunk(2, dim=-1)
+        # 方位向量按 voxel 所属样本广播;(1 + gamma) 保证恒等初始化下的稳定性
+        hidden = (1.0 + gamma[batch_indices]) * hidden + beta[batch_indices]
+        return self.head(self.act(hidden)).squeeze(-1)
 
 
 class LCBGPlaceNetStage1(nn.Module):
@@ -243,7 +283,16 @@ class LCBGPlaceNetStage1(nn.Module):
             num_heads=int(cfg["fusion"].get("num_heads", 4)),
             dropout=float(cfg["fusion"].get("dropout", 0.1)),
         )
-        self.pos_mlp = nn.Sequential(
+        # w3 段可缺省;旧配置未显式配置时退回默认超参,保证向后兼容加载。
+        w3_cfg = cfg.get("w3", {})
+        self.w3 = W3LanguageRouting(
+            hidden_dim=hidden_dim,
+            num_heads=int(w3_cfg.get("num_heads", 8)),
+            dropout=float(w3_cfg.get("dropout", 0.1)),
+        )
+        # CamPE:相机相关方位编码,替代原先的世界系 pos_mlp，Source Grounding 和
+        # Support Head 共用同一份编码(见 forward 中的 pos_embed_cam)。
+        self.pos_mlp_cam = nn.Sequential(
             nn.Linear(3, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -259,10 +308,12 @@ class LCBGPlaceNetStage1(nn.Module):
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         batch_size = int(batch["batch_size"])
         f_3d = self.backbone(batch)
-        text_tokens, text_global, text_attention_mask = self.text_encoder(
+        text_tokens, text_attention_mask = self.text_encoder(
             batch["instructions"],
             device=batch["features"].device,
         )
+        # W³ 三路路由:what/where/whole 分别服务 grounding / support / Stage 2
+        text_what, text_where, text_whole = self.w3(text_tokens, text_attention_mask)
         f_vl = self.fusion(
             voxel_features=f_3d,
             text_tokens=text_tokens,
@@ -270,32 +321,36 @@ class LCBGPlaceNetStage1(nn.Module):
             batch_indices=batch["batch_indices"],
             batch_size=batch_size,
         )
+        # CamPE:每个 active voxel 相对该帧相机的方位编码,Source Grounding 和
+        # Support Head 共用同一份,与语言指令中方位词的参照系保持一致。
+        pos_embed_cam = self.pos_mlp_cam(batch["coords_cam_norm"])
         voxel_tokens, pos_tokens, padding_mask = self._pack_voxels(
             f_vl,
-            batch["coords_norm"],
+            pos_embed_cam,
             batch["batch_indices"],
             batch_size,
         )
         source_out = self.source_grounding(
             voxel_features=voxel_tokens,
             voxel_pos_embed=pos_tokens,
-            text_global=text_global,
+            text_what=text_what,
             voxel_padding_mask=padding_mask,
             scene_min=batch["scene_min"],
             scene_max=batch["scene_max"],
         )
-        support_logits = self.support_head(f_vl)
+        support_logits = self.support_head(f_vl, pos_embed_cam, text_where, batch["batch_indices"])
         return {
             "source_box": source_out["source_box"],
             "source_feature": source_out["source_feature"],
             "support_logits": support_logits,
             "voxel_language_features": f_vl,
+            "text_whole": text_whole,
         }
 
     def _pack_voxels(
         self,
         voxel_features: torch.Tensor,
-        coords_norm: torch.Tensor,
+        pos_embed: torch.Tensor,
         batch_indices: torch.Tensor,
         batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -305,7 +360,6 @@ class LCBGPlaceNetStage1(nn.Module):
         tokens = voxel_features.new_zeros((batch_size, max_voxels, hidden_dim))
         pos = voxel_features.new_zeros((batch_size, max_voxels, hidden_dim))
         padding_mask = torch.ones((batch_size, max_voxels), dtype=torch.bool, device=voxel_features.device)
-        pos_embed = self.pos_mlp(coords_norm)
         for batch_idx in range(batch_size):
             idx = torch.nonzero(batch_indices == batch_idx, as_tuple=False).flatten()
             count = len(idx)
