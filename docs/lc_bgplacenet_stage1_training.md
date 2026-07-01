@@ -3,7 +3,7 @@
 Stage 1 只训练两个分支：
 
 - Source Grounding：根据语言指令预测源物体 `(cx, cy, cz, l, w, h)`。
-- Support Surface：预测每个 active voxel 是否属于支撑面。
+- Support Surface：预测每个 active voxel 是否属于该条指令对应的目标支撑区域。
 
 本阶段不训练 placement heatmap 和 yaw。Stage 1 训练完成后，先查看验证指标和可视化效果，再决定是否进入 Stage 2。
 
@@ -15,17 +15,26 @@ Stage 1 只训练两个分支：
 point_clouds_voxel_1cm/*.ply
 ```
 
-不要把 `point_clouds/*.ply` 直接作为 Stage 1 输入。`support_mask_ply` 是 free_bbox 基于 1cm 体素点云生成的，与 `point_clouds_voxel_1cm` 坐标和尺度最一致。
+不要把 `point_clouds/*.ply` 直接作为 Stage 1 输入。Stage 1 会通过 `all_labels.json` 中的
+`placement_sample_id/cluster_id` 回连 free_bbox placement，并使用该 placement 的
+`corners_world` 和对应帧的 `support_mask_ply` 生成文本条件目标支撑区域监督。
 
 Support 监督生成规则：
 
 ```text
 1. 数据索引只保留 all_labels.json 中 visualization_png 实际存在的记录。
-2. 读取对应 placements JSON 中的 support_mask_ply。
-3. 读取 support_mask_ply 中颜色为白色的点。
-4. 对每个 active voxel 点查询最近的白色 support 点。
-5. 最近距离 <= 1.5cm 的 active voxel 标为 support=1，否则为 0。
+2. 用 placement_sample_id 优先、cluster_id 兜底，在对应 placements JSON 中找回目标 placement。
+3. 读取该 placement 的 corners_world，计算 GT 放置框底面中心和底面 Z。
+4. 读取 support_mask_ply 中白色支撑面点，并在底面 Z 附近找出 GT 中心所在的支撑面连通区域。
+5. 该连通区域面积记为 A，候选圆面积为 A * support_radius_area_fraction，半径为 sqrt(A * support_radius_area_fraction / pi)。
+6. active voxel 同时满足以下条件时标为 support=1，否则为 0：
+   - 与最近支撑面白点距离不超过 support_align_threshold_cm。
+   - XY 平面上到 GT 底面中心的距离不超过上一步计算出的动态半径。
+   - Z 到 GT 底面的距离不超过 support_align_threshold_cm。
 ```
+
+这个定义监督的是“目标 placement 中心附近、且覆盖当前支撑面固定面积比例的支撑面点”。
+半径只由 GT 中心所在支撑面连通区域面积决定，不由目标物体 footprint 决定，也不额外设置上限或下限。
 
 ## 固定数据划分
 
@@ -115,9 +124,43 @@ outputs/lc_bgplacenet_stage1/inference_rgb_valid/
 预测框和 GT 框都使用 canonical sample 中该源物体的 `pose_world` 方向绘制，
 `predictions.jsonl` 会记录 `visualization_rotation_source=gt_pose`。
 
-## Support Mask 3D 可视化
+## Support GT 3D 可视化
 
-测试集 support mask 点云可视化：
+GT 支撑区域点云可视化不需要 checkpoint，也不运行模型推理。脚本直接读取 Stage 1
+dataset，按当前 `support_label` 生成逻辑导出该条语言指令对应的目标支撑区域。
+
+```bash
+conda run -n spatial python tools/export_lc_bgplacenet_stage1_support_gt.py \
+    --config configs/lc_bgplacenet_stage1.yaml \
+    --split test \
+    --max-samples 32
+```
+
+默认输出：
+
+```text
+outputs/lc_bgplacenet_stage1/support_gt_pointclouds/
+  pointclouds/
+    *__support_gt.ply  # 灰色为非 GT support active voxel，橙红色为 GT target support voxel
+  records.jsonl        # 每条样本的 PLY 路径、placement id、指令和 GT support 统计
+  summary.json
+```
+
+如需导出某一条样本：
+
+```bash
+conda run -n spatial python tools/export_lc_bgplacenet_stage1_support_gt.py \
+    --config configs/lc_bgplacenet_stage1.yaml \
+    --split all \
+    --sample-id dopose__test_table_000001__000001 \
+    --object-id obj_0
+```
+
+`--max-samples 0` 表示导出所有匹配样本；默认只导出 32 条，避免一次性写出过多 PLY。
+
+## Support Prediction 3D 可视化
+
+测试集 support 预测点云可视化需要 checkpoint，并会运行模型前向：
 
 ```bash
 conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \

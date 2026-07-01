@@ -37,8 +37,9 @@
 sample = {
     "points": Tensor[N, 6],
     "instruction": str,
+    "placement_sample_id": str,
     "support_mask_ply": path,
-    "placement_heatmap_ply": path,
+    "corners_world": Tensor[8, 3],
 }
 ```
 
@@ -54,14 +55,14 @@ instruction:
     例如：
     "Move TomatoSauce located at the back left of CreamCheese to the right of TomatoSauce."
 
-support_mask_ply:
-    支撑面 mask 点云。
-    作为支撑面预测分支的监督信号。
+placement_sample_id:
+    该语言指令对应的 free_bbox placement id。
 
-placement_heatmap_ply:
-    可放置位置热力点云。
-    其中每个点表示目标放置 box 的底面中心点。
-    它是 placement heatmap 的监督信号，不是推理阶段输入。
+support_mask_ply:
+    该帧支撑面 mask 点云；白色点表示支撑面点。
+
+corners_world:
+    该 placement 的目标放置框角点，用于生成按支撑面面积缩放的中心区域监督。
 ```
 
 ---
@@ -135,7 +136,7 @@ place_yaw_bin_gt:
     第一版使用 24 个 yaw bin。
 
 support_voxel_label:
-    由 support_mask_ply 转换得到的支撑面体素标签。
+    由目标 placement 底面中心、中心所在支撑面连通区域面积和支撑面 mask 得到的文本条件支撑中心点标签。
 
 placement_heatmap_gt:
     由 placement_heatmap_ply 对齐到候选支撑点后得到的 placement heatmap 标签。
@@ -243,9 +244,9 @@ features:    [num_voxels, C_in]
 
 ---
 
-### 5.2 支撑面标签生成
+### 5.2 目标支撑区域标签生成
 
-`support_mask_ply` 用于生成：
+目标 placement 的 `corners_world` 和该帧 `support_mask_ply` 用于生成：
 
 ```python
 support_voxel_label: Tensor[Nv]
@@ -254,23 +255,29 @@ support_voxel_label: Tensor[Nv]
 标签含义：
 
 ```text
-1：该体素属于支撑面
-0：该体素不属于支撑面
+1：该体素属于当前文字指令对应的目标支撑区域
+0：该体素不属于当前文字指令对应的目标支撑区域
 ```
 
-可以使用最近邻距离对齐：
+生成方式：
 
 ```python
-if nearest_distance(voxel_center_i, support_ply_points) < threshold:
+if (
+    nearest_distance(voxel_center_i, support_mask_white_points) < support_align_threshold_cm
+    and xy_distance(voxel_center_i, gt_bottom_center) <= sqrt(component_area_cm2 * support_radius_area_fraction / pi)
+    and abs(voxel_center_i.z - gt_bottom_z) <= support_align_threshold_cm
+):
     support_voxel_label[i] = 1
-else:
-    support_voxel_label[i] = 0
 ```
+
+`component_area_cm2` 只统计 GT 中心所在的支撑面连通区域，不统计整帧所有支撑面。
+该标签表示“目标 placement 中心附近、且覆盖当前支撑面固定面积比例的支撑面点”。
 
 推荐阈值：
 
 ```text
-threshold = 1.5 * voxel_size
+support_align_threshold_cm = 1.5 * voxel_size
+support_radius_area_fraction = 0.25
 ```
 
 ---
@@ -745,7 +752,7 @@ class SupportHead(nn.Module):
 
 ### 11.2 Support loss
 
-监督来自 `support_mask_ply`：
+监督来自目标 placement 底面中心附近、按支撑面连通区域面积动态缩放半径的支撑面点：
 
 ```python
 L_sup = BCEWithLogitsLoss(support_logits, support_voxel_label)

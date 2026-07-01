@@ -1,8 +1,8 @@
 """
 LC-BGPlaceNet Stage 1 model.
 
-Implements source grounding and support surface prediction from active 1cm
-voxel point clouds and language instructions.
+Implements source grounding and target support region prediction from active
+1cm voxel point clouds and language instructions.
 """
 
 from __future__ import annotations
@@ -203,7 +203,7 @@ class SingleQuerySourceGroundingHead(nn.Module):
 
 
 class SupportHead(nn.Module):
-    """Per-active-voxel support surface classifier."""
+    """Per-active-voxel target support region classifier."""
 
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()

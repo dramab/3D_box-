@@ -76,10 +76,10 @@ model:
     dropout: 0.1
 
 loss:
-  # 源物体框回归 loss 在 Stage 1 总 loss 中的权重。
+  # Support finetune 阶段源物体框
   lambda_src: 1.0
-  # 目标支撑区域分割 loss 在 Stage 1 总 loss 中的权重。
-  lambda_sup: 0.2
+  # 新 support GT 支撑区域分割 loss 权重
+  lambda_sup: 1.0
   source:
     # 源物体框中心点 L1 loss 权重。
     lambda_center: 2.0
@@ -93,17 +93,17 @@ loss:
 
 training:
   # 保存 metrics.jsonl、last.pt 和 best.pt 的输出目录。
-  output_dir: outputs/lc_bgplacenet_stage1
+  output_dir: outputs/lc_bgplacenet_stage1_support
   # auto 表示优先使用 CUDA，CUDA 不可用时使用 CPU。
   device: auto
   # 用于训练复现的随机种子。
   seed: 20260624
-  # 对训练集完整遍历的轮数。
+  # 对训练集完整遍历的总轮数；从旧 last.pt(epoch=24) resume 时会继续跑到 35。
   epochs: 25
   # 每次优化器更新使用的样本数。
   batch_size: 15
   # DataLoader worker 进程数量。
-  num_workers: 4
+  num_workers: 8
   # 将 host memory pin 住以加速 CUDA 数据传输。
   pin_memory: true
   # 是否在主进程显示训练/验证进度条；多卡训练时只在 rank 0 显示。

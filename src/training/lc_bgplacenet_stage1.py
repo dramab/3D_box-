@@ -1,9 +1,10 @@
 """
 LC-BGPlaceNet Stage 1 training utilities.
 
-Stage 1 trains source grounding and support surface prediction from canonical
-1cm voxel point clouds. Support labels are built by nearest-neighbor alignment
-from free_bbox support mask PLY white points to active voxels.
+Stage 1 trains source grounding and text-conditioned target support region
+prediction from canonical 1cm voxel point clouds. Support labels are built from
+a support-area-scaled neighborhood around the target placement center,
+constrained to support-surface voxels.
 """
 
 from __future__ import annotations
@@ -64,6 +65,9 @@ class Stage1IndexItem:
     dataset_dir: Path
     voxel_point_cloud_path: Path
     support_mask_path: Path
+    placement_sample_id: str
+    cluster_id: int
+    placement_corners_world: np.ndarray
     source_box_gt: np.ndarray
 
 
@@ -90,11 +94,14 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
                     payload_cache[cache_key] = json.load(f)
             payload = payload_cache[cache_key]
 
-            support_mask_path = source.free_bbox_dir / payload["support_mask_ply"]
-
             obj_record = _find_object_record(payload, object_id)
             if obj_record is None:
                 raise ValueError(f"Object {object_id} not found in {source.name}/{sample_id} placements")
+            placement = _find_placement_record(obj_record, record)
+            if placement is None:
+                raise ValueError(f"Placement not found for {source.name}/{sample_id}/{object_id}")
+            if "corners_world" not in placement:
+                raise ValueError(f"Placement {placement.get('sample_id')} missing corners_world")
 
             voxel_path = _resolve_voxel_path(source.dataset_dir, sample_id, payload)
 
@@ -108,7 +115,10 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
                     instruction=instruction,
                     dataset_dir=source.dataset_dir,
                     voxel_point_cloud_path=voxel_path,
-                    support_mask_path=support_mask_path,
+                    support_mask_path=_resolve_free_bbox_path(source.free_bbox_dir, payload["support_mask_ply"]),
+                    placement_sample_id=str(placement["sample_id"]),
+                    cluster_id=int(placement["cluster_id"]),
+                    placement_corners_world=np.asarray(placement["corners_world"], dtype=np.float32),
                     source_box_gt=_source_box_from_obb(
                         obj_record["canonical_aabb_object"],
                         obj_record["original_pose_world"],
@@ -370,6 +380,14 @@ def _resolve_voxel_path(dataset_dir: Path, sample_id: str, placement_payload: di
     return dataset_dir / "point_clouds_voxel_1cm" / f"{sample_id}.ply"
 
 
+def _resolve_free_bbox_path(free_bbox_dir: Path, raw_path: str | Path) -> Path:
+    """Resolve a free_bbox output path that may already be absolute."""
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    return free_bbox_dir / path
+
+
 def _visualization_exists(free_bbox_dir: Path, record: dict[str, Any]) -> bool:
     """Use generated visualization PNGs as the Stage 1 sample whitelist."""
     vis_rel = record.get("visualization_png")
@@ -410,8 +428,161 @@ def _find_object_record(placement_payload: dict[str, Any], object_id: str) -> di
     return None
 
 
+def _find_placement_record(obj_record: dict[str, Any], label_record: dict[str, Any]) -> dict[str, Any] | None:
+    """Find the placement record referenced by one auto-label row."""
+    placements = list(obj_record.get("placements", []))
+    placement_sample_id = label_record.get("placement_sample_id")
+    if placement_sample_id is not None:
+        for placement in placements:
+            if str(placement.get("sample_id")) == str(placement_sample_id):
+                return placement
+
+    cluster_id = label_record.get("cluster_id")
+    if cluster_id is None:
+        return None
+    for placement in placements:
+        placement_cluster_id = placement.get("cluster_id")
+        if placement_cluster_id is not None and int(placement_cluster_id) == int(cluster_id):
+            return placement
+    return None
+
+
+def _bottom_center_and_z(corners_world: np.ndarray, z_tolerance_cm: float) -> tuple[np.ndarray, float]:
+    """Return the placed box bottom center and bottom z."""
+    corners = np.asarray(corners_world, dtype=np.float64)
+    bottom_z = float(corners[:, 2].min())
+    bottom = corners[corners[:, 2] <= bottom_z + max(float(z_tolerance_cm), 1e-6)]
+    center_xy = bottom[:, :2].mean(axis=0)
+    return center_xy, bottom_z
+
+
+def _support_component_area_cm2(
+    support_points: np.ndarray,
+    center_xy: np.ndarray,
+    bottom_z: float,
+    align_threshold_cm: float,
+    voxel_size_cm: float,
+) -> float:
+    """Estimate area of the support-surface component containing the GT center."""
+    z_tol = float(align_threshold_cm)
+    near_bottom = np.abs(support_points[:, 2] - float(bottom_z)) <= z_tol
+    plane_points = np.asarray(support_points[near_bottom], dtype=np.float64)
+    if len(plane_points) == 0:
+        raise ValueError("No support surface points found near the target bottom height")
+
+    xy = plane_points[:, :2]
+    start_index = int(np.argmin(np.sum((xy - center_xy[None, :]) ** 2, axis=1)))
+    voxel_size = max(float(voxel_size_cm), 1e-6)
+    grid_coords = np.rint(xy / voxel_size).astype(np.int64)
+    start = tuple(int(v) for v in grid_coords[start_index])
+    support_grid = {tuple(int(v) for v in coord) for coord in grid_coords}
+
+    offsets = [
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, -1),
+        (0, 1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+    ]
+    stack = [start]
+    visited = {start}
+    while stack:
+        x, y = stack.pop()
+        for dx, dy in offsets:
+            neighbor = (x + dx, y + dy)
+            if neighbor in support_grid and neighbor not in visited:
+                visited.add(neighbor)
+                stack.append(neighbor)
+
+    return float(len(visited)) * voxel_size * voxel_size
+
+
+def _support_radius_from_area(area_cm2: float, area_fraction: float) -> float:
+    """Convert a support component area fraction into an equivalent circle radius."""
+    fraction = float(area_fraction)
+    if fraction <= 0.0:
+        raise ValueError("support_radius_area_fraction must be positive")
+    return math.sqrt(float(area_cm2) * fraction / math.pi)
+
+
+def _dynamic_radius_center_label(
+    points: np.ndarray,
+    corners_world: np.ndarray,
+    center_radius_cm: float,
+    z_tolerance_cm: float,
+) -> np.ndarray:
+    """Mark active voxels within the dynamic XY radius of the placed box bottom center."""
+    center_xy, bottom_z = _bottom_center_and_z(corners_world, z_tolerance_cm)
+    points_xy = np.asarray(points[:, :2], dtype=np.float64)
+    in_radius = np.linalg.norm(points_xy - center_xy[None, :], axis=1) <= float(center_radius_cm)
+    near_bottom_z = np.abs(points[:, 2] - bottom_z) <= float(z_tolerance_cm)
+    return in_radius & near_bottom_z
+
+
+def _build_target_support_label(
+    points: np.ndarray,
+    support_mask_path: Path,
+    corners_world: np.ndarray,
+    align_threshold_cm: float,
+    radius_area_fraction: float,
+    voxel_size_cm: float,
+) -> tuple[np.ndarray, float]:
+    """Build placement-specific target support labels for active voxels."""
+    if len(points) == 0:
+        raise ValueError("empty active point cloud")
+
+    mask_points, mask_colors = load_ply(support_mask_path)
+    white = np.all(mask_colors.astype(np.int16) >= 240, axis=1)
+    support_points = mask_points[white]
+    if len(support_points) == 0:
+        raise ValueError(f"No support surface points found in {support_mask_path}")
+
+    support_tree = cKDTree(support_points)
+    dist_to_support, _ = support_tree.query(points, k=1)
+    support_surface_label = dist_to_support <= float(align_threshold_cm)
+    center_xy, bottom_z = _bottom_center_and_z(corners_world, align_threshold_cm)
+    support_area_cm2 = _support_component_area_cm2(
+        support_points,
+        center_xy,
+        bottom_z,
+        align_threshold_cm=float(align_threshold_cm),
+        voxel_size_cm=float(voxel_size_cm),
+    )
+    center_radius_cm = _support_radius_from_area(
+        support_area_cm2,
+        area_fraction=float(radius_area_fraction),
+    )
+    center_label = _dynamic_radius_center_label(
+        points,
+        corners_world,
+        center_radius_cm=float(center_radius_cm),
+        z_tolerance_cm=float(align_threshold_cm),
+    )
+    labels = center_label & support_surface_label
+    if not np.any(labels):
+        raise ValueError("No support-surface voxels found inside the area-scaled placement center region")
+
+    support_center_label = _dynamic_radius_center_label(
+        support_points,
+        corners_world,
+        center_radius_cm=float(center_radius_cm),
+        z_tolerance_cm=float(align_threshold_cm),
+    )
+    center_support_points = support_points[support_center_label]
+    if len(center_support_points) == 0:
+        align_coverage = 0.0
+    else:
+        active_tree = cKDTree(points)
+        support_to_active_dist, _ = active_tree.query(center_support_points, k=1)
+        align_coverage = float(np.mean(support_to_active_dist <= float(align_threshold_cm)))
+    return labels.astype(np.float32), align_coverage
+
+
 class LCBGPlaceNetStage1Dataset(Dataset):
-    """Dataset for source grounding and support surface Stage 1 training."""
+    """Dataset for source grounding and target support region Stage 1 training."""
 
     def __init__(
         self,
@@ -420,6 +591,8 @@ class LCBGPlaceNetStage1Dataset(Dataset):
         val_fraction: float = 0.1,
         seed: int = 0,
         support_align_threshold_cm: float = 1.5,
+        support_radius_area_fraction: float = 0.25,
+        voxel_size_cm: float = 1.0,
         max_samples: int | None = None,
         items: list[Stage1IndexItem] | None = None,
         split_dir: str | Path | None = None,
@@ -427,6 +600,8 @@ class LCBGPlaceNetStage1Dataset(Dataset):
         split_name = normalize_stage1_split(split)
         self.split = split_name
         self.support_align_threshold_cm = float(support_align_threshold_cm)
+        self.support_radius_area_fraction = float(support_radius_area_fraction)
+        self.voxel_size_cm = float(voxel_size_cm)
         if items is None:
             if sources is None:
                 raise ValueError("sources must be provided when items is None")
@@ -453,25 +628,22 @@ class LCBGPlaceNetStage1Dataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self.items[idx]
         points, colors = load_ply(item.voxel_point_cloud_path)
-        mask_points, mask_colors = load_ply(item.support_mask_path)
-        white = np.all(mask_colors.astype(np.int16) >= 240, axis=1)
-        support_points = mask_points[white]
-        if len(points) == 0 or len(support_points) == 0:
-            raise ValueError(f"Invalid empty point/support data for {item.sample_id}")
-
-        support_tree = cKDTree(support_points)
-        dist_to_support, _ = support_tree.query(points, k=1)
-        support_label = (dist_to_support <= self.support_align_threshold_cm).astype(np.float32)
-
-        active_tree = cKDTree(points)
-        support_to_active_dist, _ = active_tree.query(support_points, k=1)
-        support_align_coverage = float(np.mean(support_to_active_dist <= self.support_align_threshold_cm))
+        support_label, support_align_coverage = _build_target_support_label(
+            points,
+            item.support_mask_path,
+            item.placement_corners_world,
+            self.support_align_threshold_cm,
+            self.support_radius_area_fraction,
+            self.voxel_size_cm,
+        )
 
         return {
             "item_id": item.item_id,
             "source_name": item.source_name,
             "sample_id": item.sample_id,
             "object_id": item.object_id,
+            "placement_sample_id": item.placement_sample_id,
+            "cluster_id": item.cluster_id,
             "instruction": item.instruction,
             "points": points.astype(np.float32),
             "colors": colors.astype(np.uint8),
@@ -497,6 +669,8 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
     source_names = []
     sample_ids = []
     object_ids = []
+    placement_sample_ids = []
+    cluster_ids = []
     align_coverages = []
     spatial_max = np.zeros(3, dtype=np.int64)
 
@@ -527,6 +701,8 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         source_names.append(str(item["source_name"]))
         sample_ids.append(str(item["sample_id"]))
         object_ids.append(str(item["object_id"]))
+        placement_sample_ids.append(str(item["placement_sample_id"]))
+        cluster_ids.append(int(item["cluster_id"]))
         align_coverages.append(float(item["support_align_coverage"]))
 
     return {
@@ -545,6 +721,8 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         "source_names": source_names,
         "sample_ids": sample_ids,
         "object_ids": object_ids,
+        "placement_sample_ids": placement_sample_ids,
+        "cluster_ids": cluster_ids,
         "support_align_coverage": torch.tensor(align_coverages, dtype=torch.float32),
         "batch_size": len(batch),
     }
@@ -580,7 +758,7 @@ def source_box_loss(
 
 
 def support_loss(logits: torch.Tensor, labels: torch.Tensor, pos_weight: float | None = None) -> torch.Tensor:
-    """Binary support surface loss over active voxels."""
+    """Binary target support region loss over active voxels."""
     weight = None
     if pos_weight is not None:
         weight = torch.tensor(float(pos_weight), dtype=logits.dtype, device=logits.device)
@@ -774,6 +952,8 @@ def train_stage1(
             val_fraction=valid_fraction,
             seed=int(data_cfg.get("split_seed", 0)),
             support_align_threshold_cm=float(data_cfg["support_align_threshold_cm"]),
+            support_radius_area_fraction=float(data_cfg.get("support_radius_area_fraction", 0.25)),
+            voxel_size_cm=float(data_cfg.get("voxel_size_cm", 1.0)),
             max_samples=max_train_samples or data_cfg.get("max_train_samples"),
             items=all_items,
             split_dir=split_dir,
@@ -784,6 +964,8 @@ def train_stage1(
             val_fraction=valid_fraction,
             seed=int(data_cfg.get("split_seed", 0)),
             support_align_threshold_cm=float(data_cfg["support_align_threshold_cm"]),
+            support_radius_area_fraction=float(data_cfg.get("support_radius_area_fraction", 0.25)),
+            voxel_size_cm=float(data_cfg.get("voxel_size_cm", 1.0)),
             max_samples=max_val_samples or data_cfg.get("max_valid_samples", data_cfg.get("max_val_samples")),
             items=all_items,
             split_dir=split_dir,
