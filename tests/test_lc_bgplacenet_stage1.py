@@ -15,10 +15,12 @@ from src.training.lc_bgplacenet_stage1 import (
     Stage1DataSource,
     STAGE1_SPLIT_SCHEMA_VERSION,
     build_stage1_index,
+    compute_stage1_loss,
     compute_stage1_metrics,
     stage1_item_to_split_record,
     stage1_collate,
     source_box_loss,
+    support_loss,
 )
 
 
@@ -319,3 +321,42 @@ def test_stage1_support_metrics() -> None:
     assert metrics["support_precision"] > 0.999
     assert metrics["support_recall"] > 0.999
     assert metrics["support_f1"] > 0.999
+
+
+def test_stage1_support_loss_auto_pos_weight_balances_batch() -> None:
+    """Auto support pos_weight should up-weight sparse positive voxels."""
+    logits = torch.zeros(4)
+    labels = torch.tensor([1.0, 0.0, 0.0, 0.0])
+
+    loss = support_loss(logits, labels, pos_weight="auto")
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        labels,
+        pos_weight=torch.tensor(3.0),
+    )
+
+    assert torch.allclose(loss, expected)
+
+
+def test_compute_stage1_loss_logs_auto_support_pos_weight() -> None:
+    """Stage 1 loss logging should expose the batch-adaptive support weight."""
+    outputs = {
+        "source_box": torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]),
+        "support_logits": torch.zeros(3),
+    }
+    batch = {
+        "source_box_gt": torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]),
+        "support_labels": torch.tensor([1.0, 0.0, 0.0]),
+    }
+    cfg = {
+        "loss": {
+            "lambda_src": 1.0,
+            "lambda_sup": 1.0,
+            "source": {"lambda_center": 2.0, "lambda_size": 1.5, "lambda_iou": 0.2},
+            "support": {"pos_weight": "auto", "max_pos_weight": 20.0},
+        }
+    }
+
+    losses = compute_stage1_loss(outputs, batch, cfg)
+
+    assert torch.allclose(losses["support_pos_weight"], torch.tensor(2.0))

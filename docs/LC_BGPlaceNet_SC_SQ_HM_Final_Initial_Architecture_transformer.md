@@ -755,10 +755,13 @@ class SupportHead(nn.Module):
 监督来自目标 placement 底面中心附近、按支撑面连通区域面积动态缩放半径的支撑面点：
 
 ```python
-L_sup = BCEWithLogitsLoss(support_logits, support_voxel_label)
+pos_weight = num_negative_support_voxels / max(num_positive_support_voxels, 1)
+L_sup = BCEWithLogitsLoss(support_logits, support_voxel_label, pos_weight=pos_weight)
 ```
 
-如果正负样本极度不平衡，推荐使用 Focal Loss：
+实现中 `loss.support.pos_weight: auto` 会按当前 batch 动态计算正类权重，并可通过
+`loss.support.max_pos_weight` 限制上限，避免极端稀疏正样本 batch 造成梯度过大。
+如果仍然受易负样本主导，也可以尝试 Focal Loss：
 
 ```python
 L_sup = FocalLoss(support_logits, support_voxel_label)

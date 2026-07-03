@@ -757,11 +757,48 @@ def source_box_loss(
     }
 
 
-def support_loss(logits: torch.Tensor, labels: torch.Tensor, pos_weight: float | None = None) -> torch.Tensor:
+def _support_pos_weight(
+    labels: torch.Tensor,
+    pos_weight: float | str | torch.Tensor | None = None,
+    max_pos_weight: float | None = None,
+) -> torch.Tensor | None:
+    """Resolve positive-class BCE weight for imbalanced support labels."""
+    if pos_weight is None:
+        return None
+    if isinstance(pos_weight, torch.Tensor):
+        weight = pos_weight.to(dtype=labels.dtype, device=labels.device)
+        if max_pos_weight is not None:
+            weight = weight.clamp(max=float(max_pos_weight))
+        return weight
+
+    if isinstance(pos_weight, str):
+        if pos_weight.lower() != "auto":
+            raise ValueError(f"Unsupported support pos_weight: {pos_weight!r}")
+        positive = torch.count_nonzero(labels >= 0.5).to(dtype=labels.dtype)
+        negative = labels.numel() - positive
+        weight = torch.where(
+            positive > 0.0,
+            negative / positive.clamp_min(1.0),
+            torch.ones((), dtype=labels.dtype, device=labels.device),
+        )
+    else:
+        weight = torch.tensor(float(pos_weight), dtype=labels.dtype, device=labels.device)
+
+    if max_pos_weight is not None:
+        weight = weight.clamp(max=float(max_pos_weight))
+    return weight
+
+
+def support_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    pos_weight: float | str | torch.Tensor | None = None,
+    max_pos_weight: float | None = None,
+) -> torch.Tensor:
     """Binary target support region loss over active voxels."""
-    weight = None
-    if pos_weight is not None:
-        weight = torch.tensor(float(pos_weight), dtype=logits.dtype, device=logits.device)
+    weight = _support_pos_weight(labels, pos_weight=pos_weight, max_pos_weight=max_pos_weight)
+    if weight is not None:
+        weight = weight.to(dtype=logits.dtype, device=logits.device)
     return F.binary_cross_entropy_with_logits(logits, labels, pos_weight=weight)
 
 
@@ -775,10 +812,16 @@ def compute_stage1_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch
         lambda_size=float(loss_cfg["source"]["lambda_size"]),
         lambda_iou=float(loss_cfg["source"]["lambda_iou"]),
     )
+    support_cfg = loss_cfg.get("support", {})
+    support_weight = _support_pos_weight(
+        batch["support_labels"],
+        pos_weight=support_cfg.get("pos_weight"),
+        max_pos_weight=support_cfg.get("max_pos_weight"),
+    )
     sup_loss = support_loss(
         outputs["support_logits"],
         batch["support_labels"],
-        pos_weight=loss_cfg["support"].get("pos_weight"),
+        pos_weight=support_weight,
     )
     total = float(loss_cfg["lambda_src"]) * src_loss + float(loss_cfg["lambda_sup"]) * sup_loss
     terms = {
@@ -786,6 +829,8 @@ def compute_stage1_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch
         "loss_src": src_loss.detach(),
         "loss_sup": sup_loss.detach(),
     }
+    if support_weight is not None:
+        terms["support_pos_weight"] = support_weight.detach()
     terms.update(src_terms)
     return terms
 

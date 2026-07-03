@@ -88,8 +88,10 @@ loss:
     # 源物体框 IoU loss 权重。
     lambda_iou: 0.2
   support:
-    # support voxel 正类 BCE 权重；留空表示不加权 BCE。
-    pos_weight:
+    # support voxel 正类 BCE 权重；auto 表示按当前 batch 的负/正样本比例动态加权，留空表示普通 BCE。
+    pos_weight: auto
+    # 限制 auto pos_weight，避免极端稀疏正样本 batch 造成梯度过大；留空表示不限制。
+    max_pos_weight: 20.0
 
 training:
   # 保存 metrics.jsonl、last.pt 和 best.pt 的输出目录。
@@ -99,9 +101,9 @@ training:
   # 用于训练复现的随机种子。
   seed: 20260624
   # 对训练集完整遍历的总轮数；从旧 last.pt(epoch=24) resume 时会继续跑到 35。
-  epochs: 25
+  epochs: 45
   # 每次优化器更新使用的样本数。
-  batch_size: 15
+  batch_size: 10
   # DataLoader worker 进程数量。
   num_workers: 8
   # 将 host memory pin 住以加速 CUDA 数据传输。
