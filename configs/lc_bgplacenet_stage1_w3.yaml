@@ -1,0 +1,123 @@
+data:
+  # 输入 active 点云的体素大小，单位为厘米；应与 point_clouds_voxel_1cm 保持一致。
+  voxel_size_cm: 1.0
+  # 支撑面点对齐距离和目标放置框底面 Z 容差，单位为厘米。
+  support_align_threshold_cm: 1.5
+  # 候选支撑区域圆面积占 GT 中心所在支撑面连通区域面积的比例。
+  support_radius_area_fraction: 0.25
+  # 固定 train/valid/test 划分文件目录；先运行 tools/generate_lc_bgplacenet_stage1_splits.py 生成。
+  split_dir: data/splits/lc_bgplacenet_stage1
+  # 生成固定 split 时，按 canonical sample 分组划入验证集的比例。
+  valid_fraction: 0.1
+  # 生成固定 split 时，按 canonical sample 分组划入测试集的比例。
+  test_fraction: 0.1
+  # 仅用于固定 split 生成；生成后训练/推理直接读取 split 文件。
+  split_seed: 20260624
+  # 可选的训练样本数量上限；留空表示使用全部训练样本。
+  max_train_samples:
+  # 可选的验证样本数量上限；留空表示使用全部验证样本。
+  max_valid_samples:
+  # canonical 数据源，以及对应生成的 free_bbox 和 auto-label 结果。
+  sources:
+    - name: dopose
+      # canonical 数据集根目录。
+      dataset_dir: data/dopose
+      # 保存 free_bbox placement JSON、support mask PLY 和可视化文件的目录。
+      free_bbox_dir: outputs/free_bbox_dopose
+      # 用于建立样本索引、读取源物体框并回连目标 placement 的自动标注文件。
+      labels_path: outputs/auto_labels_dopose/all_labels.json
+    - name: hope
+      dataset_dir: data/hope
+      free_bbox_dir: outputs/free_bbox_hope
+      labels_path: outputs/auto_labels_hope/all_labels.json
+    - name: housecat
+      dataset_dir: data/housecat
+      free_bbox_dir: outputs/free_bbox_housecat
+      labels_path: outputs/auto_labels_housecat/all_labels.json
+    - name: omni
+      dataset_dir: data/omni_filter
+      free_bbox_dir: outputs/free_bbox_omni
+      labels_path: outputs/auto_labels_omni/all_labels.json
+    - name: ycbv
+      dataset_dir: data/ycbv
+      free_bbox_dir: outputs/free_bbox_ycbv
+      labels_path: outputs/auto_labels_ycbv/all_labels.json
+
+model:
+  # 点云、文本、融合模块和预测头共享的特征维度。
+  hidden_dim: 256
+  backbone:
+    # 稀疏 3D backbone 类型；当前训练流程使用 spconv。
+    type: spconv
+    # 每个 voxel 的输入通道数：XYZ 坐标加 RGB 颜色。
+    in_channels: 6
+    # 点云 backbone 中稀疏卷积块的数量。
+    num_blocks: 3
+  text:
+    # 用于语言条件建模的 HuggingFace 文本编码器。
+    model_name: roberta-base
+    # Stage 1 训练时冻结文本编码器权重。
+    freeze: true
+    # 指令或语言文本的最大 token 长度。
+    max_length: 256
+    # 只从本地缓存加载文本模型，避免训练时访问网络。
+    local_files_only: true
+  fusion:
+    # 点云-文本融合模块的注意力头数量。
+    num_heads: 8
+    # 融合模块内部使用的 dropout。
+    dropout: 0.1
+  w3:
+    # W³ 文本路由:三路 role query（what/where/whole）池化文本 token 的注意力头数量。
+    num_heads: 8
+    # W³ 路由注意力池化内部使用的 dropout。
+    dropout: 0.1
+  source_grounding:
+    # 源物体 grounding decoder 的注意力头数量。
+    num_heads: 8
+    # 源物体 grounding 的 Transformer decoder 层数。
+    num_layers: 4
+    # 源物体 grounding decoder 内部使用的 dropout。
+    dropout: 0.1
+
+loss:
+  # 源物体框回归 loss 在 Stage 1 总 loss 中的权重。
+  lambda_src: 1.0
+  # 目标支撑区域分割 loss 权重；W³ where 路 FiLM 增强后侧重 support。
+  lambda_sup: 1.0
+  source:
+    # 源物体框中心点 L1 loss 权重。
+    lambda_center: 2.0
+    # 源物体框尺寸 L1 loss 权重。
+    lambda_size: 1.5
+    # 源物体框 IoU loss 权重。
+    lambda_iou: 0.2
+  support:
+    # support voxel 正类 BCE 权重；留空表示不加权 BCE。
+    pos_weight:
+
+training:
+  # 保存 metrics.jsonl、last.pt 和 best.pt 的输出目录。
+  output_dir: outputs/lc_bgplacenet_stage1_w3
+  # auto 表示优先使用 CUDA，CUDA 不可用时使用 CPU。
+  device: auto
+  # 用于训练复现的随机种子。
+  seed: 20260624
+  # 对训练集完整遍历的总轮数。
+  epochs: 25
+  # 每次优化器更新使用的样本数。
+  batch_size: 15
+  # DataLoader worker 进程数量。
+  num_workers: 8
+  # 将 host memory pin 住以加速 CUDA 数据传输。
+  pin_memory: true
+  # 是否在主进程显示训练/验证进度条；多卡训练时只在 rank 0 显示。
+  progress_bar: true
+  # AdamW 学习率。
+  lr: 0.0001
+  # AdamW 权重衰减。
+  weight_decay: 0.01
+  # 全局梯度范数裁剪阈值。
+  grad_clip_norm: 1.0
+  # 每隔 N 次优化器更新打印一次训练指标。
+  log_every: 100

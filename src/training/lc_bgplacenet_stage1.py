@@ -69,6 +69,7 @@ class Stage1IndexItem:
     cluster_id: int
     placement_corners_world: np.ndarray
     source_box_gt: np.ndarray
+    camera_E_c2w: np.ndarray
 
 
 def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]:
@@ -103,7 +104,7 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
             if "corners_world" not in placement:
                 raise ValueError(f"Placement {placement.get('sample_id')} missing corners_world")
 
-            voxel_path = _resolve_voxel_path(source.dataset_dir, sample_id, payload)
+            voxel_path, camera_E_c2w = _resolve_voxel_path_and_camera(source.dataset_dir, sample_id, payload)
 
             items.append(
                 Stage1IndexItem(
@@ -123,6 +124,7 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
                         obj_record["canonical_aabb_object"],
                         obj_record["original_pose_world"],
                     ),
+                    camera_E_c2w=camera_E_c2w,
                 )
             )
     return items
@@ -360,24 +362,39 @@ def build_sources_from_config(cfg: dict[str, Any]) -> list[Stage1DataSource]:
     return sources
 
 
-def _resolve_voxel_path(dataset_dir: Path, sample_id: str, placement_payload: dict[str, Any]) -> Path:
-    """Resolve canonical point_clouds_voxel_1cm PLY for a sample."""
+def _resolve_voxel_path_and_camera(
+    dataset_dir: Path, sample_id: str, placement_payload: dict[str, Any]
+) -> tuple[Path, np.ndarray]:
+    """Resolve canonical point_clouds_voxel_1cm PLY and camera-to-world extrinsics.
+
+    Camera pose is required for camera-relative positional encoding (CamPE): the
+    instructions' left/right/front/back words are generated relative to this
+    frame's camera view (see src/annotation/auto_label.py), so it must always
+    come from the canonical sample JSON.
+    """
     sample_json = dataset_dir / "samples" / f"{sample_id}.json"
-    if sample_json.exists():
-        with sample_json.open("r", encoding="utf-8") as f:
-            sample_record = json.load(f)
-        rel_path = sample_record.get("voxel_point_cloud_path")
-        if rel_path:
-            return dataset_dir / rel_path
+    if not sample_json.exists():
+        raise FileNotFoundError(f"Canonical sample JSON not found: {sample_json}")
+    with sample_json.open("r", encoding="utf-8") as f:
+        sample_record = json.load(f)
 
-    raw = placement_payload.get("voxel_point_cloud_path")
-    if raw:
-        path = Path(raw)
-        if path.exists():
-            return path
-        return dataset_dir / raw
+    rel_path = sample_record.get("voxel_point_cloud_path")
+    if rel_path:
+        voxel_path = dataset_dir / rel_path
+    else:
+        raw = placement_payload.get("voxel_point_cloud_path")
+        if raw:
+            path = Path(raw)
+            voxel_path = path if path.exists() else dataset_dir / raw
+        else:
+            voxel_path = dataset_dir / "point_clouds_voxel_1cm" / f"{sample_id}.ply"
 
-    return dataset_dir / "point_clouds_voxel_1cm" / f"{sample_id}.ply"
+    camera_record = sample_record.get("camera")
+    if camera_record is None or "E_c2w" not in camera_record:
+        raise ValueError(f"Canonical sample JSON missing camera.E_c2w: {sample_json}")
+    camera_E_c2w = np.asarray(camera_record["E_c2w"], dtype=np.float32)
+
+    return voxel_path, camera_E_c2w
 
 
 def _resolve_free_bbox_path(free_bbox_dir: Path, raw_path: str | Path) -> Path:
@@ -650,6 +667,7 @@ class LCBGPlaceNetStage1Dataset(Dataset):
             "support_label": support_label,
             "source_box_gt": item.source_box_gt,
             "support_align_coverage": support_align_coverage,
+            "camera_E_c2w": item.camera_E_c2w,
         }
 
 
@@ -658,7 +676,7 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
     features = []
     sparse_coords = []
     world_coords = []
-    coords_norm = []
+    coords_cam_norm = []
     batch_indices = []
     support_labels = []
     scene_min = []
@@ -682,6 +700,17 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         extent = np.maximum(point_max - point_min, 1e-4)
         point_norm = (points - point_min) / extent
 
+        # 相机相关方位编码(CamPE):把世界坐标点旋转+平移到该帧相机局部系，
+        # 因为语言指令里的 left/right/front/back 是按拍摄该帧时的相机视角描述的
+        # （见 src/annotation/auto_label.py），而不是固定的世界坐标轴。
+        E_c2w = np.asarray(item["camera_E_c2w"], dtype=np.float64)
+        E_w2c = np.linalg.inv(E_c2w)
+        points_cam = points.astype(np.float64) @ E_w2c[:3, :3].T + E_w2c[:3, 3]
+        cam_min = points_cam.min(axis=0)
+        cam_max = points_cam.max(axis=0)
+        cam_extent = np.maximum(cam_max - cam_min, 1e-4)
+        point_cam_norm = ((points_cam - cam_min) / cam_extent).astype(np.float32)
+
         voxel_keys = np.floor(points / float(voxel_size_cm)).astype(np.int64)
         shifted_keys = voxel_keys - voxel_keys.min(axis=0, keepdims=True)
         spatial_max = np.maximum(spatial_max, shifted_keys.max(axis=0) + 1)
@@ -690,7 +719,7 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         features.append(np.concatenate([point_norm, colors], axis=1).astype(np.float32))
         sparse_coords.append(np.concatenate([batch_col, shifted_keys.astype(np.int32)], axis=1))
         world_coords.append(points)
-        coords_norm.append(point_norm.astype(np.float32))
+        coords_cam_norm.append(point_cam_norm)
         batch_indices.append(np.full(len(points), batch_idx, dtype=np.int64))
         support_labels.append(np.asarray(item["support_label"], dtype=np.float32))
         scene_min.append(point_min.astype(np.float32))
@@ -710,7 +739,7 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         "sparse_coords": torch.from_numpy(np.concatenate(sparse_coords, axis=0)),
         "spatial_shape": [int(x) for x in spatial_max.tolist()],
         "world_coords": torch.from_numpy(np.concatenate(world_coords, axis=0)),
-        "coords_norm": torch.from_numpy(np.concatenate(coords_norm, axis=0)),
+        "coords_cam_norm": torch.from_numpy(np.concatenate(coords_cam_norm, axis=0)),
         "batch_indices": torch.from_numpy(np.concatenate(batch_indices, axis=0)),
         "support_labels": torch.from_numpy(np.concatenate(support_labels, axis=0)),
         "source_box_gt": torch.from_numpy(np.stack(source_boxes, axis=0)),

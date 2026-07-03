@@ -89,6 +89,21 @@ def _make_tiny_stage1_source(tmp_path) -> Stage1DataSource:
             "schema_version": "canonical_placement_scene/v1",
             "sample_id": sample_id,
             "voxel_point_cloud_path": f"point_clouds_voxel_1cm/{sample_id}.ply",
+            "camera": {
+                "fx": 500.0,
+                "fy": 500.0,
+                "cx": 320.0,
+                "cy": 240.0,
+                "img_w": 640,
+                "img_h": 480,
+                # 单位矩阵:camera == world，足以覆盖 CamPE 的变换路径。
+                "E_c2w": [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+            },
         },
     )
 
@@ -287,6 +302,7 @@ def test_stage1_collate_builds_sparse_batch(tmp_path) -> None:
 
     assert batch["features"].shape == (10, 6)
     assert batch["sparse_coords"].shape == (10, 4)
+    assert batch["coords_cam_norm"].shape == (10, 3)
     assert batch["support_labels"].tolist() == [0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     assert batch["source_box_gt"].shape == (1, 6)
     assert batch["instructions"] == ["Move toy object to the right of the block."]

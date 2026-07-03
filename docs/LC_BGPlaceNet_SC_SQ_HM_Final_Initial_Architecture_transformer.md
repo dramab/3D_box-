@@ -77,6 +77,8 @@ outputs = {
     "source_feature": Tensor[B, C],
 
     "support_logits": Tensor[Nv],
+    "text_whole": Tensor[B, C],
+
     "placement_heatmap_logits": Tensor[B, K],
     "place_yaw_logits": Tensor[B, K, 24],
 
@@ -212,6 +214,18 @@ Placement Heatmap Head       Placement Yaw Head
                          ▼
        place_box=(cx,cy,cz,l,w,h,yaw_place)
 ```
+
+其中 Text Encoder 之后插入 W³ Language Routing，把语言解耦为三路任务角色表征：
+
+```text
+what  → Single-Query Source Grounding 的 query
+where → FiLM 调制 Support Surface Head
+whole → 透传 Stage 2 的 Source-aware Support Placement Attention
+```
+
+Sparse 3D Backbone 之后（准确说是 voxel 坐标产出后）还会计算 CamPE（见 7.4），把
+world 坐标变换到当前帧相机系，替代原先的世界系位置编码，同时供 Single-Query Source
+Grounding 和 Support Surface Head 使用，保证方位语义与语言指令的参照系一致。
 
 ---
 
@@ -411,7 +425,8 @@ class SparseBackbone(nn.Module):
 
 ### 7.1 目标
 
-Text Encoder 将自然语言指令编码为 token 级特征和全局语义特征。
+Text Encoder 将自然语言指令编码为 token 级特征。全局语义不再用 mask 平均得到，
+而是交由后续的 W³ Language Routing 按任务角色池化（见 7.3）。
 
 输入：
 
@@ -423,17 +438,17 @@ instruction: List[str]
 
 ```python
 text_tokens: Tensor[B, T, C]
-text_global: Tensor[B, C]
+attention_mask: Tensor[B, T]
 ```
 
 其中：
 
 ```text
 text_tokens:
-    token 级语言特征，用于 voxel-language fusion。
+    token 级语言特征，同时用于 voxel-language fusion 和 W³ Language Routing。
 
-text_global:
-    全局语言特征，用于 source query 和 placement attention。
+attention_mask:
+    有效 token 掩码，供 W³ 路由的注意力池化屏蔽 padding。
 ```
 
 ---
@@ -455,6 +470,101 @@ T5 Encoder
 text:
   freeze: true
 ```
+
+---
+
+### 7.3 W³ Language Routing
+
+单一全局语言向量需要同时承担“定位哪个物体”“物体多大”“放到支撑面哪个方位”多种语义，
+任务之间会相互竞争。W³ Language Routing 用三个可学习 role query，对 `text_tokens`
+做一次注意力池化，把语言解耦成三路任务角色表征：
+
+```python
+what, where, whole = w3(text_tokens, attention_mask)
+# what / where / whole: Tensor[B, C]
+```
+
+含义与去向：
+
+```text
+what（object）:
+    源物体身份与几何信息，注入 Single-Query Source Grounding 的 query（替代旧 text_global）。
+
+where（spatial）:
+    源物体放置到支撑面的方位信息，FiLM 调制 Support Head，增强目标支撑区域预测。
+
+whole（global）:
+    指令整体语义，作为 outputs["text_whole"] 透传给 Stage 2 的 placement attention。
+```
+
+W³ 不做显式句子解析，三路分工由下游任务 loss 隐式驱动。
+
+代码接口：
+
+```python
+class W3LanguageRouting(nn.Module):
+    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        # 顺序固定为 what / where / whole
+        self.role_queries = nn.Parameter(torch.randn(1, 3, hidden_dim) * 0.02)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, text_tokens, attention_mask):
+        B = text_tokens.shape[0]
+        query = self.role_queries.repeat(B, 1, 1)
+        pooled, _ = self.attn(
+            query=query,
+            key=text_tokens,
+            value=text_tokens,
+            key_padding_mask=~attention_mask,
+            need_weights=False,
+        )
+        pooled = self.norm(pooled)
+        return pooled[:, 0], pooled[:, 1], pooled[:, 2]  # what, where, whole
+```
+
+注意：Stage 1 阶段 `whole` 路没有直接 loss，其专属 role query 在 Stage 1 不会被优化
+（共享的注意力投影权重仍会被 what/where 的梯度更新），要等接入 Stage 2 loss 后才真正训练。
+
+---
+
+### 7.4 CamPE：相机相关方位编码
+
+`auto_label.py` 生成的 `left/right/front/back` 方位词是按拍摄该帧时的相机视角描述的
+（把物体中心通过该帧 `camera.E_w2c` 投影到相机系，用相机 x 轴/深度 z 轴算 `atan2`），
+而不是固定的世界坐标轴——canonical world 的 X/Y 轴与相机朝向无关，只有 Z 轴固定朝上。
+
+如果模型只用世界坐标做位置编码，网络没有任何信号知道该帧相机朝向哪个方向，无法把
+方向词和正确的世界区域对应起来。因此 Stage 1 用 **CamPE（Camera-Relative Positional
+Encoding）** 取代世界系位置编码：
+
+```python
+E_w2c = inverse(camera.E_c2w)          # world -> camera 外参（旋转 + 平移）
+point_cam = R_w2c @ (point_world - camera_center)
+```
+
+`point_cam` 与 `auto_label.py` 生成标签时使用的变换完全一致，保证方位语义自洽。
+CamPE 对每帧的 `point_cam` 做 min-max 归一化后过 MLP：
+
+```python
+class CamPE(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, coords_cam_norm):
+        return self.mlp(coords_cam_norm)
+```
+
+CamPE **取代了原先的世界系 `pos_mlp`**，Source Grounding 的 query 位置编码和 Support
+Head 的输入统一使用同一份 `pos_embed_cam`（见 9.3、11.1）。上下方向（top/below）仍由
+world Z 轴决定，但 CamPE 只做旋转+平移，不单独保留世界 Z 分量——垂直语义需要网络从
+相机系三轴中隐式学出。
 
 ---
 
@@ -529,7 +639,7 @@ NMS
 ```python
 voxel_features: Tensor[B, Nv_max, C]
 voxel_pos_embed: Tensor[B, Nv_max, C]
-text_global: Tensor[B, C]
+text_what: Tensor[B, C]          # W³ what 路
 voxel_padding_mask: Tensor[B, Nv_max]
 ```
 
@@ -558,18 +668,18 @@ source_box = (cx, cy, cz, l, w, h)
 self.source_query = nn.Parameter(torch.randn(1, 1, C) * 0.02)
 ```
 
-并加入语言条件：
+并加入语言条件（W³ what 路）：
 
 ```python
-query = source_query + text_proj(text_global)
+query = source_query + text_proj(text_what)
 ```
 
 #### Key
 
-Key 来自语言融合体素特征和位置编码：
+Key 来自语言融合体素特征和 CamPE 位置编码（见 7.4）：
 
 ```text
-K = F_vl + PE_3D(coords)
+K = F_vl + CamPE(coords_cam)
 ```
 
 #### Value
@@ -585,7 +695,7 @@ V = F_vl
 ### 9.4 模块结构
 
 ```text
-F_vl + PE_3D(coords)
+F_vl + CamPE(coords_cam)
         │
         ▼
 Transformer Decoder / Cross-Attention
@@ -625,13 +735,13 @@ class SingleQuerySourceGroundingHead(nn.Module):
             nn.Linear(hidden_dim, 6),
         )
 
-    def forward(self, voxel_features, voxel_pos_embed, text_global, voxel_padding_mask=None):
+    def forward(self, voxel_features, voxel_pos_embed, text_what, voxel_padding_mask=None):
         B = voxel_features.shape[0]
 
         memory = voxel_features + voxel_pos_embed
 
         query = self.source_query.repeat(B, 1, 1)
-        query = query + self.text_proj(text_global).unsqueeze(1)
+        query = query + self.text_proj(text_what).unsqueeze(1)
 
         f_src = self.decoder(
             tgt=query,
@@ -711,12 +821,17 @@ loss_src = (
 
 ### 11.1 目标
 
-Support Surface Branch 预测每个体素是否属于支撑面。
+Support Surface Branch 预测每个体素是否属于当前指令对应的目标支撑区域，叠加 CamPE
+（见 7.4）注入相机相关方位信息，并由 W³ where 路做 FiLM 调制，把“放到支撑面哪个方位”
+的语义注入逐 voxel 预测。
 
 输入：
 
 ```python
 F_vl: Tensor[Nv, C]
+pos_embed_cam: Tensor[Nv, C]   # CamPE，与 Source Grounding 共用同一份
+where_embed: Tensor[B, C]      # W³ where 路
+batch_indices: Tensor[Nv]
 ```
 
 输出：
@@ -726,11 +841,16 @@ support_logits: Tensor[Nv]
 support_prob = sigmoid(support_logits)
 ```
 
-公式：
+公式（b_i 为第 i 个 voxel 所属样本）：
 
 ```text
-p_i^sup = sigmoid(MLP_sup(F_i^VL))
+h_i    = Linear_pre(F_i^VL + CamPE_i)
+γ, β   = split(Linear_film(where_embed[b_i]))
+h_i    = (1 + γ) ⊙ h_i + β
+p_i^sup = sigmoid(Linear_head(ReLU(h_i)))
 ```
+
+`(1 + γ)` 是 FiLM 常见的恒等初始化稳定写法，where 向量按 `batch_indices` 广播到每个 voxel。
 
 代码：
 
@@ -738,14 +858,16 @@ p_i^sup = sigmoid(MLP_sup(F_i^VL))
 class SupportHead(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.pre = nn.Linear(hidden_dim, hidden_dim)
+        self.film = nn.Linear(hidden_dim, hidden_dim * 2)  # 生成 (gamma, beta)
+        self.act = nn.ReLU(inplace=True)
+        self.head = nn.Linear(hidden_dim, 1)
 
-    def forward(self, F_vl):
-        return self.mlp(F_vl).squeeze(-1)
+    def forward(self, F_vl, pos_embed_cam, where_embed, batch_indices):
+        hidden = self.pre(F_vl + pos_embed_cam)
+        gamma, beta = self.film(where_embed).chunk(2, dim=-1)
+        hidden = (1.0 + gamma[batch_indices]) * hidden + beta[batch_indices]
+        return self.head(self.act(hidden)).squeeze(-1)
 ```
 
 ---
@@ -839,7 +961,7 @@ source-conditioned token + support candidate tokens
 ```python
 source_box: Tensor[B, 6]
 f_src: Tensor[B, C]
-text_global: Tensor[B, C]
+text_whole: Tensor[B, C]      # W³ whole 路，来自 Stage 1 outputs["text_whole"]
 
 support_points: Tensor[B, K, 3]
 support_features: Tensor[B, K, C]
@@ -888,7 +1010,7 @@ e_size = MLP_size(source_size)
 q_src_place = MLP_src([
     f_src,
     e_size,
-    text_global,
+    text_whole,
 ])
 ```
 
@@ -901,8 +1023,8 @@ f_src:
 e_size:
     源物体尺寸特征，表示“这个物体有多大”。
 
-text_global:
-    语言全局特征，表示“应该放到哪里”。
+text_whole:
+    W³ whole 路语言全局特征，表示“应该放到哪里”。
 ```
 
 得到：
@@ -1097,7 +1219,7 @@ class SourceAwareSupportPlacementAttention(nn.Module):
         self,
         source_box,
         f_src,
-        text_global,
+        text_whole,
         support_points,
         support_features,
         support_prob,
@@ -1108,7 +1230,7 @@ class SourceAwareSupportPlacementAttention(nn.Module):
         e_size = self.size_mlp(source_size)
 
         src_token = self.source_token_mlp(
-            torch.cat([f_src, e_size, text_global], dim=-1)
+            torch.cat([f_src, e_size, text_whole], dim=-1)
         ).unsqueeze(1)  # [B, 1, C]
 
         support_tokens = self.support_token_mlp(
@@ -1598,9 +1720,10 @@ differentiable support coverage loss
 ```text
 Sparse Backbone
 Text Encoder
+W³ Language Routing
 Voxel-Language Fusion
 Single-Query Source Grounding Head
-Support Surface Head
+Support Surface Head (FiLM by W³ where)
 ```
 
 Loss：
@@ -1614,6 +1737,8 @@ L_stage1 = λ_src L_src + λ_sup L_sup
 ```text
 1. 学会定位源物体中心和尺寸。
 2. 学会识别支撑面体素。
+3. W³ 的 what/where 路在下游 loss 驱动下学会角色分工；
+   whole 路本阶段无直接监督，留待 Stage 2 训练。
 ```
 
 ---
@@ -1682,23 +1807,29 @@ place_box
 ## 19. 推理流程
 
 ```python
-def inference(points, instruction):
+def inference(points, instruction, camera_E_c2w):
     # 1. voxelize
     sparse_tensor = voxelize(points)
 
     # 2. sparse 3D backbone
     F_3d, coords, batch_indices = sparse_backbone(sparse_tensor)
 
-    # 3. text encoder
-    text_tokens, text_global = text_encoder(instruction)
+    # 2b. CamPE：把 world 坐标变换到该帧相机系（与 auto_label.py 标注方位词时一致）
+    E_w2c = inverse(camera_E_c2w)
+    coords_cam = transform_points(coords, E_w2c)
+    pos_embed_cam = campe(normalize_per_scene(coords_cam))
+
+    # 3. text encoder + W³ 语言路由
+    text_tokens, text_attention_mask = text_encoder(instruction)
+    text_what, text_where, text_whole = w3(text_tokens, text_attention_mask)
 
     # 4. voxel-language fusion
     F_vl = voxel_language_fusion(F_3d, text_tokens, batch_indices)
 
-    # 5. pack sparse voxel features
+    # 5. pack sparse voxel features + CamPE
     voxel_tokens, voxel_pos_embed, voxel_padding_mask = pack_voxel_tokens(
         F_vl,
-        coords,
+        pos_embed_cam,
         batch_indices,
     )
 
@@ -1706,15 +1837,15 @@ def inference(points, instruction):
     source_out = source_grounding(
         voxel_features=voxel_tokens,
         voxel_pos_embed=voxel_pos_embed,
-        text_global=text_global,
+        text_what=text_what,
         voxel_padding_mask=voxel_padding_mask,
     )
 
     source_box = source_out["source_box"]       # [B, 6]
     f_src = source_out["source_feature"]        # [B, C]
 
-    # 7. support prediction
-    support_logits = support_head(F_vl)
+    # 7. support prediction (CamPE + FiLM by W³ where)
+    support_logits = support_head(F_vl, pos_embed_cam, text_where, batch_indices)
     support_prob = torch.sigmoid(support_logits)
 
     # 8. select support candidates
@@ -1732,7 +1863,7 @@ def inference(points, instruction):
     place_out = source_aware_support_attention(
         source_box=source_box,
         f_src=f_src,
-        text_global=text_global,
+        text_whole=text_whole,
         support_points=support_points,
         support_features=support_features,
         support_prob=support_prob_k,
@@ -1780,6 +1911,8 @@ class LCBGPlaceNetSCSQHM(nn.Module):
 
         self.backbone = SparseBackbone(cfg.backbone)
         self.text_encoder = TextEncoder(cfg.text)
+        self.w3 = W3LanguageRouting(cfg.hidden_dim, cfg.w3.num_heads, cfg.w3.dropout)
+        self.campe = CamPE(cfg.hidden_dim)
         self.fusion = VoxelLanguageFusion(cfg.fusion)
 
         self.source_grounding = SingleQuerySourceGroundingHead(
@@ -1834,6 +1967,10 @@ fusion:
   num_layers: 2
   num_heads: 4
 
+w3:
+  num_heads: 8
+  dropout: 0.1
+
 source_grounding:
   type: single_query
   num_queries: 1
@@ -1862,7 +1999,7 @@ placement_attention:
   dropout: 0.1
   use_source_feature: true
   use_source_size_embedding: true
-  use_text_global: true
+  use_text_whole: true
   use_support_coordinates: true
   use_support_probability: true
   use_relative_to_source_center: false
