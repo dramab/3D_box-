@@ -62,29 +62,11 @@ def _make_tiny_stage1_source(tmp_path) -> Stage1DataSource:
         },
     )
 
-    support_points = np.array(
-        [
-            [1.1, 0.0, 0.0],
-            [5.0, 0.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    support_colors = np.array(
-        [
-            [255, 255, 255],
-            [55, 55, 55],
-        ],
-        dtype=np.uint8,
-    )
-    support_path = free_bbox_dir / "support_masks" / f"{sample_id}__support_mask.ply"
-    save_ply(support_path, support_points, support_colors)
-
     _write_json(
         free_bbox_dir / "placements" / f"{sample_id}__placements.json",
         {
             "schema_version": "free_bbox_placements/v1",
             "sample_id": sample_id,
-            "support_mask_ply": f"support_masks/{sample_id}__support_mask.ply",
             "objects": [
                 {
                     "object_id": "obj_0",
@@ -132,19 +114,17 @@ def _make_tiny_stage1_source(tmp_path) -> Stage1DataSource:
     )
 
 
-def test_stage1_dataset_aligns_support_mask_to_active_voxels(tmp_path) -> None:
-    """White support points are aligned to point_clouds_voxel_1cm active voxels."""
+def test_stage1_dataset_reads_source_box_and_instruction(tmp_path) -> None:
+    """Dataset returns source box supervision and language instruction."""
     source = _make_tiny_stage1_source(tmp_path)
     dataset = LCBGPlaceNetStage1Dataset(
         [source],
         split="train",
         val_fraction=0.0,
-        support_align_threshold_cm=0.25,
     )
 
     sample = dataset[0]
     np.testing.assert_allclose(sample["source_box_gt"], [1.0, 2.0, 3.0, 2.0, 4.0, 6.0])
-    np.testing.assert_array_equal(sample["support_label"], [0.0, 1.0, 0.0])
     assert sample["instruction"] == "Move toy object to the right of the block."
 
 
@@ -168,7 +148,6 @@ def test_stage1_dataset_reads_fixed_split_file(tmp_path) -> None:
         [source],
         split="train",
         val_fraction=0.5,
-        support_align_threshold_cm=0.25,
         split_dir=split_dir,
     )
 
@@ -183,13 +162,11 @@ def test_stage1_collate_builds_sparse_batch(tmp_path) -> None:
         [source],
         split="train",
         val_fraction=0.0,
-        support_align_threshold_cm=0.25,
     )
     batch = stage1_collate([dataset[0]], voxel_size_cm=1.0)
 
     assert batch["features"].shape == (3, 6)
     assert batch["sparse_coords"].shape == (3, 4)
-    assert batch["support_labels"].tolist() == [0.0, 1.0, 0.0]
     assert batch["source_box_gt"].shape == (1, 6)
     assert batch["instructions"] == ["Move toy object to the right of the block."]
 
@@ -205,19 +182,16 @@ def test_aabb_iou_and_source_loss_for_identical_boxes() -> None:
     assert float(terms["source_iou"]) > 0.999
 
 
-def test_stage1_support_metrics() -> None:
-    """Support metrics should be perfect when thresholded logits match labels."""
+def test_stage1_source_metrics() -> None:
+    """Source metrics should be perfect for identical predicted and target boxes."""
     outputs = {
         "source_box": torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]),
-        "support_logits": torch.tensor([-5.0, 5.0, -5.0]),
     }
     batch = {
         "source_box_gt": torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]),
-        "support_labels": torch.tensor([0.0, 1.0, 0.0]),
-        "support_align_coverage": torch.tensor([1.0]),
     }
     metrics = compute_stage1_metrics(outputs, batch)
 
-    assert metrics["support_precision"] > 0.999
-    assert metrics["support_recall"] > 0.999
-    assert metrics["support_f1"] > 0.999
+    assert metrics["source_center_mae_cm"] == 0.0
+    assert metrics["source_size_mae_cm"] == 0.0
+    assert metrics["source_iou"] > 0.999

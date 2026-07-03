@@ -1,8 +1,6 @@
 data:
   # 输入 active 点云的体素大小，单位为厘米；应与 point_clouds_voxel_1cm 保持一致。
   voxel_size_cm: 1.0
-  # active voxel 到 free_bbox 支撑面 mask 点的最大匹配距离，小于等于该值标为 support=1。
-  support_align_threshold_cm: 1.5
   # 固定 train/valid/test 划分文件目录；先运行 tools/generate_lc_bgplacenet_stage1_splits.py 生成。
   split_dir: data/splits/lc_bgplacenet_stage1
   # 生成固定 split 时，按 canonical sample 分组划入验证集的比例。
@@ -15,12 +13,12 @@ data:
   max_train_samples:
   # 可选的验证样本数量上限；留空表示使用全部验证样本。
   max_valid_samples:
-  # canonical 数据源，以及对应生成的 free_bbox 和 auto-label 结果。
+  # canonical 数据源，以及对应生成的 free_bbox placement 和 auto-label 结果。
   sources:
     - name: dopose
       # canonical 数据集根目录。
       dataset_dir: data/dopose
-      # 保存 free_bbox placement JSON 和支撑面 mask PLY 的目录。
+      # 保存 free_bbox placement JSON 的目录；support mask 保留给 Stage 2 使用。
       free_bbox_dir: outputs/free_bbox_dopose
       # 用于建立样本索引和读取源物体框的自动标注文件。
       labels_path: outputs/auto_labels_dopose/all_labels.json
@@ -76,8 +74,6 @@ model:
 loss:
   # 源物体框回归 loss 在 Stage 1 总 loss 中的权重。
   lambda_src: 1.0
-  # 支撑面分割 loss 在 Stage 1 总 loss 中的权重。
-  lambda_sup: 0.2
   source:
     # 源物体框中心点 L1 loss 权重。
     lambda_center: 2.0
@@ -85,13 +81,10 @@ loss:
     lambda_size: 1.5
     # 源物体框 IoU loss 权重。
     lambda_iou: 0.2
-  support:
-    # support voxel 正类 BCE 权重；留空表示不加权 BCE。
-    pos_weight:
 
 training:
   # 保存 metrics.jsonl、last.pt 和 best.pt 的输出目录。
-  output_dir: outputs/lc_bgplacenet_stage1
+  output_dir: outputs/lc_bgplacenet_stage1_no_support
   # auto 表示优先使用 CUDA，CUDA 不可用时使用 CPU。
   device: auto
   # 用于训练复现的随机种子。
@@ -99,9 +92,9 @@ training:
   # 对训练集完整遍历的轮数。
   epochs: 25
   # 每次优化器更新使用的样本数。
-  batch_size: 15
+  batch_size: 10
   # DataLoader worker 进程数量。
-  num_workers: 4
+  num_workers: 8
   # 将 host memory pin 住以加速 CUDA 数据传输。
   pin_memory: true
   # 是否在主进程显示训练/验证进度条；多卡训练时只在 rank 0 显示。

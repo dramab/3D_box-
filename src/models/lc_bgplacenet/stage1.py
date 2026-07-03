@@ -1,8 +1,8 @@
 """
 LC-BGPlaceNet Stage 1 model.
 
-Implements source grounding and support surface prediction from active 1cm
-voxel point clouds and language instructions.
+Implements source grounding from active 1cm voxel point clouds and language
+instructions.
 """
 
 from __future__ import annotations
@@ -202,21 +202,6 @@ class SingleQuerySourceGroundingHead(nn.Module):
         }
 
 
-class SupportHead(nn.Module):
-    """Per-active-voxel support surface classifier."""
-
-    def __init__(self, hidden_dim: int) -> None:
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, voxel_features: torch.Tensor) -> torch.Tensor:
-        return self.mlp(voxel_features).squeeze(-1)
-
-
 class LCBGPlaceNetStage1(nn.Module):
     """LC-BGPlaceNet Stage 1 model."""
 
@@ -254,7 +239,6 @@ class LCBGPlaceNetStage1(nn.Module):
             num_layers=int(cfg["source_grounding"].get("num_layers", 3)),
             dropout=float(cfg["source_grounding"].get("dropout", 0.1)),
         )
-        self.support_head = SupportHead(hidden_dim)
 
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         batch_size = int(batch["batch_size"])
@@ -284,12 +268,9 @@ class LCBGPlaceNetStage1(nn.Module):
             scene_min=batch["scene_min"],
             scene_max=batch["scene_max"],
         )
-        support_logits = self.support_head(f_vl)
         return {
             "source_box": source_out["source_box"],
             "source_feature": source_out["source_feature"],
-            "support_logits": support_logits,
-            "voxel_language_features": f_vl,
         }
 
     def _pack_voxels(

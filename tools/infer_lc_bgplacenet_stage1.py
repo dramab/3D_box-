@@ -104,7 +104,6 @@ def build_inference_loader(
         split=dataset_split,
         val_fraction=0.0 if split == "all" else valid_fraction,
         seed=int(data_cfg.get("split_seed", 0)),
-        support_align_threshold_cm=float(data_cfg["support_align_threshold_cm"]),
         max_samples=None if sample_id is not None or object_id is not None else max_samples,
         items=items,
         split_dir=split_dir,

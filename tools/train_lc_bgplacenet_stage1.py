@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 """
-Train LC-BGPlaceNet Stage 1: source grounding + support surface.
+Train LC-BGPlaceNet Stage 1: source grounding.
 
 使用示例:
-    conda run -n spatial python tools/train_lc_bgplacenet_stage1.py \
+     python tools/train_lc_bgplacenet_stage1.py \
         --config configs/lc_bgplacenet_stage1.yaml
 
-    conda run -n spatial torchrun --nproc_per_node=4 tools/train_lc_bgplacenet_stage1.py \
+     torchrun --nproc_per_node=4 tools/train_lc_bgplacenet_stage1.py \
         --config configs/lc_bgplacenet_stage1.yaml
 
-    conda run -n spatial python tools/train_lc_bgplacenet_stage1.py \
+     python tools/train_lc_bgplacenet_stage1.py \
         --config configs/lc_bgplacenet_stage1.yaml \
         --max-steps 2 --max-train-samples 4 --max-val-samples 2
 
-    conda run -n spatial python tools/train_lc_bgplacenet_stage1.py \
+     python tools/train_lc_bgplacenet_stage1.py \
         --config configs/lc_bgplacenet_stage1.yaml \
         --resume outputs/lc_bgplacenet_stage1/last.pt
 """

@@ -1,9 +1,8 @@
 """
 LC-BGPlaceNet Stage 1 training utilities.
 
-Stage 1 trains source grounding and support surface prediction from canonical
-1cm voxel point clouds. Support labels are built by nearest-neighbor alignment
-from free_bbox support mask PLY white points to active voxels.
+Stage 1 trains source grounding from canonical 1cm voxel point clouds and
+language instructions.
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
-from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel
@@ -63,7 +61,6 @@ class Stage1IndexItem:
     instruction: str
     dataset_dir: Path
     voxel_point_cloud_path: Path
-    support_mask_path: Path
     source_box_gt: np.ndarray
 
 
@@ -90,8 +87,6 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
                     payload_cache[cache_key] = json.load(f)
             payload = payload_cache[cache_key]
 
-            support_mask_path = source.free_bbox_dir / payload["support_mask_ply"]
-
             obj_record = _find_object_record(payload, object_id)
             if obj_record is None:
                 raise ValueError(f"Object {object_id} not found in {source.name}/{sample_id} placements")
@@ -108,7 +103,6 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
                     instruction=instruction,
                     dataset_dir=source.dataset_dir,
                     voxel_point_cloud_path=voxel_path,
-                    support_mask_path=support_mask_path,
                     source_box_gt=_source_box_from_obb(
                         obj_record["canonical_aabb_object"],
                         obj_record["original_pose_world"],
@@ -411,7 +405,7 @@ def _find_object_record(placement_payload: dict[str, Any], object_id: str) -> di
 
 
 class LCBGPlaceNetStage1Dataset(Dataset):
-    """Dataset for source grounding and support surface Stage 1 training."""
+    """Dataset for source grounding Stage 1 training."""
 
     def __init__(
         self,
@@ -419,14 +413,12 @@ class LCBGPlaceNetStage1Dataset(Dataset):
         split: str,
         val_fraction: float = 0.1,
         seed: int = 0,
-        support_align_threshold_cm: float = 1.5,
         max_samples: int | None = None,
         items: list[Stage1IndexItem] | None = None,
         split_dir: str | Path | None = None,
     ) -> None:
         split_name = normalize_stage1_split(split)
         self.split = split_name
-        self.support_align_threshold_cm = float(support_align_threshold_cm)
         if items is None:
             if sources is None:
                 raise ValueError("sources must be provided when items is None")
@@ -453,19 +445,8 @@ class LCBGPlaceNetStage1Dataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self.items[idx]
         points, colors = load_ply(item.voxel_point_cloud_path)
-        mask_points, mask_colors = load_ply(item.support_mask_path)
-        white = np.all(mask_colors.astype(np.int16) >= 240, axis=1)
-        support_points = mask_points[white]
-        if len(points) == 0 or len(support_points) == 0:
-            raise ValueError(f"Invalid empty point/support data for {item.sample_id}")
-
-        support_tree = cKDTree(support_points)
-        dist_to_support, _ = support_tree.query(points, k=1)
-        support_label = (dist_to_support <= self.support_align_threshold_cm).astype(np.float32)
-
-        active_tree = cKDTree(points)
-        support_to_active_dist, _ = active_tree.query(support_points, k=1)
-        support_align_coverage = float(np.mean(support_to_active_dist <= self.support_align_threshold_cm))
+        if len(points) == 0:
+            raise ValueError(f"Invalid empty point data for {item.sample_id}")
 
         return {
             "source_name": item.source_name,
@@ -474,9 +455,7 @@ class LCBGPlaceNetStage1Dataset(Dataset):
             "instruction": item.instruction,
             "points": points.astype(np.float32),
             "colors": colors.astype(np.uint8),
-            "support_label": support_label,
             "source_box_gt": item.source_box_gt,
-            "support_align_coverage": support_align_coverage,
         }
 
 
@@ -487,7 +466,6 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
     world_coords = []
     coords_norm = []
     batch_indices = []
-    support_labels = []
     scene_min = []
     scene_max = []
     source_boxes = []
@@ -495,7 +473,6 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
     source_names = []
     sample_ids = []
     object_ids = []
-    align_coverages = []
     spatial_max = np.zeros(3, dtype=np.int64)
 
     for batch_idx, item in enumerate(batch):
@@ -516,7 +493,6 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         world_coords.append(points)
         coords_norm.append(point_norm.astype(np.float32))
         batch_indices.append(np.full(len(points), batch_idx, dtype=np.int64))
-        support_labels.append(np.asarray(item["support_label"], dtype=np.float32))
         scene_min.append(point_min.astype(np.float32))
         scene_max.append(point_max.astype(np.float32))
         source_boxes.append(np.asarray(item["source_box_gt"], dtype=np.float32))
@@ -524,7 +500,6 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         source_names.append(str(item["source_name"]))
         sample_ids.append(str(item["sample_id"]))
         object_ids.append(str(item["object_id"]))
-        align_coverages.append(float(item["support_align_coverage"]))
 
     return {
         "features": torch.from_numpy(np.concatenate(features, axis=0)),
@@ -533,7 +508,6 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         "world_coords": torch.from_numpy(np.concatenate(world_coords, axis=0)),
         "coords_norm": torch.from_numpy(np.concatenate(coords_norm, axis=0)),
         "batch_indices": torch.from_numpy(np.concatenate(batch_indices, axis=0)),
-        "support_labels": torch.from_numpy(np.concatenate(support_labels, axis=0)),
         "source_box_gt": torch.from_numpy(np.stack(source_boxes, axis=0)),
         "scene_min": torch.from_numpy(np.stack(scene_min, axis=0)),
         "scene_max": torch.from_numpy(np.stack(scene_max, axis=0)),
@@ -541,7 +515,6 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         "source_names": source_names,
         "sample_ids": sample_ids,
         "object_ids": object_ids,
-        "support_align_coverage": torch.tensor(align_coverages, dtype=torch.float32),
         "batch_size": len(batch),
     }
 
@@ -575,14 +548,6 @@ def source_box_loss(
     }
 
 
-def support_loss(logits: torch.Tensor, labels: torch.Tensor, pos_weight: float | None = None) -> torch.Tensor:
-    """Binary support surface loss over active voxels."""
-    weight = None
-    if pos_weight is not None:
-        weight = torch.tensor(float(pos_weight), dtype=logits.dtype, device=logits.device)
-    return F.binary_cross_entropy_with_logits(logits, labels, pos_weight=weight)
-
-
 def compute_stage1_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], cfg: dict[str, Any]) -> dict[str, torch.Tensor]:
     """Compute total Stage 1 loss and detached logging terms."""
     loss_cfg = cfg["loss"]
@@ -593,16 +558,10 @@ def compute_stage1_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch
         lambda_size=float(loss_cfg["source"]["lambda_size"]),
         lambda_iou=float(loss_cfg["source"]["lambda_iou"]),
     )
-    sup_loss = support_loss(
-        outputs["support_logits"],
-        batch["support_labels"],
-        pos_weight=loss_cfg["support"].get("pos_weight"),
-    )
-    total = float(loss_cfg["lambda_src"]) * src_loss + float(loss_cfg["lambda_sup"]) * sup_loss
+    total = float(loss_cfg["lambda_src"]) * src_loss
     terms = {
         "loss": total,
         "loss_src": src_loss.detach(),
-        "loss_sup": sup_loss.detach(),
     }
     terms.update(src_terms)
     return terms
@@ -616,23 +575,10 @@ def compute_stage1_metrics(outputs: dict[str, torch.Tensor], batch: dict[str, to
     size_mae = torch.mean(torch.abs(pred[:, 3:6] - target[:, 3:6]))
     iou = aabb_iou_3d(pred, target).mean()
 
-    support_pred = torch.sigmoid(outputs["support_logits"].detach()) >= 0.5
-    support_gt = batch["support_labels"] >= 0.5
-    tp = torch.count_nonzero(support_pred & support_gt).float()
-    fp = torch.count_nonzero(support_pred & ~support_gt).float()
-    fn = torch.count_nonzero(~support_pred & support_gt).float()
-    precision = tp / (tp + fp + 1e-6)
-    recall = tp / (tp + fn + 1e-6)
-    f1 = 2.0 * precision * recall / (precision + recall + 1e-6)
-
     return {
         "source_center_mae_cm": float(center_mae.cpu()),
         "source_size_mae_cm": float(size_mae.cpu()),
         "source_iou": float(iou.cpu()),
-        "support_precision": float(precision.cpu()),
-        "support_recall": float(recall.cpu()),
-        "support_f1": float(f1.cpu()),
-        "support_align_coverage": float(batch["support_align_coverage"].mean().cpu()),
     }
 
 
@@ -668,8 +614,8 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def _best_support_f1_from_metrics(path: Path) -> float:
-    """Read the best validation support F1 already written to metrics.jsonl."""
+def _best_source_iou_from_metrics(path: Path) -> float:
+    """Read the best validation source IoU already written to metrics.jsonl."""
     if not path.exists():
         return -math.inf
     best = -math.inf
@@ -678,8 +624,8 @@ def _best_support_f1_from_metrics(path: Path) -> float:
             if not line.strip():
                 continue
             row = json.loads(line)
-            if row.get("split") in {"val", "valid"} and "support_f1" in row:
-                best = max(best, float(row["support_f1"]))
+            if row.get("split") in {"val", "valid"} and "source_iou" in row:
+                best = max(best, float(row["source_iou"]))
     return best
 
 
@@ -769,7 +715,6 @@ def train_stage1(
             split="train",
             val_fraction=valid_fraction,
             seed=int(data_cfg.get("split_seed", 0)),
-            support_align_threshold_cm=float(data_cfg["support_align_threshold_cm"]),
             max_samples=max_train_samples or data_cfg.get("max_train_samples"),
             items=all_items,
             split_dir=split_dir,
@@ -779,7 +724,6 @@ def train_stage1(
             split="valid",
             val_fraction=valid_fraction,
             seed=int(data_cfg.get("split_seed", 0)),
-            support_align_threshold_cm=float(data_cfg["support_align_threshold_cm"]),
             max_samples=max_val_samples or data_cfg.get("max_valid_samples", data_cfg.get("max_val_samples")),
             items=all_items,
             split_dir=split_dir,
@@ -800,7 +744,7 @@ def train_stage1(
         train_loader = _make_loader(train_set, cfg, shuffle=True, sampler=train_sampler)
         val_loader = _make_loader(val_set, cfg, shuffle=False, sampler=val_sampler)
         metrics_path = output_dir / "metrics.jsonl"
-        best_f1 = -math.inf
+        best_source_iou = -math.inf
         global_step = 0
         start_epoch = 0
         show_progress = _is_main_process(rank) and bool(cfg["training"].get("progress_bar", True))
@@ -812,11 +756,11 @@ def train_stage1(
             optimizer.load_state_dict(checkpoint["optimizer"])
             start_epoch = int(checkpoint["epoch"]) + 1
             global_step = int(checkpoint["step"])
-            best_f1 = float(checkpoint.get("best_f1", _best_support_f1_from_metrics(metrics_path)))
+            best_source_iou = float(checkpoint.get("best_source_iou", _best_source_iou_from_metrics(metrics_path)))
             if _is_main_process(rank):
                 print(
                     f"Resumed from {resume_path} at epoch={start_epoch}, "
-                    f"step={global_step}, best_support_f1={best_f1:.6f}"
+                    f"step={global_step}, best_source_iou={best_source_iou:.6f}"
                 )
 
         if _is_main_process(rank):
@@ -864,12 +808,12 @@ def train_stage1(
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
                     "step": global_step,
-                    "best_f1": best_f1,
+                    "best_source_iou": best_source_iou,
                     "config": cfg,
                 }
-                if val_metrics.get("support_f1", -math.inf) > best_f1:
-                    best_f1 = val_metrics["support_f1"]
-                    checkpoint["best_f1"] = best_f1
+                if val_metrics.get("source_iou", -math.inf) > best_source_iou:
+                    best_source_iou = val_metrics["source_iou"]
+                    checkpoint["best_source_iou"] = best_source_iou
                     torch.save(checkpoint, output_dir / "best.pt")
                 torch.save(checkpoint, output_dir / "last.pt")
 

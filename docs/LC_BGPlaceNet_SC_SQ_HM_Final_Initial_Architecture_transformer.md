@@ -1581,7 +1581,7 @@ differentiable support coverage loss
 
 ## 18. 训练策略
 
-### 18.1 Stage 1：Source Grounding + Support Surface
+### 18.1 Stage 1：Source Grounding
 
 训练模块：
 
@@ -1590,29 +1590,28 @@ Sparse Backbone
 Text Encoder
 Voxel-Language Fusion
 Single-Query Source Grounding Head
-Support Surface Head
 ```
 
 Loss：
 
 ```text
-L_stage1 = λ_src L_src + λ_sup L_sup
+L_stage1 = λ_src L_src
 ```
 
 目标：
 
 ```text
-1. 学会定位源物体中心和尺寸。
-2. 学会识别支撑面体素。
+学会根据语言指令定位源物体中心和尺寸。
 ```
 
 ---
 
-### 18.2 Stage 2：Placement Heatmap + Placement Yaw
+### 18.2 Stage 2：Support Surface + Placement Heatmap + Placement Yaw
 
 训练模块：
 
 ```text
+Support Surface Head
 Source-aware Support Placement Attention
 Placement Heatmap Head
 Placement Yaw Head
@@ -1629,7 +1628,7 @@ source_box_for_place = source_box_gt
 Loss：
 
 ```text
-L_stage2 = λ_heat L_heat + λ_yaw L_yaw_aniso
+L_stage2 = λ_sup L_sup + λ_heat L_heat + λ_yaw L_yaw_aniso
 ```
 
 ---

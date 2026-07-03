@@ -1,11 +1,11 @@
 # LC-BGPlaceNet Stage 1 Training
 
-Stage 1 只训练两个分支：
+Stage 1 只训练一个分支：
 
 - Source Grounding：根据语言指令预测源物体 `(cx, cy, cz, l, w, h)`。
-- Support Surface：预测每个 active voxel 是否属于支撑面。
 
-本阶段不训练 placement heatmap 和 yaw。Stage 1 训练完成后，先查看验证指标和可视化效果，再决定是否进入 Stage 2。
+本阶段不训练 support surface、placement heatmap 和 yaw。Stage 1 训练完成后，
+先查看 source box 验证指标和可视化效果，再进入 Stage 2 训练支撑面预测与放置分支。
 
 ## 数据输入
 
@@ -15,17 +15,12 @@ Stage 1 只训练两个分支：
 point_clouds_voxel_1cm/*.ply
 ```
 
-不要把 `point_clouds/*.ply` 直接作为 Stage 1 输入。`support_mask_ply` 是 free_bbox 基于 1cm 体素点云生成的，与 `point_clouds_voxel_1cm` 坐标和尺度最一致。
+不要把 `point_clouds/*.ply` 直接作为 Stage 1 输入。free_bbox 的 placements
+仍用于读取源物体 GT box，但其中的 `support_mask_ply` 不再作为 Stage 1 监督。
 
-Support 监督生成规则：
-
-```text
-1. 数据索引只保留 all_labels.json 中 visualization_png 实际存在的记录。
-2. 读取对应 placements JSON 中的 support_mask_ply。
-3. 读取 support_mask_ply 中颜色为白色的点。
-4. 对每个 active voxel 点查询最近的白色 support 点。
-5. 最近距离 <= 1.5cm 的 active voxel 标为 support=1，否则为 0。
-```
+Stage 1 数据索引只保留 `all_labels.json` 中 `visualization_png` 实际存在的记录，
+并从对应 placements JSON 中读取源物体 GT box。`support_mask_ply` 保留给 Stage 2
+训练支撑面预测使用，Stage 1 不再读取或对齐 support mask。
 
 ## 固定数据划分
 
@@ -87,8 +82,8 @@ conda run -n spatial torchrun --nproc_per_node=4 tools/train_lc_bgplacenet_stage
 ```text
 outputs/lc_bgplacenet_stage1/
   metrics.jsonl
-  last.pt
-  best.pt
+  last.pt   # 最近一轮 checkpoint
+  best.pt   # 按 valid source_iou 最高保存
 ```
 
 ## 推理和 RGB 可视化
@@ -111,7 +106,7 @@ outputs/lc_bgplacenet_stage1/inference_rgb_valid/
   summary.json        # 汇总指标
 ```
 
-注意：Stage 1 只预测 source box 的中心和尺寸，不预测 source yaw。推理可视化中
+注意：Stage 1 只预测 source box 的中心和尺寸，不预测 source yaw 或 support surface。推理可视化中
 预测框和 GT 框都使用 canonical sample 中该源物体的 `pose_world` 方向绘制，
 `predictions.jsonl` 会记录 `visualization_rotation_source=gt_pose`。
 
