@@ -489,19 +489,14 @@ def compute_occlusion_ratio(
     return occluded_area / (ref_area + 1e-6)
 
 
-def find_nearest_reference(
+def collect_reference_candidates(
     target_corners_world: np.ndarray,
     reference_objects: List[ObjectInfo],
     camera: CameraParams,
     exclude_id: Optional[str] = None,
-) -> List[Tuple[Optional[ObjectInfo], str, float]]:
-    """
-    经过可见性、遮挡和距离过滤后，为目标 box 选出近邻参照物并计算空间关系。
-    返回 list[(ObjectInfo|None, relation, distance)]，上下关系优先、距离近优先。
-    """
-    if not reference_objects:
-        return [(None, "near", float("inf"))]
-
+    apply_visibility_filters: bool = True,
+) -> List[Tuple[int, float, float, ObjectInfo, str]]:
+    """收集有效参照物候选；无阈值模式只排除目标自身并跳过 near 关系。"""
     E_w2c = camera.E_w2c
     K = camera.K
     img_w, img_h = camera.img_w, camera.img_h
@@ -516,61 +511,97 @@ def find_nearest_reference(
         ref_info = obj_info_map[ref.obj_id]
         ref_corners_world = ref_info["corners_world"]
         r_min_c, r_max_c = get_camera_aabb(ref_corners_world, E_w2c)
-        is_visible, ref_area = passes_reference_visibility_filter(
-            ref_info["min_2d"], ref_info["max_2d"], img_w, img_h
-        )
-        if not is_visible:
-            continue
+        if apply_visibility_filters:
+            is_visible, ref_area = passes_reference_visibility_filter(
+                ref_info["min_2d"], ref_info["max_2d"], img_w, img_h
+            )
+            if not is_visible:
+                continue
 
-        occlusion_ratio = compute_occlusion_ratio(
-            ref_id=ref.obj_id,
-            ref_min_2d=ref_info["min_2d"],
-            ref_max_2d=ref_info["max_2d"],
-            ref_area=ref_area,
-            ref_depth=ref_info["depth"],
-            obj_info_map=obj_info_map,
-            exclude_id=exclude_id,
-        )
-        if occlusion_ratio >= MAX_OCCLUSION_RATIO:
-            continue
+            occlusion_ratio = compute_occlusion_ratio(
+                ref_id=ref.obj_id,
+                ref_min_2d=ref_info["min_2d"],
+                ref_max_2d=ref_info["max_2d"],
+                ref_area=ref_area,
+                ref_depth=ref_info["depth"],
+                obj_info_map=obj_info_map,
+                exclude_id=exclude_id,
+            )
+            if occlusion_ratio >= MAX_OCCLUSION_RATIO:
+                continue
 
         center_dist = center_distance(t_min_c, t_max_c, r_min_c, r_max_c)
         score = 1.0 / (center_dist + 1e-5)
         relation = describe_spatial_relation(target_corners_world, ref_corners_world, E_w2c, K)
+        if relation == "near":
+            continue
         vertical_priority = 1 if relation in ("the top of", "below") else 0
         valid_candidates.append((vertical_priority, score, center_dist, ref, relation))
 
-    if not valid_candidates:
-        return [(None, "near", float("inf"))]
-
     valid_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return valid_candidates
+
+
+def find_nearest_reference(
+    target_corners_world: np.ndarray,
+    reference_objects: List[ObjectInfo],
+    camera: CameraParams,
+    exclude_id: Optional[str] = None,
+) -> List[Tuple[ObjectInfo, str, float, str]]:
+    """
+    先按可见性/遮挡筛选参照物；若筛空，则取消这些阈值并按距离选参照物。
+
+    返回 list[(ObjectInfo, relation, distance, selection_mode)]。没有可用参照物时返回空列表。
+    """
+    available_refs = [
+        ref
+        for ref in reference_objects
+        if exclude_id is None or str(ref.obj_id) != str(exclude_id)
+    ]
+    if not available_refs:
+        return []
+
+    valid_candidates = collect_reference_candidates(
+        target_corners_world,
+        reference_objects,
+        camera,
+        exclude_id=exclude_id,
+        apply_visibility_filters=True,
+    )
+    selection_mode = "filtered"
+    if not valid_candidates:
+        valid_candidates = collect_reference_candidates(
+            target_corners_world,
+            reference_objects,
+            camera,
+            exclude_id=exclude_id,
+            apply_visibility_filters=False,
+        )
+        selection_mode = "unfiltered"
+    if not valid_candidates:
+        return []
+
     top_candidates = valid_candidates[:MAX_REFERENCE_CANDIDATES]
-    return [(ref, relation, dist) for _, _, dist, ref, relation in top_candidates]
+    return [(ref, relation, dist, selection_mode) for _, _, dist, ref, relation in top_candidates]
 
 
 def build_spatial_relation_record(
-    ref: Optional[ObjectInfo],
+    ref: ObjectInfo,
     relation: str,
     distance_cm: float,
+    selection_mode: str,
     mapping_data: Optional[dict] = None,
 ) -> dict:
     """将参照物候选转换为结构化关系记录。"""
     if mapping_data is None:
         mapping_data = {}
-    if ref is None:
-        return {
-            "relation": str(relation),
-            "reference_object_id": None,
-            "reference_class_name": None,
-            "reference_name": "nothing",
-            "distance_cm": None if not np.isfinite(distance_cm) else float(distance_cm),
-        }
     return {
         "relation": str(relation),
         "reference_object_id": str(ref.obj_id),
         "reference_class_name": str(ref.class_name),
         "reference_name": mapping_data.get(ref.class_name, ref.class_name),
         "distance_cm": None if not np.isfinite(distance_cm) else float(distance_cm),
+        "reference_selection_mode": str(selection_mode),
     }
 
 
@@ -586,28 +617,19 @@ def calculate_spatial_relation_records(
         mapping_data = {}
     all_candidates = find_nearest_reference(target_corners_world, reference_objects, camera, exclude_id)
     return [
-        build_spatial_relation_record(ref, relation, distance, mapping_data)
-        for ref, relation, distance in all_candidates
+        build_spatial_relation_record(ref, relation, distance, selection_mode, mapping_data)
+        for ref, relation, distance, selection_mode in all_candidates
     ]
 
 
 # ===================== 4. 标注生成 =====================
-_EMPTY_RECORD = {
-    "relation": "near",
-    "reference_object_id": None,
-    "reference_class_name": None,
-    "reference_name": "the reference object",
-    "distance_cm": None,
-}
-
-
 def generate_label_for_placement(
     obj_record: dict,
     placement: dict,
     reference_objects: List[ObjectInfo],
     camera: CameraParams,
     mapping_data: dict,
-) -> Tuple[str, dict]:
+) -> Tuple[Optional[str], dict]:
     """
     为单个 placement 生成自然语言移动指令，并返回结构化空间关系。
 
@@ -618,7 +640,7 @@ def generate_label_for_placement(
         camera: CameraParams
         mapping_data: 类别名 -> 展示名映射
     输出:
-        (label, spatial_relation_dict)，后者含 original / placement 两段记录。
+        (label, spatial_relation_dict)，后者含 original / placement 两段记录；无法生成有效方向时 label 为 None。
     """
     target_obj_id = str(obj_record["object_id"])
     target_class_name = obj_record.get("class_name")
@@ -634,7 +656,9 @@ def generate_label_for_placement(
     original_records = calculate_spatial_relation_records(
         original_corners, reference_objects, camera, exclude_id=target_obj_id, mapping_data=mapping_data
     )
-    original_record = original_records[0] if original_records else dict(_EMPTY_RECORD)
+    if not original_records:
+        return None, {"skip_reason": "no_original_reference"}
+    original_record = original_records[0]
     rel_original = original_record["relation"]
     ref_a_name = original_record["reference_name"]
 
@@ -642,28 +666,11 @@ def generate_label_for_placement(
     placement_records = calculate_spatial_relation_records(
         placement_corners, reference_objects, camera, exclude_id=None, mapping_data=mapping_data
     )
-    placement_record = placement_records[0] if placement_records else dict(_EMPTY_RECORD)
+    if not placement_records:
+        return None, {"original": original_record, "skip_reason": "no_placement_reference"}
+    placement_record = placement_records[0]
     rel_placement = placement_record["relation"]
     ref_b_name = placement_record["reference_name"]
-
-    # 只有当「参照物相同 AND 方位也相同」时，才强制换一个，避免描述退化
-    if (ref_b_name == ref_a_name) and (rel_placement == rel_original):
-        ref_a_id = original_record.get("reference_object_id")
-        if ref_a_id is None:
-            for obj in reference_objects:
-                if mapping_data.get(obj.class_name, obj.class_name) == ref_a_name:
-                    ref_a_id = obj.obj_id
-                    break
-        if ref_a_id is not None:
-            filtered_refs = [obj for obj in reference_objects if str(obj.obj_id) != str(ref_a_id)]
-            if filtered_refs:
-                new_records = calculate_spatial_relation_records(
-                    placement_corners, filtered_refs, camera, exclude_id=target_obj_id, mapping_data=mapping_data
-                )
-                if new_records:
-                    placement_record = new_records[0]
-                    rel_placement = placement_record["relation"]
-                    ref_b_name = placement_record["reference_name"]
 
     label = LABEL_TEMPLATE.format(
         object_name=target_object_name,
