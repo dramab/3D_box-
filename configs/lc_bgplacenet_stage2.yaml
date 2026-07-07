@@ -1,0 +1,95 @@
+data:
+  # 输入 active 点云的体素大小，单位为厘米；应与 point_clouds_voxel_1cm 保持一致。
+  voxel_size_cm: 1.0
+  # dense heatmap 高斯半径，单位为 voxel 数。
+  heatmap_sigma_voxels: 2.0
+  # 复用 Stage 1 固定 train/valid/test 划分文件。
+  split_dir: data/splits/lc_bgplacenet_stage1
+  valid_fraction: 0.1
+  test_fraction: 0.1
+  split_seed: 20260624
+  max_train_samples:
+  max_valid_samples:
+  # canonical 数据源，以及对应生成的 free_bbox placement 和 auto-label 结果。
+  sources:
+    - name: dopose
+      dataset_dir: data/dopose
+      free_bbox_dir: outputs/free_bbox_dopose
+      labels_path: outputs/auto_labels_dopose/all_labels.json
+    - name: hope
+      dataset_dir: data/hope
+      free_bbox_dir: outputs/free_bbox_hope
+      labels_path: outputs/auto_labels_hope/all_labels.json
+    - name: housecat
+      dataset_dir: data/housecat
+      free_bbox_dir: outputs/free_bbox_housecat
+      labels_path: outputs/auto_labels_housecat/all_labels.json
+    - name: omni
+      dataset_dir: data/omni_filter
+      free_bbox_dir: outputs/free_bbox_omni
+      labels_path: outputs/auto_labels_omni/all_labels.json
+    - name: ycbv
+      dataset_dir: data/ycbv
+      free_bbox_dir: outputs/free_bbox_ycbv
+      labels_path: outputs/auto_labels_ycbv/all_labels.json
+
+model:
+  hidden_dim: 256
+  backbone:
+    type: spconv
+    in_channels: 6
+    num_blocks: 3
+  text:
+    model_name: roberta-base
+    freeze: true
+    max_length: 256
+    local_files_only: true
+  fusion:
+    num_heads: 8
+    dropout: 0.1
+  source_grounding:
+    num_heads: 8
+    num_layers: 4
+    dropout: 0.1
+  placement:
+    dropout: 0.1
+    # Dense Placement Fusion 后使用 spconv sparse neck 聚合局部体素上下文。
+    neck_num_blocks: 4
+    use_source_center: false
+    heatmap_loss: focal
+    size_refinement: exp_residual
+    yaw_repr: sincos
+    yaw_sensitive_ratio: 0.25
+    near_square_yaw: random
+
+loss:
+  lambda_heat: 1.0
+  lambda_center: 1.0
+  lambda_size: 1.0
+  lambda_yaw: 0.5
+  lambda_src: 0.2
+  heatmap_loss: focal
+  yaw_sensitive_ratio: 0.25
+  focal:
+    alpha: 0.25
+    gamma: 2.0
+  source:
+    lambda_center: 2.0
+    lambda_size: 1.5
+    lambda_iou: 0.2
+
+training:
+  output_dir: outputs/lc_bgplacenet_stage2
+  # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
+  stage1_pretrained_checkpoint:
+  device: auto
+  seed: 20260624
+  epochs: 45
+  batch_size: 8
+  num_workers: 8
+  pin_memory: true
+  progress_bar: true
+  lr: 0.0001
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  log_every: 100
