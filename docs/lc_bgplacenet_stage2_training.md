@@ -83,17 +83,41 @@ python tools/export_lc_bgplacenet_stage2_inference_web.py \
 
 ## Test Benchmark
 
-读取 test split 的 `predictions.json`，评估 size 体积 IoU、direction-filtered heatmap 底面中心命中率和非支撑面点云碰撞率：
+读取 test split 的 `predictions.json`，评估 size 体积 IoU、auto-label 语义方位命中率和场景物体 3D box 碰撞率。
+
+先为固定 split 生成语义方位 metadata。脚本会从 instruction 的 `to ...` 目标短语解析目标关系和参照物名称，再用 GT placement 与 `auto_label.describe_spatial_relation` 规则反解唯一参照物 id：
+
+```bash
+python tools/generate_lc_bgplacenet_stage2_direction_metadata.py \
+  --config configs/lc_bgplacenet_stage2.yaml \
+  --split test \
+  --output outputs/lc_bgplacenet_stage2/direction_metadata_test.json
+```
+
+然后运行 benchmark：
 
 ```bash
 python tools/benchmark_lc_bgplacenet_stage2.py \
   --config configs/lc_bgplacenet_stage2.yaml \
   --predictions outputs/lc_bgplacenet_stage2/inference_stage2_test/predictions.json \
+  --direction-metadata outputs/lc_bgplacenet_stage2/direction_metadata_test.json \
   --split test \
   --output-dir outputs/lc_bgplacenet_stage2/benchmark_stage2_test
 ```
 
-输出包含 `benchmark_metrics.json` 和 `per_sample_metrics.jsonl`。`--size-iou-threshold` 默认 0.8，可按 benchmark 口径调整。
+输出包含 `benchmark_metrics.json` 和 `per_sample_metrics.jsonl`。`direction_hit_rate` 表示预测 place box 相对 metadata 指定参照物的 `describe_spatial_relation` 结果是否等于 instruction 目标关系；碰撞检测会把预测 3D box 与场景中所有已知物体 3D box 做 OBB 相交判断；`--size-iou-threshold` 默认 0.8，可按 benchmark 口径调整。
+
+导出静态 benchmark 可视化网页：
+
+```bash
+python tools/export_lc_bgplacenet_stage2_benchmark_web.py \
+  --config configs/lc_bgplacenet_stage2.yaml \
+  --input-dir outputs/lc_bgplacenet_stage2/inference_stage2_test \
+  --benchmark-dir outputs/lc_bgplacenet_stage2/benchmark_stage2_test \
+  --split test
+```
+
+输出默认为 `outputs/lc_bgplacenet_stage2/benchmark_stage2_test/web_vis/index.html`。网页包含预测 / GT 投影、XY 俯视诊断图、direction/size/collision 状态，以及按错误类型筛选和排序的控件。
 
 ## 监督可视化
 

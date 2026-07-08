@@ -1,0 +1,332 @@
+{
+  "item_id": "housecat__label_009672__32fe6df71c86cb19",
+  "metric_row": {
+    "item_id": "housecat__label_009672__32fe6df71c86cb19",
+    "source_name": "housecat",
+    "sample_id": "housecat__scene32__000430",
+    "object_id": "obj_4_cutlery_spoon_1",
+    "cluster_id": 1,
+    "size_iou": 0.8366924860749158,
+    "size_correct": true,
+    "direction_hit": false,
+    "target_relation": "the front right of",
+    "predicted_relation": "the front left of",
+    "reference_object_id": "obj_6_shoe_crocs_yellow_sandal_right",
+    "reference_name": "Crocs Yellow Right Sandal",
+    "collision": true,
+    "collision_object_count": 1,
+    "collision_object_ids": [
+      "obj_6_shoe_crocs_yellow_sandal_right"
+    ]
+  },
+  "prediction_place_box_xyzdxdydzyaw": [
+    36.16984558105469,
+    8.250714302062988,
+    0.8532230854034424,
+    14.926470756530762,
+    3.383200168609619,
+    1.6252413988113403,
+    1.3699426651000977
+  ],
+  "collision_code": {
+    "type": "3D OBB SAT",
+    "eps_cm": 1e-06,
+    "explicit_margin_or_padding_cm": 0.0,
+    "source_file": "tools/benchmark_lc_bgplacenet_stage2.py"
+  },
+  "coordinate_normalization": {
+    "enabled": true,
+    "method": "support_surface_ransac_to_world_z",
+    "source_world_frame": "scene_link",
+    "target_world_frame": "canonical_z_up",
+    "point_count": 148203,
+    "ransac_point_count": 50000,
+    "ransac_iterations": 512,
+    "distance_thresh_cm": 1.0,
+    "min_inlier_count": 500,
+    "min_inlier_ratio": 0.03,
+    "min_required_inliers": 1500,
+    "inlier_count": 33466,
+    "inlier_ratio": 0.66932,
+    "plane_rmse_cm": 0.3412873665115514,
+    "plane_median_abs_error_cm": 0.20049662610983665,
+    "support_normal_before": [
+      0.0070925326929515324,
+      -0.026558567961313416,
+      0.9996220978188927
+    ],
+    "plane_d_before": 5.0647054018412305,
+    "normal_orientation_reference": "objects",
+    "correction_degrees": 1.5752192380694086,
+    "support_z_before_translation": -5.032611173581694,
+    "z_translation_cm": 5.032611173581694,
+    "object_bottom_tolerance_cm": 8.0,
+    "object_bottom_signed_distances_cm": [
+      0.5105172549544523,
+      -0.3968788388222002,
+      -1.4969712666067458,
+      0.06916705014163771,
+      7.14800535565484,
+      -1.2368935789514204
+    ],
+    "supported_object_count": 6,
+    "penetrating_object_count": 0,
+    "median_abs_object_bottom_distance_cm": 0.8737054169529364
+  },
+  "camera_projection": {
+    "uses_sample_E_c2w_after_coordinate_normalization": true,
+    "E_w2c_is_inverse_of_E_c2w": true,
+    "pred_projected_uv_minmax": [
+      [
+        325.2164017453612,
+        634.6038094084835
+      ],
+      [
+        594.6437457276162,
+        731.2907843176465
+      ]
+    ],
+    "shoe_projected_uv_minmax": [
+      [
+        442.85816845326593,
+        177.1400482559334
+      ],
+      [
+        957.6898934252101,
+        648.5273086784008
+      ]
+    ],
+    "pred_zcam_minmax": [
+      38.73776084316297,
+      43.076567578895855
+    ],
+    "shoe_zcam_minmax": [
+      36.308440455063945,
+      52.80156075357758
+    ]
+  },
+  "pred_obb": {
+    "object_id": "prediction",
+    "center": [
+      36.16984558105469,
+      8.250714302062988,
+      0.8532230854034424
+    ],
+    "axes": [
+      [
+        0.19950590360033135,
+        -0.9798966243582102,
+        0.0
+      ],
+      [
+        0.9798966243582102,
+        0.19950590360033135,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "half_extents": [
+      7.463235378265381,
+      1.6916000843048096,
+      0.8126206994056702
+    ]
+  },
+  "shoe_obb": {
+    "object_id": "obj_6_shoe_crocs_yellow_sandal_right",
+    "center": [
+      27.398962871631053,
+      26.309676190923305,
+      8.989782651216826
+    ],
+    "axes": [
+      [
+        -0.24261380626785228,
+        0.1661897995568309,
+        0.9557821360181853
+      ],
+      [
+        0.8951146229004331,
+        -0.34151495737715265,
+        0.28659613702472964
+      ],
+      [
+        0.37404325000999616,
+        0.925066745922121,
+        -0.0659026760535379
+      ]
+    ],
+    "half_extents": [
+      14.375400543212818,
+      4.864799976348861,
+      5.788600072264674
+    ]
+  },
+  "xy_footprint": {
+    "pred_area_cm2": 50.49923838024142,
+    "shoe_area_cm2": 368.47996973570116,
+    "intersection_area_cm2": 3.258044934729469,
+    "intersection_over_pred": 0.06451671429571951,
+    "intersection_over_shoe": 0.00884185085302292,
+    "pred_polygon_xy": [
+      [
+        33.02329285075754,
+        1.2749993514595994
+      ],
+      [
+        36.33847927550624,
+        0.6000309447603431
+      ],
+      [
+        39.31639831135183,
+        15.226429252666378
+      ],
+      [
+        36.00121188660314,
+        15.901397659365633
+      ]
+    ],
+    "shoe_polygon_xy": [
+      [
+        17.570171554639593,
+        39.179718964282955
+      ],
+      [
+        24.54551283946722,
+        13.444456491721711
+      ],
+      [
+        26.162473105374207,
+        10.1216525785794
+      ],
+      [
+        37.22775418862251,
+        13.439633417563654
+      ],
+      [
+        30.252412903794884,
+        39.1748958901249
+      ],
+      [
+        28.635452637887898,
+        42.49769980326721
+      ]
+    ]
+  },
+  "z_aabb_overlap": {
+    "pred_z_minmax_cm": [
+      0.04060238599777222,
+      1.6658437848091125
+    ],
+    "shoe_z_minmax_cm": [
+      -1.2689878072109586,
+      19.24855310964461
+    ],
+    "overlap_cm": 1.6252413988113403
+  },
+  "sat_min_overlap": {
+    "axis": "cross_0_1",
+    "center_distance_cm": 13.805223958142303,
+    "radius_sum_cm": 13.97836455618304,
+    "overlap_cm": 0.173140598040737,
+    "axis_vector": [
+      0.9507079035636896,
+      -0.19356311129725284,
+      -0.24225565844054403
+    ]
+  },
+  "sat_smallest_overlaps": [
+    {
+      "axis": "cross_0_1",
+      "center_distance_cm": 13.805223958142303,
+      "radius_sum_cm": 13.97836455618304,
+      "overlap_cm": 0.173140598040737,
+      "axis_vector": [
+        0.9507079035636896,
+        -0.19356311129725284,
+        -0.24225565844054403
+      ]
+    },
+    {
+      "axis": "shoe_axis_0",
+      "center_distance_cm": 21.336203283479417,
+      "radius_sum_cm": 21.568507241422388,
+      "overlap_cm": 0.2323039579429711,
+      "axis_vector": [
+        -0.24261380626785228,
+        0.8951146229004331,
+        0.37404325000999616
+      ]
+    },
+    {
+      "axis": "pred_axis_1",
+      "center_distance_cm": 12.197427869327036,
+      "radius_sum_cm": 13.890449030220058,
+      "overlap_cm": 1.6930211608930215,
+      "axis_vector": [
+        -0.9798966243582102,
+        0.19950590360033135,
+        0.0
+      ]
+    },
+    {
+      "axis": "cross_2_2",
+      "center_distance_cm": 19.817215795983532,
+      "radius_sum_cm": 22.527540462098145,
+      "overlap_cm": 2.7103246661146123,
+      "axis_vector": [
+        -0.2872205384980859,
+        0.9578644801144208,
+        0.0
+      ]
+    },
+    {
+      "axis": "cross_1_2",
+      "center_distance_cm": 10.265509192651121,
+      "radius_sum_cm": 13.066079940271292,
+      "overlap_cm": 2.8005707476201707,
+      "axis_vector": [
+        -0.02761587450405691,
+        -0.13563860375498374,
+        -0.9903734309071375
+      ]
+    },
+    {
+      "axis": "pred_axis_2",
+      "center_distance_cm": 8.136559565813384,
+      "radius_sum_cm": 11.071391157833455,
+      "overlap_cm": 2.934831592020071,
+      "axis_vector": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "axis": "cross_0_2",
+      "center_distance_cm": 7.202271492074512,
+      "radius_sum_cm": 10.423156614782773,
+      "overlap_cm": 3.2208851227082604,
+      "axis_vector": [
+        -0.07322942496389076,
+        0.014909432520111404,
+        -0.9972036703409121
+      ]
+    },
+    {
+      "axis": "cross_1_1",
+      "center_distance_cm": 17.682475251493038,
+      "radius_sum_cm": 22.81750462518299,
+      "overlap_cm": 5.135029373689953,
+      "axis_vector": [
+        0.18968580443704774,
+        0.9316640565629156,
+        0.3098731697062567
+      ]
+    }
+  ],
+  "all_sat_axes_have_positive_overlap": true
+}
