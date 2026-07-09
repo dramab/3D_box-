@@ -10,19 +10,42 @@ tools/run_auto_label.py
 
 使用示例:
     # 小批量验证（指定 sample_id）
-    conda run -n spatial python tools/run_auto_label.py \
+   python tools/run_auto_label.py \
         --placements-dir outputs/free_bbox_hope/placements \
         --dataset-dir data/hope \
         --output-dir outputs/auto_labels_hope \
         --sample-ids hope__scene_0000__0000 hope__scene_0000__0005
 
     # 全量
-    conda run -n spatial python tools/run_auto_label.py \
+   python tools/run_auto_label.py \
         --placements-dir outputs/free_bbox_hope/placements \
         --dataset-dir data/hope \
         --output-dir outputs/auto_labels_hope \
         --workers 8
+    
+   python tools/run_auto_label.py \
+        --placements-dir outputs/free_bbox_dopose/placements \
+        --dataset-dir data/dopose \
+        --output-dir outputs/auto_labels_dopose \
+        --workers 8
 
+   python tools/run_auto_label.py \
+        --placements-dir outputs/free_bbox_ycbv/placements \
+        --dataset-dir data/ycbv \
+        --output-dir outputs/auto_labels_ycbv \
+        --workers 8
+
+   python tools/run_auto_label.py \
+        --placements-dir outputs/free_bbox_housecat/placements \
+        --dataset-dir data/housecat \
+        --output-dir outputs/auto_labels_housecat \
+        --workers 8
+
+   python tools/run_auto_label.py \
+        --placements-dir outputs/free_bbox_omni/placements \
+        --dataset-dir data/omni_filter \
+        --output-dir outputs/auto_labels_omni \
+        --workers 8
 查看报告: 进入 output-dir 上级，python3 -m http.server 8080，浏览器打开 report.html。
 """
 

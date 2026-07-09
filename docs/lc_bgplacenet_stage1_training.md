@@ -86,6 +86,14 @@ outputs/lc_bgplacenet_stage1/
   best.pt   # 按 valid source_iou 最高保存
 ```
 
+可视化训练日志：
+
+```bash
+python scripts/visualize_metrics_jsonl.py \
+    --metrics outputs/lc_bgplacenet_stage1/metrics.jsonl \
+    --output outputs/lc_bgplacenet_stage1/metrics_plot.png
+```
+
 ## 推理和 RGB 可视化
 
 推理脚本默认使用固定 `valid` split；也可以显式选择 `train` 或 `test`。

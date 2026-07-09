@@ -76,21 +76,21 @@ loss:
   lambda_src: 1.0
   source:
     # 源物体框中心点 L1 loss 权重。
-    lambda_center: 2.0
+    lambda_center: 1.0
     # 源物体框尺寸 L1 loss 权重。
-    lambda_size: 1.5
+    lambda_size: 1.0
     # 源物体框 IoU loss 权重。
     lambda_iou: 0.2
 
 training:
   # 保存 metrics.jsonl、last.pt 和 best.pt 的输出目录。
-  output_dir: outputs/lc_bgplacenet_stage1_no_support
+  output_dir: outputs/lc_bgplacenet_stage1
   # auto 表示优先使用 CUDA，CUDA 不可用时使用 CPU。
   device: auto
   # 用于训练复现的随机种子。
   seed: 20260624
   # 对训练集完整遍历的轮数。
-  epochs: 25
+  epochs: 50
   # 每次优化器更新使用的样本数。
   batch_size: 10
   # DataLoader worker 进程数量。
@@ -106,4 +106,4 @@ training:
   # 全局梯度范数裁剪阈值。
   grad_clip_norm: 1.0
   # 每隔 N 次优化器更新打印一次训练指标。
-  log_every: 100
+  log_every: 300

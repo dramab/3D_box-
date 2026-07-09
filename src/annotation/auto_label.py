@@ -3,7 +3,7 @@ src/annotation/auto_label.py
 ----------------------------
 为 free_bbox pipeline 产出的放置样本生成自然语言移动指令标注。
 
-结合 3D 物理测距、真实 world box 上下关系判断与 2D 像素中心角度，
+结合 3D 物理测距、真实 world box 上下关系判断与图像轴对齐的 world XY 俯视角度，
 生成形如 "Move {object} located at {rel_a} {ref_a} to {rel_b} {ref_b}." 的描述。
 
 几何/关系判定逻辑移植自 Spatial-Affordance/tools/auto_label.py，
@@ -33,10 +33,8 @@ VERTICAL_MAX_PENETRATION_RATIO = 0.35
 MAX_VERTICAL_PENETRATION = 3.0
 VERTICAL_CENTER_SEPARATION_RATIO = 0.20
 MIN_VERTICAL_CENTER_SEPARATION = 0.5
-AXIS_DIRECTION_HALF_WIDTH_DEG = 15.0
-DEPTH_DIRECTION_MIN_CM = 5.0
-DEPTH_DIRECTION_EXTENT_RATIO = 0.20
-LATERAL_DIRECTION_MIN_PX = 8.0
+# 8 个水平方向均匀划分，每个方向 45° 扇区。
+AXIS_DIRECTION_HALF_WIDTH_DEG = 22.5
 MIN_VISIBILITY_RATIO = 0.4
 MAX_OCCLUSION_RATIO = 0.5
 SMALL_IMAGE_AREA_THRESHOLD = 2500
@@ -69,7 +67,7 @@ def get_mapping(mapping_path: Optional[str] = None) -> dict:
     return GLOBAL_MAPPING_CACHE[mapping_path]
 
 
-# ===================== 2. 空间几何计算 (真实 box + 像素中心角度法) =====================
+# ===================== 2. 空间几何计算 (真实 box + 图像轴对齐的 world XY 俯视角度法) =====================
 def get_camera_aabb(corners_world: np.ndarray, E_w2c: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """将世界坐标 box 角点变换到相机坐标系并返回 AABB (cam_min, cam_max)。"""
     corners_cam = transform_points(corners_world, E_w2c)
@@ -259,26 +257,13 @@ def describe_vertical_relation(
     return None
 
 
-def project_box_center_to_camera(corners_world: np.ndarray, E_w2c: np.ndarray) -> np.ndarray:
-    """将真实 world box 的中心点变换到相机坐标系，返回 (3,) [x, y, z]。"""
-    center_world = np.asarray(corners_world, dtype=np.float64).mean(axis=0)
-    return transform_points(center_world[None, :], E_w2c)[0]
-
-
-def project_box_center_to_pixel(corners_world: np.ndarray, E_w2c: np.ndarray, K: np.ndarray) -> np.ndarray:
-    """将真实 world box 的中心点投影到像素坐标，返回 (2,) [u, v]。"""
-    center_world = np.asarray(corners_world, dtype=np.float64).mean(axis=0)
-    center_uv, _ = project_world(center_world[None, :], K, E_w2c)
-    return center_uv[0]
-
-
 def normalize_angle_degrees(angle_deg: float) -> float:
     """将角度归一化到 [-180, 180) 区间。"""
     return ((float(angle_deg) + 180.0) % 360.0) - 180.0
 
 
 def describe_angle_relation(angle_deg: float, axis_half_width_deg: float = AXIS_DIRECTION_HALF_WIDTH_DEG) -> str:
-    """用非均匀扇区将像素向量角度映射到 8 个水平方向。"""
+    """将图像轴对齐的 world XY 俯视向量角度映射到 8 个均匀水平方向。"""
     axis_half_width_deg = float(axis_half_width_deg)
     if not (0.0 < axis_half_width_deg < 45.0):
         raise ValueError("axis_half_width_deg must be in (0, 45)")
@@ -309,66 +294,60 @@ def describe_angle_relation(angle_deg: float, axis_half_width_deg: float = AXIS_
     return "the back right of"
 
 
-def compute_depth_direction_threshold(
+def footprint_center_world_xy(corners_world: np.ndarray) -> np.ndarray:
+    """返回真实 box 在 world XY 支撑平面足迹上的中心点。"""
+    footprint = convex_hull_xy(corners_world)
+    return np.asarray(footprint, dtype=np.float64).mean(axis=0)
+
+
+def camera_image_axes_world_xy(E_w2c: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """返回绕 world-Z 旋转后与图像视角对齐的 world XY 单位轴。"""
+    R_c2w = np.linalg.inv(np.asarray(E_w2c, dtype=np.float64))[:3, :3]
+    axis_x = R_c2w[:2, 0].astype(np.float64)
+    norm_x = float(np.linalg.norm(axis_x))
+    if norm_x <= 1e-9:
+        return None
+    axis_x = axis_x / norm_x
+
+    image_y_projection = R_c2w[:2, 1].astype(np.float64)
+    axis_y = np.array([-axis_x[1], axis_x[0]], dtype=np.float64)
+    if float(axis_y @ image_y_projection) > 0.0:
+        axis_y = -axis_y
+    return axis_x, axis_y
+
+
+def describe_horizontal_relation_image_aligned_world_xy(
     target_corners_world: np.ndarray,
     ref_corners_world: np.ndarray,
     E_w2c: np.ndarray,
-    min_depth_cm: float = DEPTH_DIRECTION_MIN_CM,
-    extent_ratio: float = DEPTH_DIRECTION_EXTENT_RATIO,
-) -> float:
-    """根据最小深度阈值和两个 box 的相机深度厚度生成前后方向阈值。"""
-    t_min_c, t_max_c = get_camera_aabb(target_corners_world, E_w2c)
-    r_min_c, r_max_c = get_camera_aabb(ref_corners_world, E_w2c)
-    target_depth_extent = max(0.0, float(t_max_c[2] - t_min_c[2]))
-    ref_depth_extent = max(0.0, float(r_max_c[2] - r_min_c[2]))
-    adaptive_threshold = float(extent_ratio) * min(target_depth_extent, ref_depth_extent)
-    return max(float(min_depth_cm), adaptive_threshold)
-
-
-def describe_horizontal_relation_by_depth(
-    target_corners_world: np.ndarray,
-    ref_corners_world: np.ndarray,
-    E_w2c: np.ndarray,
-    K: np.ndarray,
-    lateral_min_px: float = LATERAL_DIRECTION_MIN_PX,
-    depth_min_cm: float = DEPTH_DIRECTION_MIN_CM,
     axis_half_width_deg: float = AXIS_DIRECTION_HALF_WIDTH_DEG,
-) -> str:
+) -> Optional[str]:
     """
-    在相机横向-深度平面上用角度扇区判断 8 向水平关系。
-    中心近似重合时返回 "near"。
+    在 world XY 支撑平面上，使用绕 world-Z 旋转到图像视角的 XY 轴判断 8 向水平关系。
+    中心重合时无法给出可靠方向，返回 None 让上层跳过该参照物。
     """
-    target_uv = project_box_center_to_pixel(target_corners_world, E_w2c, K)
-    ref_uv = project_box_center_to_pixel(ref_corners_world, E_w2c, K)
-    target_cam = project_box_center_to_camera(target_corners_world, E_w2c)
-    ref_cam = project_box_center_to_camera(ref_corners_world, E_w2c)
+    target_xy = footprint_center_world_xy(target_corners_world)
+    ref_xy = footprint_center_world_xy(ref_corners_world)
+    direction_world_xy = target_xy - ref_xy
+    if float(np.linalg.norm(direction_world_xy)) <= 1e-9:
+        return None
 
-    delta_u = float(target_uv[0] - ref_uv[0])
-    delta_v = float(target_uv[1] - ref_uv[1])
-    delta_depth = float(target_cam[2] - ref_cam[2])
-    if (
-        abs(delta_u) <= float(lateral_min_px)
-        and abs(delta_v) <= float(lateral_min_px)
-        and abs(delta_depth) <= float(depth_min_cm)
-    ):
-        return "near"
+    axes = camera_image_axes_world_xy(E_w2c)
+    if axes is None:
+        return None
+    image_x_world_xy, image_y_world_xy = axes
 
-    depth_threshold = compute_depth_direction_threshold(
-        target_corners_world,
-        ref_corners_world,
-        E_w2c,
-        min_depth_cm=depth_min_cm,
+    direction_image_xy = np.array(
+        [
+            float(direction_world_xy @ image_x_world_xy),
+            float(direction_world_xy @ image_y_world_xy),
+        ],
+        dtype=np.float64,
     )
+    if float(np.linalg.norm(direction_image_xy)) <= 1e-9:
+        return None
 
-    # 将像素偏移和深度偏移归一化，保留更强的前后证据再计算角度。
-    direction_x = delta_u / float(lateral_min_px)
-    image_direction_y = delta_v / float(lateral_min_px)
-    depth_direction_y = -delta_depth / float(depth_threshold)
-    if abs(depth_direction_y) > abs(image_direction_y):
-        direction_y = depth_direction_y
-    else:
-        direction_y = image_direction_y
-    angle_deg = float(np.degrees(np.arctan2(direction_y, direction_x)))
+    angle_deg = float(np.degrees(np.arctan2(direction_image_xy[1], direction_image_xy[0])))
     return describe_angle_relation(angle_deg, axis_half_width_deg=axis_half_width_deg)
 
 
@@ -377,15 +356,15 @@ def describe_spatial_relation(
     ref_corners_world: np.ndarray,
     E_w2c: np.ndarray,
     K: np.ndarray,
-) -> str:
+) -> Optional[str]:
     """
-    先用真实 world box 判断上下关系；不是上下时融合像素左右和相机深度判断水平关系。
-    输出 10 类方向关系之一，极端中心重合时为 "near"。
+    先用真实 world box 判断上下关系；不是上下时用图像轴对齐的 world XY 俯视关系判断水平关系。
+    输出方向关系；中心重合且不是上下时返回 None。
     """
     vertical_relation = describe_vertical_relation(target_corners_world, ref_corners_world)
     if vertical_relation is not None:
         return vertical_relation
-    return describe_horizontal_relation_by_depth(target_corners_world, ref_corners_world, E_w2c, K)
+    return describe_horizontal_relation_image_aligned_world_xy(target_corners_world, ref_corners_world, E_w2c)
 
 
 # ===================== 3. 参照物筛选 =====================
@@ -533,7 +512,7 @@ def collect_reference_candidates(
         center_dist = center_distance(t_min_c, t_max_c, r_min_c, r_max_c)
         score = 1.0 / (center_dist + 1e-5)
         relation = describe_spatial_relation(target_corners_world, ref_corners_world, E_w2c, K)
-        if relation == "near":
+        if relation is None:
             continue
         vertical_priority = 1 if relation in ("the top of", "below") else 0
         valid_candidates.append((vertical_priority, score, center_dist, ref, relation))
@@ -658,17 +637,39 @@ def generate_label_for_placement(
     )
     if not original_records:
         return None, {"skip_reason": "no_original_reference"}
-    original_record = original_records[0]
-    rel_original = original_record["relation"]
-    ref_a_name = original_record["reference_name"]
 
     # 2. 目标放置位置关系
     placement_records = calculate_spatial_relation_records(
         placement_corners, reference_objects, camera, exclude_id=None, mapping_data=mapping_data
     )
     if not placement_records:
-        return None, {"original": original_record, "skip_reason": "no_placement_reference"}
-    placement_record = placement_records[0]
+        return None, {"original": original_records[0], "skip_reason": "no_placement_reference"}
+
+    original_record = None
+    placement_record = None
+    for original_candidate in original_records:
+        for placement_candidate in placement_records:
+            same_reference = (
+                original_candidate["reference_object_id"] == placement_candidate["reference_object_id"]
+            )
+            same_relation = original_candidate["relation"] == placement_candidate["relation"]
+            if same_reference and same_relation:
+                continue
+            original_record = original_candidate
+            placement_record = placement_candidate
+            break
+        if original_record is not None:
+            break
+
+    if original_record is None or placement_record is None:
+        return None, {
+            "original": original_records[0],
+            "placement": placement_records[0],
+            "skip_reason": "duplicate_original_and_placement_relation",
+        }
+
+    rel_original = original_record["relation"]
+    ref_a_name = original_record["reference_name"]
     rel_placement = placement_record["relation"]
     ref_b_name = placement_record["reference_name"]
 
