@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
+from PIL import Image
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -40,6 +41,7 @@ from src.training.lc_bgplacenet_stage1 import (
     _progress,
     _reduce_mean_dict,
     _resolve_device,
+    _resolve_rgb_camera_metadata,
     _resolve_voxel_path,
     _source_box_from_obb,
     build_sources_from_config,
@@ -65,6 +67,9 @@ class Stage2IndexItem:
     dataset_dir: Path
     free_bbox_dir: Path
     voxel_point_cloud_path: Path
+    rgb_path: Path
+    camera_K: np.ndarray
+    camera_E_w2c: np.ndarray
     support_mask_ply: Path
     direction_filtered_heatmap_ply: Path
     source_box_gt: np.ndarray
@@ -117,6 +122,7 @@ def build_stage2_index(sources: list[Stage1DataSource]) -> list[Stage2IndexItem]
             support_mask_path = _resolve_free_bbox_path(source.free_bbox_dir, support_mask)
             if not direction_heatmap.exists() or not support_mask_path.exists():
                 continue
+            rgb_path, camera_k, camera_e_w2c = _resolve_rgb_camera_metadata(source.dataset_dir, sample_id)
 
             items.append(
                 Stage2IndexItem(
@@ -130,6 +136,9 @@ def build_stage2_index(sources: list[Stage1DataSource]) -> list[Stage2IndexItem]
                     dataset_dir=source.dataset_dir,
                     free_bbox_dir=source.free_bbox_dir,
                     voxel_point_cloud_path=_resolve_voxel_path(source.dataset_dir, sample_id, payload),
+                    rgb_path=rgb_path,
+                    camera_K=camera_k,
+                    camera_E_w2c=camera_e_w2c,
                     support_mask_ply=support_mask_path,
                     direction_filtered_heatmap_ply=direction_heatmap,
                     source_box_gt=_source_box_from_obb(
@@ -238,6 +247,7 @@ class LCBGPlaceNetStage2Dataset(Dataset):
             raise ValueError(f"Invalid empty point data for {item.sample_id}")
         if len(positive_points) == 0:
             raise ValueError(f"No direction-filtered heatmap positives for {item.item_id}")
+        image = np.asarray(Image.open(item.rgb_path).convert("RGB"), dtype=np.uint8)
 
         return {
             "item_id": item.item_id,
@@ -248,6 +258,9 @@ class LCBGPlaceNetStage2Dataset(Dataset):
             "instruction": item.instruction,
             "points": points.astype(np.float32),
             "colors": colors.astype(np.uint8),
+            "image": image,
+            "camera_K": item.camera_K,
+            "camera_E_w2c": item.camera_E_w2c,
             "support_points": support_points[_is_support_color(support_colors)].astype(np.float32),
             "heatmap_positive_points": positive_points.astype(np.float32),
             "source_box_gt": item.source_box_gt,
@@ -312,6 +325,10 @@ def stage2_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
     sample_ids = []
     object_ids = []
     cluster_ids = []
+    images = []
+    camera_k = []
+    camera_e_w2c = []
+    image_hw = []
     spatial_max = np.zeros(3, dtype=np.int64)
 
     for batch_idx, item in enumerate(batch):
@@ -349,6 +366,11 @@ def stage2_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         sample_ids.append(str(item["sample_id"]))
         object_ids.append(str(item["object_id"]))
         cluster_ids.append(int(item["cluster_id"]))
+        image = np.asarray(item["image"], dtype=np.uint8)
+        images.append(image)
+        camera_k.append(np.asarray(item["camera_K"], dtype=np.float32))
+        camera_e_w2c.append(np.asarray(item["camera_E_w2c"], dtype=np.float32))
+        image_hw.append(np.asarray(image.shape[:2], dtype=np.float32))
 
     return {
         "features": torch.from_numpy(np.concatenate(features, axis=0)),
@@ -370,6 +392,10 @@ def stage2_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         "sample_ids": sample_ids,
         "object_ids": object_ids,
         "cluster_ids": cluster_ids,
+        "images": images,
+        "camera_K": torch.from_numpy(np.stack(camera_k, axis=0)),
+        "camera_E_w2c": torch.from_numpy(np.stack(camera_e_w2c, axis=0)),
+        "image_hw": torch.from_numpy(np.stack(image_hw, axis=0)),
         "batch_size": len(batch),
     }
 
@@ -552,11 +578,19 @@ def _make_loader(
     )
 
 
-def load_stage1_weights(model: LCBGPlaceNetDensePlacement, checkpoint_path: str | Path, device: torch.device) -> None:
+def load_stage1_weights(model: LCBGPlaceNetDensePlacement, checkpoint_path: str | Path, device: torch.device) -> list[str]:
     """Initialize shared Stage 1 modules from a Stage 1 checkpoint."""
     checkpoint = torch.load(Path(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-    model.load_state_dict(state_dict, strict=False)
+    model_state = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in state_dict.items()
+        if key in model_state and tuple(value.shape) == tuple(model_state[key].shape)
+    }
+    skipped = sorted(key for key in state_dict if key not in compatible)
+    model.load_state_dict(compatible, strict=False)
+    return skipped
 
 
 def train_stage2(
@@ -605,9 +639,12 @@ def train_stage2(
         model = LCBGPlaceNetDensePlacement(cfg["model"]).to(device)
         init_checkpoint = stage1_checkpoint or cfg["training"].get("stage1_pretrained_checkpoint")
         if resume_checkpoint is None and init_checkpoint:
-            load_stage1_weights(model, init_checkpoint, device)
+            skipped = load_stage1_weights(model, init_checkpoint, device)
             if _is_main_process(rank):
                 print(f"Initialized Stage 2 shared modules from Stage 1 checkpoint: {init_checkpoint}")
+                if skipped:
+                    preview = ", ".join(skipped[:8])
+                    print(f"Skipped {len(skipped)} incompatible Stage 1 keys: {preview}")
 
         if distributed:
             model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)

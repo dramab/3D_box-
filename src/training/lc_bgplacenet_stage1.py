@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel
@@ -61,6 +62,9 @@ class Stage1IndexItem:
     instruction: str
     dataset_dir: Path
     voxel_point_cloud_path: Path
+    rgb_path: Path
+    camera_K: np.ndarray
+    camera_E_w2c: np.ndarray
     source_box_gt: np.ndarray
 
 
@@ -92,6 +96,7 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
                 raise ValueError(f"Object {object_id} not found in {source.name}/{sample_id} placements")
 
             voxel_path = _resolve_voxel_path(source.dataset_dir, sample_id, payload)
+            rgb_path, camera_k, camera_e_w2c = _resolve_rgb_camera_metadata(source.dataset_dir, sample_id)
 
             items.append(
                 Stage1IndexItem(
@@ -103,6 +108,9 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
                     instruction=instruction,
                     dataset_dir=source.dataset_dir,
                     voxel_point_cloud_path=voxel_path,
+                    rgb_path=rgb_path,
+                    camera_K=camera_k,
+                    camera_E_w2c=camera_e_w2c,
                     source_box_gt=_source_box_from_obb(
                         obj_record["canonical_aabb_object"],
                         obj_record["original_pose_world"],
@@ -364,6 +372,31 @@ def _resolve_voxel_path(dataset_dir: Path, sample_id: str, placement_payload: di
     return dataset_dir / "point_clouds_voxel_1cm" / f"{sample_id}.ply"
 
 
+def _resolve_rgb_camera_metadata(dataset_dir: Path, sample_id: str) -> tuple[Path, np.ndarray, np.ndarray]:
+    """Resolve RGB path and camera matrices needed for 2D-to-3D feature splatting."""
+    sample_json = dataset_dir / "samples" / f"{sample_id}.json"
+    if not sample_json.exists():
+        raise FileNotFoundError(f"Canonical sample JSON not found: {sample_json}")
+    with sample_json.open("r", encoding="utf-8") as f:
+        sample_record = json.load(f)
+    rgb_rel = sample_record.get("rgb_path")
+    camera = sample_record.get("camera")
+    if not rgb_rel or not camera:
+        raise ValueError(f"Sample {sample_json} must contain rgb_path and camera for CLIP splat features")
+
+    k = np.array(
+        [
+            [float(camera["fx"]), 0.0, float(camera["cx"])],
+            [0.0, float(camera["fy"]), float(camera["cy"])],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    e_c2w = np.asarray(camera["E_c2w"], dtype=np.float64)
+    e_w2c = np.linalg.inv(e_c2w).astype(np.float32)
+    return dataset_dir / str(rgb_rel), k, e_w2c
+
+
 def _visualization_exists(free_bbox_dir: Path, record: dict[str, Any]) -> bool:
     """Use generated visualization PNGs as the Stage 1 sample whitelist."""
     vis_rel = record.get("visualization_png")
@@ -447,6 +480,7 @@ class LCBGPlaceNetStage1Dataset(Dataset):
         points, colors = load_ply(item.voxel_point_cloud_path)
         if len(points) == 0:
             raise ValueError(f"Invalid empty point data for {item.sample_id}")
+        image = np.asarray(Image.open(item.rgb_path).convert("RGB"), dtype=np.uint8)
 
         return {
             "source_name": item.source_name,
@@ -455,6 +489,9 @@ class LCBGPlaceNetStage1Dataset(Dataset):
             "instruction": item.instruction,
             "points": points.astype(np.float32),
             "colors": colors.astype(np.uint8),
+            "image": image,
+            "camera_K": item.camera_K,
+            "camera_E_w2c": item.camera_E_w2c,
             "source_box_gt": item.source_box_gt,
         }
 
@@ -473,6 +510,10 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
     source_names = []
     sample_ids = []
     object_ids = []
+    images = []
+    camera_k = []
+    camera_e_w2c = []
+    image_hw = []
     spatial_max = np.zeros(3, dtype=np.int64)
 
     for batch_idx, item in enumerate(batch):
@@ -500,6 +541,11 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         source_names.append(str(item["source_name"]))
         sample_ids.append(str(item["sample_id"]))
         object_ids.append(str(item["object_id"]))
+        image = np.asarray(item["image"], dtype=np.uint8)
+        images.append(image)
+        camera_k.append(np.asarray(item["camera_K"], dtype=np.float32))
+        camera_e_w2c.append(np.asarray(item["camera_E_w2c"], dtype=np.float32))
+        image_hw.append(np.asarray(image.shape[:2], dtype=np.float32))
 
     return {
         "features": torch.from_numpy(np.concatenate(features, axis=0)),
@@ -515,6 +561,10 @@ def stage1_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         "source_names": source_names,
         "sample_ids": sample_ids,
         "object_ids": object_ids,
+        "images": images,
+        "camera_K": torch.from_numpy(np.stack(camera_k, axis=0)),
+        "camera_E_w2c": torch.from_numpy(np.stack(camera_e_w2c, axis=0)),
+        "image_hw": torch.from_numpy(np.stack(image_hw, axis=0)),
         "batch_size": len(batch),
     }
 

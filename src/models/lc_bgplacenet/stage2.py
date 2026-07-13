@@ -14,9 +14,10 @@ from torch import nn
 import torch.nn.functional as F
 
 from src.models.lc_bgplacenet.stage1 import (
+    CLIPTextEncoder,
+    ProjectedCLIPVoxelFeatureEncoder,
     SingleQuerySourceGroundingHead,
     SparseBackboneSpconv,
-    TransformerTextEncoder,
     VoxelLanguageFusion,
 )
 
@@ -235,17 +236,32 @@ class LCBGPlaceNetDensePlacement(nn.Module):
         backbone_cfg = cfg["backbone"]
         if str(backbone_cfg.get("type", "spconv")).lower() != "spconv":
             raise ValueError("Only spconv backbone is implemented for Stage 2.")
+        clip_cfg = cfg.get("clip", {})
+        clip_model = str(clip_cfg.get("model_name_or_path", clip_cfg.get("model_name", "openai/clip-vit-base-patch16")))
+        clip_local_only = bool(clip_cfg.get("local_files_only", True))
+        clip_freeze = bool(clip_cfg.get("freeze", True))
+        voxel_clip_dim = int(clip_cfg.get("voxel_feature_dim", 0))
+        self.voxel_image_encoder = (
+            ProjectedCLIPVoxelFeatureEncoder(
+                model_name_or_path=clip_model,
+                voxel_feature_dim=voxel_clip_dim,
+                freeze=clip_freeze,
+                local_files_only=clip_local_only,
+            )
+            if voxel_clip_dim > 0
+            else None
+        )
         self.backbone = SparseBackboneSpconv(
             in_channels=int(backbone_cfg.get("in_channels", 6)),
             hidden_dim=hidden_dim,
             num_blocks=int(backbone_cfg.get("num_blocks", 3)),
         )
-        self.text_encoder = TransformerTextEncoder(
-            model_name=str(cfg["text"]["model_name"]),
+        self.text_encoder = CLIPTextEncoder(
+            model_name_or_path=clip_model,
             hidden_dim=hidden_dim,
-            freeze=bool(cfg["text"].get("freeze", True)),
-            max_length=int(cfg["text"].get("max_length", 48)),
-            local_files_only=bool(cfg["text"].get("local_files_only", True)),
+            freeze=clip_freeze,
+            max_length=int(clip_cfg.get("max_length", 77)),
+            local_files_only=clip_local_only,
         )
         self.fusion = VoxelLanguageFusion(
             hidden_dim=hidden_dim,
@@ -271,10 +287,11 @@ class LCBGPlaceNetDensePlacement(nn.Module):
 
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         batch_size = int(batch["batch_size"])
-        f_3d = self.backbone(batch)
+        backbone_batch = self._prepare_backbone_batch(batch)
+        f_3d = self.backbone(backbone_batch)
         text_tokens, text_global, text_attention_mask = self.text_encoder(
             batch["instructions"],
-            device=batch["features"].device,
+            device=backbone_batch["features"].device,
         )
         f_vl = self.fusion(
             voxel_features=f_3d,
@@ -326,6 +343,21 @@ class LCBGPlaceNetDensePlacement(nn.Module):
             **placement_out,
             **decoded,
         }
+
+    def _prepare_backbone_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        if self.voxel_image_encoder is None:
+            return batch
+        image_features = self.voxel_image_encoder(
+            images=batch["images"],
+            world_coords=batch["world_coords"],
+            batch_indices=batch["batch_indices"],
+            camera_k=batch["camera_K"],
+            camera_e_w2c=batch["camera_E_w2c"],
+            image_hw=batch["image_hw"],
+        )
+        out = dict(batch)
+        out["features"] = torch.cat([batch["features"], image_features], dim=-1)
+        return out
 
     def _pack_voxels(
         self,

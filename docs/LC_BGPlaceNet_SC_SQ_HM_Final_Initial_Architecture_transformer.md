@@ -4,7 +4,7 @@
 
 ## 1. 任务定义
 
-本方案面向语言条件的 3D 物体放置任务。模型输入单帧 RGB-D 反投影点云和自然语言指令，输出需要移动的源物体 box，以及最终目标放置 3D box。
+本方案面向语言条件的 3D 物体放置任务。模型输入单帧 RGB-D 反投影点云、RGB 图像、相机参数和自然语言指令，输出需要移动的源物体 box，以及最终目标放置 3D box。
 
 任务拆成两个阶段：
 
@@ -39,6 +39,9 @@ Stage 1 作为预训练先验知识保留。Stage 2 不再训练 Support Head、
 ```python
 sample = {
     "points": Tensor[N, 6],
+    "image": UInt8[H, W, 3],
+    "camera_K": Tensor[3, 3],
+    "camera_E_w2c": Tensor[4, 4],
     "instruction": str,
     "direction_filtered_heatmap_ply": path,
     "support_masks": Tensor[Nv],
@@ -53,6 +56,10 @@ sample = {
 points:
     单帧 RGB-D 反投影得到的点云。
     每个点包含 (x, y, z, r, g, b)。
+
+image / camera_K / camera_E_w2c:
+    用 CLIP ViT-B/16 的 14x14=196 个 patch token 提取 2D 语义特征，再把每个 active voxel 投影到
+    RGB 特征图采样，作为 F_3D 的输入端补充。
 
 instruction:
     自然语言放置指令。
@@ -1023,13 +1030,15 @@ model:
 
 backbone:
   type: spconv
-  in_channels: 6
+  in_channels: 70
   out_channels: 256
 
-text:
-  encoder: roberta-base
+clip:
+  model_name_or_path: openai/clip-vit-base-patch16
   freeze: true
-  out_dim: 256
+  max_length: 77
+  voxel_feature_dim: 64
+  local_files_only: true
 
 fusion:
   type: voxel_language_cross_attention

@@ -8,6 +8,13 @@ Benchmark LC-BGPlaceNet Stage 2 predictions on the fixed test split.
         --predictions outputs/lc_bgplacenet_stage2/inference_stage2_test/predictions.json \
         --split test \
         --output-dir outputs/lc_bgplacenet_stage2/benchmark_stage2_test
+
+python tools/benchmark_lc_bgplacenet_stage2.py \
+    --config configs/lc_bgplacenet_stage2.yaml \
+    --predictions outputs/lc_bgplacenet_stage2_clip16/inference_stage2_test/predictions.json \
+    --split test \
+    --output-dir outputs/lc_bgplacenet_stage2_clip16/benchmark_stage2_test \
+    --direction-metadata outputs/lc_bgplacenet_stage2_clip16/direction_metadata_test.json
 """
 
 from __future__ import annotations
