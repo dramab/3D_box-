@@ -18,6 +18,13 @@ point_clouds_voxel_1cm/*.ply
 不要把 `point_clouds/*.ply` 直接作为 Stage 1 输入。free_bbox 的 placements
 仍用于读取源物体 GT box，但其中的 `support_mask_ply` 不再作为 Stage 1 监督。
 
+模型输入端会额外读取同一 canonical sample 的 `rgb_path` 和 `camera`。CLIP ViT-B/16
+会在 RGB 上提取 14x14=196 个 patch 语义特征，再通过相机内外参把每个 active voxel 投影到
+2D 特征图上采样，采样结果作为 64 维 per-voxel 特征拼接到原始
+`(xyz_norm, rgb)` 后进入 spconv backbone。因此配置中的
+`model.backbone.in_channels` 为 `70`。`model.clip.model_name_or_path`
+需要指向本地可用的 CLIP 模型名或 HuggingFace snapshot 路径。
+
 Stage 1 数据索引只保留 `all_labels.json` 中 `visualization_png` 实际存在的记录，
 并从对应 placements JSON 中读取源物体 GT box。`support_mask_ply` 保留给 Stage 2
 训练支撑面预测使用，Stage 1 不再读取或对齐 support mask。
@@ -31,7 +38,7 @@ Stage 1 使用固定的 `train/valid/test` 清单，不在每次训练时重新�
 首次生成：
 
 ```bash
-conda run -n spatial python tools/generate_lc_bgplacenet_stage1_splits.py \
+python tools/generate_lc_bgplacenet_stage1_splits.py \
     --config configs/lc_bgplacenet_stage1.yaml
 ```
 
@@ -54,7 +61,7 @@ data/splits/lc_bgplacenet_stage1/
 小步验证：
 
 ```bash
-conda run -n spatial python tools/train_lc_bgplacenet_stage1.py \
+python tools/train_lc_bgplacenet_stage1.py \
     --config configs/lc_bgplacenet_stage1.yaml \
     --max-steps 2 \
     --max-train-samples 4 \
@@ -64,14 +71,14 @@ conda run -n spatial python tools/train_lc_bgplacenet_stage1.py \
 正式 Stage 1：
 
 ```bash
-conda run -n spatial python tools/train_lc_bgplacenet_stage1.py \
+python tools/train_lc_bgplacenet_stage1.py \
     --config configs/lc_bgplacenet_stage1.yaml
 ```
 
 多卡 Stage 1：
 
 ```bash
-conda run -n spatial torchrun --nproc_per_node=4 tools/train_lc_bgplacenet_stage1.py \
+torchrun --nproc_per_node=4 tools/train_lc_bgplacenet_stage1.py \
     --config configs/lc_bgplacenet_stage1.yaml
 ```
 
@@ -100,7 +107,7 @@ python scripts/visualize_metrics_jsonl.py \
 `--split val` 仍可作为 `valid` 的兼容别名。
 
 ```bash
-conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
+python tools/infer_lc_bgplacenet_stage1.py \
     --config configs/lc_bgplacenet_stage1.yaml \
     --checkpoint outputs/lc_bgplacenet_stage1/best.pt
 ```
@@ -122,25 +129,25 @@ outputs/lc_bgplacenet_stage1/inference_rgb_valid/
 
 ```bash
 # 推理全部可用样本
-conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
+python tools/infer_lc_bgplacenet_stage1.py \
     --config configs/lc_bgplacenet_stage1.yaml \
     --checkpoint outputs/lc_bgplacenet_stage1/best.pt \
     --split all
 
 # 推理固定测试集
-conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
+python tools/infer_lc_bgplacenet_stage1.py \
     --config configs/lc_bgplacenet_stage1.yaml \
     --checkpoint outputs/lc_bgplacenet_stage1/best.pt \
     --split test
 
 # 只跑少量样本验证输出
-conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
+python tools/infer_lc_bgplacenet_stage1.py \
     --config configs/lc_bgplacenet_stage1.yaml \
     --checkpoint outputs/lc_bgplacenet_stage1/best.pt \
     --max-samples 8
 
 # 只重画一个样本/物体，便于 debug
-conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
+python tools/infer_lc_bgplacenet_stage1.py \
     --config configs/lc_bgplacenet_stage1.yaml \
     --checkpoint outputs/lc_bgplacenet_stage1/best.pt \
     --sample-id dopose__test_table_000034__000003 \

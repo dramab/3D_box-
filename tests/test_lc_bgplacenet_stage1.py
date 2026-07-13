@@ -7,9 +7,10 @@ import math
 
 import numpy as np
 import torch
+from PIL import Image
 
 from src.datasets.pointcloud import save_ply
-from src.models.lc_bgplacenet.stage1 import aabb_iou_3d
+from src.models.lc_bgplacenet.stage1 import aabb_iou_3d, project_world_to_image_grid
 from src.training.lc_bgplacenet_stage1 import (
     LCBGPlaceNetStage1Dataset,
     Stage1DataSource,
@@ -52,13 +53,26 @@ def _make_tiny_stage1_source(tmp_path) -> Stage1DataSource:
     )
     voxel_path = dataset_dir / "point_clouds_voxel_1cm" / f"{sample_id}.ply"
     save_ply(voxel_path, points, colors)
+    rgb_path = dataset_dir / "rgb" / f"{sample_id}.png"
+    rgb_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.full((8, 8, 3), 128, dtype=np.uint8)).save(rgb_path)
 
     _write_json(
         dataset_dir / "samples" / f"{sample_id}.json",
         {
             "schema_version": "canonical_placement_scene/v1",
             "sample_id": sample_id,
+            "rgb_path": f"rgb/{sample_id}.png",
             "voxel_point_cloud_path": f"point_clouds_voxel_1cm/{sample_id}.ply",
+            "camera": {
+                "fx": 1.0,
+                "fy": 1.0,
+                "cx": 0.0,
+                "cy": 0.0,
+                "img_w": 8,
+                "img_h": 8,
+                "E_c2w": np.eye(4).tolist(),
+            },
         },
     )
 
@@ -168,7 +182,35 @@ def test_stage1_collate_builds_sparse_batch(tmp_path) -> None:
     assert batch["features"].shape == (3, 6)
     assert batch["sparse_coords"].shape == (3, 4)
     assert batch["source_box_gt"].shape == (1, 6)
+    assert len(batch["images"]) == 1
+    assert batch["camera_K"].shape == (1, 3, 3)
+    assert batch["camera_E_w2c"].shape == (1, 4, 4)
+    assert batch["image_hw"].tolist() == [[8.0, 8.0]]
     assert batch["instructions"] == ["Move toy object to the right of the block."]
+
+
+def test_project_world_to_image_grid_marks_invalid_voxels() -> None:
+    """Projection should return normalized image grid coords and invalid masks."""
+    world = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [7.0, 7.0, 1.0],
+            [9.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ],
+        dtype=torch.float32,
+    )
+    batch_indices = torch.zeros(4, dtype=torch.long)
+    camera_k = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]])
+    camera_e_w2c = torch.eye(4).unsqueeze(0)
+    image_hw = torch.tensor([[8.0, 8.0]])
+
+    grid, valid = project_world_to_image_grid(world, batch_indices, camera_k, camera_e_w2c, image_hw)
+
+    assert grid.shape == (4, 2)
+    assert valid.tolist() == [True, True, False, False]
+    np.testing.assert_allclose(grid[0].numpy(), [-1.0, -1.0], atol=1e-6)
+    np.testing.assert_allclose(grid[1].numpy(), [1.0, 1.0], atol=1e-6)
 
 
 def test_aabb_iou_and_source_loss_for_identical_boxes() -> None:

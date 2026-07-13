@@ -8,12 +8,13 @@ instructions.
 from __future__ import annotations
 
 from contextlib import nullcontext
+import math
 from typing import Any
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer
+from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModel
 
 
 def aabb_iou_3d(box_a: torch.Tensor, box_b: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -65,20 +66,20 @@ class SparseBackboneSpconv(nn.Module):
         return self.net(x).features
 
 
-class TransformerTextEncoder(nn.Module):
-    """Frozen HuggingFace text encoder with projection to model hidden size."""
+class CLIPTextEncoder(nn.Module):
+    """CLIP text encoder with projection to the model hidden size."""
 
     def __init__(
         self,
-        model_name: str,
+        model_name_or_path: str,
         hidden_dim: int,
         freeze: bool = True,
-        max_length: int = 48,
+        max_length: int = 77,
         local_files_only: bool = True,
     ) -> None:
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=local_files_only)
-        self.encoder = AutoModel.from_pretrained(model_name, local_files_only=local_files_only)
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_name_or_path, local_files_only=local_files_only)
+        self.encoder = CLIPTextModel.from_pretrained(model_name_or_path, local_files_only=local_files_only)
         self.freeze = bool(freeze)
         self.max_length = int(max_length)
         encoder_dim = int(self.encoder.config.hidden_size)
@@ -102,10 +103,126 @@ class TransformerTextEncoder(nn.Module):
         with context:
             encoded = self.encoder(**tokens)
         token_features = self.proj(encoded.last_hidden_state)
-        attention_mask = tokens["attention_mask"].to(dtype=token_features.dtype)
-        denom = attention_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        text_global = (token_features * attention_mask.unsqueeze(-1)).sum(dim=1) / denom
+        text_global = self.proj(encoded.pooler_output)
         return token_features, text_global, tokens["attention_mask"].bool()
+
+
+def project_world_to_image_grid(
+    world_coords: torch.Tensor,
+    batch_indices: torch.Tensor,
+    camera_k: torch.Tensor,
+    camera_e_w2c: torch.Tensor,
+    image_hw: torch.Tensor,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project world-space voxel centers to normalized image sampling grids."""
+    ones = torch.ones((world_coords.shape[0], 1), dtype=world_coords.dtype, device=world_coords.device)
+    points_h = torch.cat([world_coords, ones], dim=-1)
+    e_w2c = camera_e_w2c[batch_indices]
+    points_cam = torch.bmm(e_w2c, points_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+
+    z = points_cam[:, 2]
+    z_safe = z.clamp_min(float(eps))
+    k = camera_k[batch_indices]
+    u = k[:, 0, 0] * points_cam[:, 0] / z_safe + k[:, 0, 2]
+    v = k[:, 1, 1] * points_cam[:, 1] / z_safe + k[:, 1, 2]
+
+    hw = image_hw[batch_indices].to(dtype=world_coords.dtype)
+    height = hw[:, 0].clamp_min(1.0)
+    width = hw[:, 1].clamp_min(1.0)
+    x_norm = (u / (width - 1.0).clamp_min(1.0)) * 2.0 - 1.0
+    y_norm = (v / (height - 1.0).clamp_min(1.0)) * 2.0 - 1.0
+    valid = (z > float(eps)) & (u >= 0.0) & (u <= width - 1.0) & (v >= 0.0) & (v <= height - 1.0)
+    return torch.stack([x_norm, y_norm], dim=-1), valid
+
+
+class ProjectedCLIPVoxelFeatureEncoder(nn.Module):
+    """Splat CLIP ViT patch features onto active 3D voxels via camera projection."""
+
+    def __init__(
+        self,
+        model_name_or_path: str,
+        voxel_feature_dim: int,
+        freeze: bool = True,
+        local_files_only: bool = True,
+    ) -> None:
+        super().__init__()
+        self.image_processor = CLIPImageProcessor.from_pretrained(
+            model_name_or_path,
+            local_files_only=local_files_only,
+        )
+        self.vision_model = CLIPVisionModel.from_pretrained(
+            model_name_or_path,
+            local_files_only=local_files_only,
+        )
+        self.freeze = bool(freeze)
+        vision_dim = int(self.vision_model.config.hidden_size)
+        self.proj = nn.Linear(vision_dim, int(voxel_feature_dim))
+
+        if self.freeze:
+            self.vision_model.eval()
+            for param in self.vision_model.parameters():
+                param.requires_grad_(False)
+
+    def forward(
+        self,
+        images: list[Any],
+        world_coords: torch.Tensor,
+        batch_indices: torch.Tensor,
+        camera_k: torch.Tensor,
+        camera_e_w2c: torch.Tensor,
+        image_hw: torch.Tensor,
+    ) -> torch.Tensor:
+        device = world_coords.device
+        dtype = world_coords.dtype
+        size = int(self.vision_model.config.image_size)
+        inputs = self.image_processor(
+            images=images,
+            return_tensors="pt",
+            do_resize=True,
+            size={"height": size, "width": size},
+            do_center_crop=False,
+        )
+        pixel_values = inputs["pixel_values"].to(device=device)
+
+        context = torch.no_grad() if self.freeze else nullcontext()
+        with context:
+            encoded = self.vision_model(pixel_values=pixel_values)
+        patch_tokens = encoded.last_hidden_state[:, 1:, :]
+        grid_side = int(math.sqrt(patch_tokens.shape[1]))
+        if grid_side * grid_side != patch_tokens.shape[1]:
+            raise ValueError(f"CLIP vision patch token count is not square: {patch_tokens.shape[1]}")
+        feature_map = patch_tokens.transpose(1, 2).reshape(
+            patch_tokens.shape[0],
+            patch_tokens.shape[-1],
+            grid_side,
+            grid_side,
+        )
+
+        image_grid, valid = project_world_to_image_grid(
+            world_coords=world_coords,
+            batch_indices=batch_indices,
+            camera_k=camera_k,
+            camera_e_w2c=camera_e_w2c,
+            image_hw=image_hw,
+        )
+        sampled = feature_map.new_zeros((world_coords.shape[0], feature_map.shape[1]))
+        for batch_idx in range(feature_map.shape[0]):
+            voxel_idx = torch.nonzero(batch_indices == batch_idx, as_tuple=False).flatten()
+            if len(voxel_idx) == 0:
+                continue
+            grid = image_grid[voxel_idx].view(1, len(voxel_idx), 1, 2)
+            values = F.grid_sample(
+                feature_map[batch_idx : batch_idx + 1],
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+            sampled[voxel_idx] = values.squeeze(0).squeeze(-1).transpose(0, 1)
+
+        sampled = sampled * valid.to(dtype=sampled.dtype).unsqueeze(-1)
+        return self.proj(sampled).to(dtype=dtype)
 
 
 class VoxelLanguageFusion(nn.Module):
@@ -211,17 +328,32 @@ class LCBGPlaceNetStage1(nn.Module):
         backbone_cfg = cfg["backbone"]
         if str(backbone_cfg.get("type", "spconv")).lower() != "spconv":
             raise ValueError("Only spconv backbone is implemented for Stage 1.")
+        clip_cfg = cfg.get("clip", {})
+        clip_model = str(clip_cfg.get("model_name_or_path", clip_cfg.get("model_name", "openai/clip-vit-base-patch16")))
+        clip_local_only = bool(clip_cfg.get("local_files_only", True))
+        clip_freeze = bool(clip_cfg.get("freeze", True))
+        voxel_clip_dim = int(clip_cfg.get("voxel_feature_dim", 0))
+        self.voxel_image_encoder = (
+            ProjectedCLIPVoxelFeatureEncoder(
+                model_name_or_path=clip_model,
+                voxel_feature_dim=voxel_clip_dim,
+                freeze=clip_freeze,
+                local_files_only=clip_local_only,
+            )
+            if voxel_clip_dim > 0
+            else None
+        )
         self.backbone = SparseBackboneSpconv(
             in_channels=int(backbone_cfg.get("in_channels", 6)),
             hidden_dim=hidden_dim,
             num_blocks=int(backbone_cfg.get("num_blocks", 3)),
         )
-        self.text_encoder = TransformerTextEncoder(
-            model_name=str(cfg["text"]["model_name"]),
+        self.text_encoder = CLIPTextEncoder(
+            model_name_or_path=clip_model,
             hidden_dim=hidden_dim,
-            freeze=bool(cfg["text"].get("freeze", True)),
-            max_length=int(cfg["text"].get("max_length", 48)),
-            local_files_only=bool(cfg["text"].get("local_files_only", True)),
+            freeze=clip_freeze,
+            max_length=int(clip_cfg.get("max_length", 77)),
+            local_files_only=clip_local_only,
         )
         self.fusion = VoxelLanguageFusion(
             hidden_dim=hidden_dim,
@@ -242,10 +374,11 @@ class LCBGPlaceNetStage1(nn.Module):
 
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         batch_size = int(batch["batch_size"])
-        f_3d = self.backbone(batch)
+        backbone_batch = self._prepare_backbone_batch(batch)
+        f_3d = self.backbone(backbone_batch)
         text_tokens, text_global, text_attention_mask = self.text_encoder(
             batch["instructions"],
-            device=batch["features"].device,
+            device=backbone_batch["features"].device,
         )
         f_vl = self.fusion(
             voxel_features=f_3d,
@@ -272,6 +405,21 @@ class LCBGPlaceNetStage1(nn.Module):
             "source_box": source_out["source_box"],
             "source_feature": source_out["source_feature"],
         }
+
+    def _prepare_backbone_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        if self.voxel_image_encoder is None:
+            return batch
+        image_features = self.voxel_image_encoder(
+            images=batch["images"],
+            world_coords=batch["world_coords"],
+            batch_indices=batch["batch_indices"],
+            camera_k=batch["camera_K"],
+            camera_e_w2c=batch["camera_E_w2c"],
+            image_hw=batch["image_hw"],
+        )
+        out = dict(batch)
+        out["features"] = torch.cat([batch["features"], image_features], dim=-1)
+        return out
 
     def _pack_voxels(
         self,

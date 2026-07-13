@@ -45,18 +45,20 @@ model:
   backbone:
     # 稀疏 3D backbone 类型；当前训练流程使用 spconv。
     type: spconv
-    # 每个 voxel 的输入通道数：XYZ 坐标加 RGB 颜色。
-    in_channels: 6
+    # 每个 voxel 的输入通道数：XYZ 坐标、RGB 颜色和 2D->3D CLIP splat 特征。
+    in_channels: 70
     # 点云 backbone 中稀疏卷积块的数量。
     num_blocks: 3
-  text:
-    # 用于语言条件建模的 HuggingFace 文本编码器。
-    model_name: roberta-base
-    # Stage 1 训练时冻结文本编码器权重。
+  clip:
+    # 本地 HuggingFace CLIP 模型名或 snapshot 路径；patch16 在 224 输入下提供 14x14 个 patch token。
+    model_name_or_path: /data/limengfei/xingqunqi/models/clip-vit-base-patch16
+    # Stage 1 训练时冻结 CLIP 文本和图像编码器主干。
     freeze: true
-    # 指令或语言文本的最大 token 长度。
-    max_length: 256
-    # 只从本地缓存加载文本模型，避免训练时访问网络。
+    # CLIP 文本编码器最大 token 长度。
+    max_length: 77
+    # 每个 voxel 追加的 2D->3D CLIP splat 特征维度。
+    voxel_feature_dim: 64
+    # 只从本地缓存加载 CLIP，避免训练时访问网络。
     local_files_only: true
   fusion:
     # 点云-文本融合模块的注意力头数量。
@@ -84,7 +86,7 @@ loss:
 
 training:
   # 保存 metrics.jsonl、last.pt 和 best.pt 的输出目录。
-  output_dir: outputs/lc_bgplacenet_stage1
+  output_dir: outputs/lc_bgplacenet_stage1_clip16
   # auto 表示优先使用 CUDA，CUDA 不可用时使用 CPU。
   device: auto
   # 用于训练复现的随机种子。
@@ -92,7 +94,7 @@ training:
   # 对训练集完整遍历的轮数。
   epochs: 50
   # 每次优化器更新使用的样本数。
-  batch_size: 10
+  batch_size: 15
   # DataLoader worker 进程数量。
   num_workers: 8
   # 将 host memory pin 住以加速 CUDA 数据传输。

@@ -8,6 +8,7 @@ import math
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from src.annotation.free_bbox.io_utils import save_ply
 from src.models.lc_bgplacenet.stage2 import SourceConditionedDensePlacementField, decode_place_box
@@ -55,11 +56,15 @@ def _make_tiny_stage2_source(tmp_path) -> Stage1DataSource:
     )
     voxel_path = dataset_dir / "point_clouds_voxel_1cm" / f"{sample_id}.ply"
     save_ply(voxel_path, points, colors)
+    rgb_path = dataset_dir / "rgb" / f"{sample_id}.png"
+    rgb_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.full((8, 8, 3), 128, dtype=np.uint8)).save(rgb_path)
     _write_json(
         dataset_dir / "samples" / f"{sample_id}.json",
         {
             "schema_version": "canonical_placement_scene/v1",
             "sample_id": sample_id,
+            "rgb_path": f"rgb/{sample_id}.png",
             "voxel_point_cloud_path": f"point_clouds_voxel_1cm/{sample_id}.ply",
             "camera": {
                 "fx": 1.0,
@@ -206,6 +211,10 @@ def test_stage2_collate_and_heatmap_target_are_support_limited(tmp_path) -> None
     )
 
     assert batch["support_masks"].tolist() == [False, True, False]
+    assert len(batch["images"]) == 1
+    assert batch["camera_K"].shape == (1, 3, 3)
+    assert batch["camera_E_w2c"].shape == (1, 4, 4)
+    assert batch["image_hw"].tolist() == [[8.0, 8.0]]
     assert float(heatmap[1]) > 0.99
     assert float(heatmap[0]) == 0.0
     assert float(heatmap[2]) == 0.0

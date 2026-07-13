@@ -37,12 +37,13 @@ model:
   hidden_dim: 256
   backbone:
     type: spconv
-    in_channels: 6
+    in_channels: 70
     num_blocks: 3
-  text:
-    model_name: roberta-base
+  clip:
+    model_name_or_path: /data/limengfei/xingqunqi/models/clip-vit-base-patch16
     freeze: true
-    max_length: 256
+    max_length: 77
+    voxel_feature_dim: 64
     local_files_only: true
   fusion:
     num_heads: 8
@@ -83,9 +84,9 @@ validation:
   size_iou_threshold: 0.8
 
 training:
-  output_dir: outputs/lc_bgplacenet_stage2
+  output_dir: outputs/lc_bgplacenet_stage2_clip16
   # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
-  stage1_pretrained_checkpoint:
+  stage1_pretrained_checkpoint: /data/limengfei/xingqunqi/3D_box-/outputs/lc_bgplacenet_stage1_clip16/best.pt
   device: auto
   seed: 20260624
   epochs: 45

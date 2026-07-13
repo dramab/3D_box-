@@ -9,6 +9,9 @@ Dense Placement Fusion 会先融合 voxel-language feature、坐标编码和 sou
 训练样本来自 `configs/lc_bgplacenet_stage2.yaml` 中的数据源：
 
 - `point_clouds_voxel_1cm/*.ply`：active voxel 点云，字段为 `(x, y, z, r, g, b)`。
+- canonical `samples/*.json` 中的 `rgb_path` 与 `camera`：用于复用 Stage 1 输入端的
+  CLIP ViT-B/16 2D->3D splat 特征；224 输入下对应 14x14=196 个 patch token，
+  Stage 2 不再新增单独的图像融合分支。
 - `outputs/auto_labels_*/all_labels.json`：语言指令、`sample_id`、`object_id` 和 `cluster_id`。
 - `outputs/free_bbox_*/placements/*.json`：source box、place box、raw heatmap 和 support mask 路径。
 - `outputs/free_bbox_*/direction_filtered_heatmaps/*.ply`：只用于训练的方向过滤 heatmap。
@@ -21,6 +24,10 @@ Dense Placement Fusion 会先融合 voxel-language feature、坐标编码和 sou
 配置文件不默认绑定 Stage 1 checkpoint，需要通过命令行显式传入：
 
 `model.placement.neck_num_blocks` 控制 Dense Placement Fusion 后的 spconv sparse neck 深度，默认使用 2 个同分辨率 residual SubMConv block，保持 active voxel 顺序与数量不变。
+
+Stage 2 的 `model.backbone.in_channels` 需要与 Stage 1 一致；当前为 `70`，
+即原始 6 维点特征加 64 维 CLIP splat 特征。旧 Stage 1 checkpoint 中形状不匹配的
+文本编码器参数或 6 通道 backbone 第一层参数会在初始化时跳过。
 
 ```bash
 python tools/train_lc_bgplacenet_stage2.py \
@@ -67,7 +74,7 @@ python tools/train_lc_bgplacenet_stage2.py \
 
 ## 推理
 
-推理阶段只需要点云和语言指令，不读取 direction-filtered heatmap 或 support mask：
+推理阶段需要点云、RGB、camera 和语言指令，不读取 direction-filtered heatmap 或 support mask：
 
 ```bash
 python tools/infer_lc_bgplacenet_stage2.py \

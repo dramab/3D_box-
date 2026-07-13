@@ -37,12 +37,13 @@ model:
   hidden_dim: 256
   backbone:
     type: spconv
-    in_channels: 6
+    in_channels: 70
     num_blocks: 3
-  text:
-    model_name: roberta-base
+  clip:
+    model_name_or_path: /data/limengfei/xingqunqi/models/clip-vit-base-patch16
     freeze: true
-    max_length: 256
+    max_length: 77
+    voxel_feature_dim: 64
     local_files_only: true
   fusion:
     num_heads: 8

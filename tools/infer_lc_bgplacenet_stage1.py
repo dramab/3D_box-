@@ -3,11 +3,11 @@
 Run LC-BGPlaceNet Stage 1 inference and export RGB visualizations.
 
 使用示例:
-    conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
+    python tools/infer_lc_bgplacenet_stage1.py \
         --config configs/lc_bgplacenet_stage1.yaml \
         --checkpoint outputs/lc_bgplacenet_stage1/best.pt
 
-    conda run -n spatial python tools/infer_lc_bgplacenet_stage1.py \
+    python tools/infer_lc_bgplacenet_stage1.py \
         --config configs/lc_bgplacenet_stage1.yaml \
         --checkpoint outputs/lc_bgplacenet_stage1/best.pt \
         --split all --max-samples 20

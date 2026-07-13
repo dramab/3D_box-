@@ -108,10 +108,14 @@ class Stage2InferenceDataset(Dataset):
         points, colors = load_ply(item.voxel_point_cloud_path)
         if len(points) == 0:
             raise ValueError(f"Invalid empty point data for {item.sample_id}")
+        image = np.asarray(Image.open(item.rgb_path).convert("RGB"), dtype=np.uint8)
         return {
             "item": item,
             "points": points.astype(np.float32),
             "colors": colors.astype(np.uint8),
+            "image": image,
+            "camera_K": item.camera_K,
+            "camera_E_w2c": item.camera_E_w2c,
             "instruction": item.instruction,
             "source_box_gt": item.source_box_gt,
             "place_box_gt": item.place_box_gt,
@@ -152,6 +156,10 @@ def inference_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -
     source_boxes = []
     place_boxes = []
     items = []
+    images = []
+    camera_k = []
+    camera_e_w2c = []
+    image_hw = []
     spatial_max = np.zeros(3, dtype=np.int64)
 
     for batch_idx, row in enumerate(batch):
@@ -177,6 +185,11 @@ def inference_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -
         source_boxes.append(np.asarray(row["source_box_gt"], dtype=np.float32))
         place_boxes.append(np.asarray(row["place_box_gt"], dtype=np.float32))
         items.append(row["item"])
+        image = np.asarray(row["image"], dtype=np.uint8)
+        images.append(image)
+        camera_k.append(np.asarray(row["camera_K"], dtype=np.float32))
+        camera_e_w2c.append(np.asarray(row["camera_E_w2c"], dtype=np.float32))
+        image_hw.append(np.asarray(image.shape[:2], dtype=np.float32))
 
     return {
         "features": torch.from_numpy(np.concatenate(features, axis=0)),
@@ -191,6 +204,10 @@ def inference_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -
         "place_box_gt": torch.from_numpy(np.stack(place_boxes, axis=0)),
         "instructions": instructions,
         "items": items,
+        "images": images,
+        "camera_K": torch.from_numpy(np.stack(camera_k, axis=0)),
+        "camera_E_w2c": torch.from_numpy(np.stack(camera_e_w2c, axis=0)),
+        "image_hw": torch.from_numpy(np.stack(image_hw, axis=0)),
         "batch_size": len(batch),
     }
 
