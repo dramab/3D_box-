@@ -78,6 +78,10 @@ loss:
     lambda_size: 1.5
     lambda_iou: 0.2
 
+validation:
+  # task_success = direction_hit AND collision_free AND size_iou >= threshold；yaw 仅单独统计。
+  size_iou_threshold: 0.8
+
 training:
   output_dir: outputs/lc_bgplacenet_stage2
   # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。

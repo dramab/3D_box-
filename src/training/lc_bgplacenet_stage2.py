@@ -25,8 +25,10 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
+from src.annotation.auto_label import describe_spatial_relation
+from src.annotation.free_bbox.geometry import get_bbox_corners, transform_points
 from src.annotation.free_bbox.io_utils import load_ply
-from src.models.lc_bgplacenet.stage1 import aabb_iou_3d
+from src.datasets.canonical import CameraParams, load_sample_record
 from src.models.lc_bgplacenet.stage2 import LCBGPlaceNetDensePlacement
 from src.training.lc_bgplacenet_stage1 import (
     STAGE1_SPLIT_SCHEMA_VERSION,
@@ -36,9 +38,7 @@ from src.training.lc_bgplacenet_stage1 import (
     _find_object_record,
     _init_distributed,
     _is_main_process,
-    _mean_dict,
     _progress,
-    _reduce_mean_dict,
     _resolve_device,
     _resolve_voxel_path,
     _source_box_from_obb,
@@ -49,6 +49,20 @@ from src.training.lc_bgplacenet_stage1 import (
     set_seed,
     source_box_loss,
 )
+
+
+BOX_COLLISION_EPS_CM = 1e-6
+
+
+@dataclass(frozen=True)
+class Stage2ValidationContext:
+    """Cached scene geometry for task-aligned validation metrics."""
+
+    target_relation: str
+    reference_corners_world: np.ndarray
+    camera_K: np.ndarray
+    camera_E_w2c: np.ndarray
+    collision_context: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -69,6 +83,8 @@ class Stage2IndexItem:
     direction_filtered_heatmap_ply: Path
     source_box_gt: np.ndarray
     place_box_gt: np.ndarray
+    target_relation: str
+    reference_object_id: str
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -117,6 +133,11 @@ def build_stage2_index(sources: list[Stage1DataSource]) -> list[Stage2IndexItem]
             support_mask_path = _resolve_free_bbox_path(source.free_bbox_dir, support_mask)
             if not direction_heatmap.exists() or not support_mask_path.exists():
                 continue
+            placement_relation = record.get("spatial_relation", {}).get("placement", {})
+            target_relation = placement_relation.get("relation")
+            reference_object_id = placement_relation.get("reference_object_id")
+            if not target_relation or reference_object_id is None:
+                raise ValueError(f"Missing placement direction metadata for {source.name}/{sample_id}/{object_id}")
 
             items.append(
                 Stage2IndexItem(
@@ -137,6 +158,8 @@ def build_stage2_index(sources: list[Stage1DataSource]) -> list[Stage2IndexItem]
                         obj_record["original_pose_world"],
                     ),
                     place_box_gt=_place_box_from_placement(placement),
+                    target_relation=str(target_relation),
+                    reference_object_id=str(reference_object_id),
                 )
             )
     return items
@@ -173,6 +196,186 @@ def _place_box_from_placement(placement: dict[str, Any]) -> np.ndarray:
     dims = np.asarray(placement["yaw_only_dimensions"], dtype=np.float32)
     yaw = np.deg2rad(float(placement["yaw_degrees"]))
     return np.concatenate([center, dims, np.asarray([yaw], dtype=np.float32)]).astype(np.float32)
+
+
+def compute_size_iou(pred_dims: np.ndarray, gt_dims: np.ndarray) -> float:
+    """Compute dimension-only volume IoU while preserving dimension order."""
+    pred = np.maximum(np.asarray(pred_dims, dtype=np.float64), 0.0)
+    gt = np.maximum(np.asarray(gt_dims, dtype=np.float64), 0.0)
+    intersection = float(np.prod(np.minimum(pred, gt)))
+    union = float(np.prod(np.maximum(pred, gt)))
+    return intersection / union if union > 0.0 else 0.0
+
+
+def compute_size_metrics(
+    place_box: np.ndarray,
+    place_box_gt: np.ndarray,
+    threshold: float,
+) -> dict[str, Any]:
+    """Compute dimension IoU and its thresholded correctness flag."""
+    size_iou = compute_size_iou(place_box[3:6], place_box_gt[3:6])
+    return {"size_iou": size_iou, "size_correct": bool(size_iou >= float(threshold))}
+
+
+def compute_yaw_metrics(
+    place_box: np.ndarray,
+    place_box_gt: np.ndarray,
+    yaw_sensitive_ratio: float,
+) -> dict[str, Any]:
+    """Compute 180-degree-equivalent yaw error for direction-sensitive boxes."""
+    gt_dx, gt_dy = float(place_box_gt[3]), float(place_box_gt[4])
+    size_ratio = abs(gt_dx - gt_dy) / max(min(gt_dx, gt_dy), 1e-6)
+    yaw_sensitive = size_ratio >= float(yaw_sensitive_ratio)
+    if not yaw_sensitive:
+        return {"yaw_sensitive": False, "yaw_error_deg": None}
+    yaw_delta = (float(place_box[6] - place_box_gt[6]) + math.pi * 0.5) % math.pi - math.pi * 0.5
+    return {"yaw_sensitive": True, "yaw_error_deg": abs(math.degrees(yaw_delta))}
+
+
+def compute_task_success(direction_hit: bool, collision: bool, size_correct: bool) -> bool:
+    """Return the shared val/benchmark task-success decision."""
+    return bool(direction_hit and not collision and size_correct)
+
+
+def _place_box_to_bbox_and_transform(place_box: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Convert (x, y, z, dx, dy, dz, yaw) to a local AABB and world transform."""
+    box = np.asarray(place_box, dtype=np.float64)
+    dims = np.maximum(box[3:6], 1e-4)
+    yaw = float(box[6])
+    c, s = math.cos(yaw), math.sin(yaw)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    transform[:3, 3] = box[:3]
+    return np.concatenate([-dims * 0.5, dims * 0.5]), transform
+
+
+def place_box_to_corners(place_box: np.ndarray) -> np.ndarray:
+    """Convert a yaw-only place box to its eight world-space corners."""
+    bbox, transform = _place_box_to_bbox_and_transform(place_box)
+    return transform_points(get_bbox_corners(bbox), transform)
+
+
+def _obb_from_bbox_transform(object_id: str, bbox3d: np.ndarray, transform: np.ndarray) -> dict[str, Any]:
+    """Convert a local AABB and object-to-world transform to an OBB."""
+    bbox = np.asarray(bbox3d, dtype=np.float64)
+    pose = np.asarray(transform, dtype=np.float64)
+    local_center = (bbox[:3] + bbox[3:]) * 0.5
+    axes = pose[:3, :3]
+    axis_scales = np.linalg.norm(axes, axis=0)
+    if np.any(axis_scales < 1e-12):
+        raise ValueError(f"Object {object_id} has a degenerate OBB transform")
+    return {
+        "object_id": object_id,
+        "center": (axes @ local_center + pose[:3, 3]).astype(np.float64),
+        "axes": (axes / axis_scales[None, :]).astype(np.float64),
+        "half_extents": (np.maximum((bbox[3:] - bbox[:3]) * 0.5, 1e-4) * axis_scales).astype(np.float64),
+    }
+
+
+def _obb_intersects(a: dict[str, Any], b: dict[str, Any], eps: float = BOX_COLLISION_EPS_CM) -> bool:
+    """Return True only when two OBBs have positive-volume overlap."""
+    a_axes = np.asarray(a["axes"], dtype=np.float64)
+    b_axes = np.asarray(b["axes"], dtype=np.float64)
+    cross_axes = np.cross(a_axes.T[:, None, :], b_axes.T[None, :, :]).reshape(-1, 3)
+    candidate_axes = np.vstack([a_axes.T, b_axes.T, cross_axes])
+    axis_norms = np.linalg.norm(candidate_axes, axis=1)
+    candidate_axes = candidate_axes[axis_norms > 1e-8]
+    candidate_axes /= np.linalg.norm(candidate_axes, axis=1, keepdims=True)
+    center_delta = np.asarray(b["center"], dtype=np.float64) - np.asarray(a["center"], dtype=np.float64)
+    center_distances = np.abs(candidate_axes @ center_delta)
+    radius_a = np.abs(candidate_axes @ a_axes) @ np.asarray(a["half_extents"], dtype=np.float64)
+    radius_b = np.abs(candidate_axes @ b_axes) @ np.asarray(b["half_extents"], dtype=np.float64)
+    return bool(np.all(center_distances < radius_a + radius_b - float(eps)))
+
+
+def build_collision_context(scene_objects: list[dict[str, Any]]) -> dict[str, Any]:
+    """Precompute scene OBBs reused by validation collision checks."""
+    return {
+        "object_obbs": [
+            _obb_from_bbox_transform(
+                str(obj.get("object_id", index)),
+                np.asarray(obj["canonical_aabb_object"], dtype=np.float64),
+                np.asarray(obj["original_pose_world"], dtype=np.float64),
+            )
+            for index, obj in enumerate(scene_objects)
+        ]
+    }
+
+
+def compute_collision_metrics(place_box: np.ndarray, context: dict[str, Any]) -> dict[str, Any]:
+    """Check whether a predicted place box intersects any cached scene OBB."""
+    bbox, transform = _place_box_to_bbox_and_transform(place_box)
+    pred_obb = _obb_from_bbox_transform("prediction", bbox, transform)
+    colliding_ids = [
+        str(obj["object_id"])
+        for obj in context["object_obbs"]
+        if _obb_intersects(pred_obb, obj)
+    ]
+    return {
+        "collision": bool(colliding_ids),
+        "collision_object_count": len(colliding_ids),
+        "collision_object_ids": colliding_ids,
+    }
+
+
+def compute_direction_hit(place_box: np.ndarray, context: Stage2ValidationContext) -> bool:
+    """Check one predicted box against its language target relation."""
+    predicted_relation = describe_spatial_relation(
+        place_box_to_corners(place_box),
+        context.reference_corners_world,
+        context.camera_E_w2c,
+        context.camera_K,
+    )
+    return bool(predicted_relation == context.target_relation)
+
+
+def build_stage2_validation_contexts(items: list[Stage2IndexItem]) -> dict[str, Stage2ValidationContext]:
+    """Load and cache direction/collision geometry only for validation items."""
+    scene_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    contexts = {}
+    for item in items:
+        key = (item.source_name, item.sample_id)
+        if key not in scene_cache:
+            sample = load_sample_record(item.dataset_dir / "samples" / f"{item.sample_id}.json")
+            camera_record = sample["camera"]
+            camera = CameraParams(
+                fx=float(camera_record["fx"]),
+                fy=float(camera_record["fy"]),
+                cx=float(camera_record["cx"]),
+                cy=float(camera_record["cy"]),
+                E_c2w=np.asarray(camera_record["E_c2w"], dtype=np.float64),
+                img_w=int(camera_record["img_w"]),
+                img_h=int(camera_record["img_h"]),
+            )
+            object_corners = {
+                str(obj["obj_id"]): transform_points(
+                    get_bbox_corners(np.asarray(obj["bbox3d_canonical"], dtype=np.float64)),
+                    np.asarray(obj["pose_world"], dtype=np.float64),
+                )
+                for obj in sample["objects"]
+            }
+            placement_path = item.free_bbox_dir / "placements" / f"{item.sample_id}__placements.json"
+            with placement_path.open("r", encoding="utf-8") as f:
+                placement_payload = json.load(f)
+            scene_cache[key] = {
+                "camera_K": camera.K,
+                "camera_E_w2c": camera.E_w2c,
+                "object_corners": object_corners,
+                "collision_context": build_collision_context(placement_payload.get("objects", [])),
+            }
+
+        scene = scene_cache[key]
+        reference_corners = scene["object_corners"].get(item.reference_object_id)
+        if reference_corners is None:
+            raise ValueError(f"Reference object {item.reference_object_id} not found for {item.item_id}")
+        contexts[item.item_id] = Stage2ValidationContext(
+            target_relation=item.target_relation,
+            reference_corners_world=reference_corners,
+            camera_K=scene["camera_K"],
+            camera_E_w2c=scene["camera_E_w2c"],
+            collision_context=scene["collision_context"],
+        )
+    return contexts
 
 
 def _is_heatmap_positive_color(colors: np.ndarray) -> np.ndarray:
@@ -515,21 +718,43 @@ def compute_stage2_loss(
     return terms
 
 
-def compute_stage2_metrics(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> dict[str, float]:
-    """Compute scalar validation metrics for Stage 2."""
-    place_pred = outputs["place_box"].detach()
-    place_gt = batch["place_box_gt"]
-    bottom_gt = place_gt[:, 0:3].clone()
-    bottom_gt[:, 2] = place_gt[:, 2] - place_gt[:, 5] * 0.5
-    center_mae = torch.mean(torch.abs(place_pred[:, 0:3] - place_gt[:, 0:3]))
-    size_mae = torch.mean(torch.abs(place_pred[:, 3:6] - place_gt[:, 3:6]))
-    bottom_mae = torch.mean(torch.abs(outputs["bottom_center"].detach() - bottom_gt))
-    source_iou = aabb_iou_3d(outputs["source_box"].detach(), batch["source_box_gt"]).mean()
+def compute_stage2_task_metric_sums(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, Any],
+    cfg: dict[str, Any],
+) -> dict[str, float]:
+    """Compute additive task metric statistics for one validation batch."""
+    place_pred = outputs["place_box"].detach().cpu().numpy()
+    place_gt = batch["place_box_gt"].detach().cpu().numpy()
+    contexts = batch["validation_contexts"]
+    size_iou_threshold = float(cfg.get("validation", {}).get("size_iou_threshold", 0.8))
+    yaw_sensitive_ratio = float(cfg["loss"].get("yaw_sensitive_ratio", 0.25))
+
+    direction_hits = []
+    collision_free = []
+    size_ious = []
+    task_success = []
+    yaw_errors = []
+    for pred, gt, context in zip(place_pred, place_gt, contexts):
+        size_metrics = compute_size_metrics(pred, gt, size_iou_threshold)
+        direction_hit = compute_direction_hit(pred, context)
+        collision = compute_collision_metrics(pred, context.collision_context)["collision"]
+        yaw_metrics = compute_yaw_metrics(pred, gt, yaw_sensitive_ratio)
+        direction_hits.append(direction_hit)
+        collision_free.append(not collision)
+        size_ious.append(size_metrics["size_iou"])
+        task_success.append(compute_task_success(direction_hit, collision, size_metrics["size_correct"]))
+        if yaw_metrics["yaw_sensitive"]:
+            yaw_errors.append(yaw_metrics["yaw_error_deg"])
+
     return {
-        "place_center_mae_cm": float(center_mae.cpu()),
-        "place_size_mae_cm": float(size_mae.cpu()),
-        "place_bottom_mae_cm": float(bottom_mae.cpu()),
-        "source_iou": float(source_iou.cpu()),
+        "sample_count": float(len(place_pred)),
+        "direction_hit_sum": float(sum(direction_hits)),
+        "collision_free_sum": float(sum(collision_free)),
+        "size_iou_sum": float(sum(size_ious)),
+        "yaw_error_deg_sum": float(sum(yaw_errors)),
+        "yaw_sensitive_count": float(len(yaw_errors)),
+        "task_success_sum": float(sum(task_success)),
     }
 
 
@@ -601,6 +826,7 @@ def train_stage2(
             items=all_items,
             split_dir=split_dir,
         )
+        validation_contexts = build_stage2_validation_contexts(val_set.items)
 
         model = LCBGPlaceNetDensePlacement(cfg["model"]).to(device)
         init_checkpoint = stage1_checkpoint or cfg["training"].get("stage1_pretrained_checkpoint")
@@ -623,7 +849,7 @@ def train_stage2(
         train_loader = _make_loader(train_set, cfg, shuffle=True, sampler=train_sampler)
         val_loader = _make_loader(val_set, cfg, shuffle=False, sampler=val_sampler)
         metrics_path = output_dir / "metrics.jsonl"
-        best_place_center_mae = math.inf
+        best_task_success_rate = -math.inf
         global_step = 0
         start_epoch = 0
         show_progress = _is_main_process(rank) and bool(cfg["training"].get("progress_bar", True))
@@ -635,11 +861,11 @@ def train_stage2(
             optimizer.load_state_dict(checkpoint["optimizer"])
             start_epoch = int(checkpoint["epoch"]) + 1
             global_step = int(checkpoint["step"])
-            best_place_center_mae = float(checkpoint.get("best_place_center_mae", math.inf))
+            best_task_success_rate = float(checkpoint.get("best_task_success_rate", -math.inf))
             if _is_main_process(rank):
                 print(
                     f"Resumed Stage 2 from {resume_path} at epoch={start_epoch}, "
-                    f"step={global_step}, best_place_center_mae={best_place_center_mae:.6f}"
+                    f"step={global_step}, best_task_success_rate={best_task_success_rate:.6f}"
                 )
 
         if _is_main_process(rank):
@@ -676,7 +902,15 @@ def train_stage2(
                 if max_steps is not None and global_step >= int(max_steps):
                     break
 
-            val_metrics = evaluate_stage2(model, val_loader, cfg, device, show_progress=show_progress, distributed=distributed)
+            val_metrics = evaluate_stage2(
+                model,
+                val_loader,
+                cfg,
+                device,
+                validation_contexts,
+                show_progress=show_progress,
+                distributed=distributed,
+            )
             if _is_main_process(rank):
                 val_payload = {"split": "valid", "epoch": epoch, "step": global_step, **val_metrics}
                 _append_jsonl(metrics_path, val_payload)
@@ -687,13 +921,13 @@ def train_stage2(
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
                     "step": global_step,
-                    "best_place_center_mae": best_place_center_mae,
+                    "best_task_success_rate": best_task_success_rate,
                     "config": cfg,
                 }
-                current_mae = val_metrics.get("place_center_mae_cm", math.inf)
-                if current_mae < best_place_center_mae:
-                    best_place_center_mae = current_mae
-                    checkpoint["best_place_center_mae"] = best_place_center_mae
+                current_success_rate = val_metrics.get("task_success_rate", -math.inf)
+                if current_success_rate > best_task_success_rate:
+                    best_task_success_rate = current_success_rate
+                    checkpoint["best_task_success_rate"] = best_task_success_rate
                     torch.save(checkpoint, output_dir / "best.pt")
                 torch.save(checkpoint, output_dir / "last.pt")
 
@@ -712,17 +946,46 @@ def evaluate_stage2(
     loader: DataLoader,
     cfg: dict[str, Any],
     device: torch.device,
+    validation_contexts: dict[str, Stage2ValidationContext],
     show_progress: bool = False,
     distributed: bool = False,
 ) -> dict[str, float]:
     """Evaluate Stage 2 on one dataloader."""
     model.eval()
-    rows = []
+    totals = {
+        "loss_sum": 0.0,
+        "sample_count": 0.0,
+        "direction_hit_sum": 0.0,
+        "collision_free_sum": 0.0,
+        "size_iou_sum": 0.0,
+        "yaw_error_deg_sum": 0.0,
+        "yaw_sensitive_count": 0.0,
+        "task_success_sum": 0.0,
+    }
     val_iter = _progress(loader, show_progress, desc="stage2 valid", total=len(loader))
     for batch in val_iter:
+        batch["validation_contexts"] = [validation_contexts[item_id] for item_id in batch["item_ids"]]
         batch = move_batch_to_device(batch, device)
         outputs = model(batch)
         losses = compute_stage2_loss(outputs, batch, cfg)
-        metrics = compute_stage2_metrics(outputs, batch)
-        rows.append({**{k: float(v.detach().cpu()) for k, v in losses.items()}, **metrics})
-    return _reduce_mean_dict(_mean_dict(rows), device, distributed)
+        metric_sums = compute_stage2_task_metric_sums(outputs, batch, cfg)
+        totals["loss_sum"] += float(losses["loss"].detach().cpu()) * metric_sums["sample_count"]
+        for key, value in metric_sums.items():
+            totals[key] += value
+
+    if distributed:
+        keys = list(totals)
+        values = torch.tensor([totals[key] for key in keys], dtype=torch.float64, device=device)
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        totals = {key: float(value.cpu()) for key, value in zip(keys, values)}
+
+    sample_count = max(totals["sample_count"], 1.0)
+    yaw_count = max(totals["yaw_sensitive_count"], 1.0)
+    return {
+        "loss": totals["loss_sum"] / sample_count,
+        "direction_hit_rate": totals["direction_hit_sum"] / sample_count,
+        "collision_free_rate": totals["collision_free_sum"] / sample_count,
+        "size_iou": totals["size_iou_sum"] / sample_count,
+        "yaw_error_deg": totals["yaw_error_deg_sum"] / yaw_count,
+        "task_success_rate": totals["task_success_sum"] / sample_count,
+    }

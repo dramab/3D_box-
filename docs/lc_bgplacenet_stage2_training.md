@@ -53,6 +53,18 @@ python tools/train_lc_bgplacenet_stage2.py \
   --resume outputs/lc_bgplacenet_stage2/last.pt
 ```
 
+## Validation 指标
+
+每轮 validation 保留总 `loss`，并记录以下任务指标：
+
+- `direction_hit_rate`：预测 place box 是否满足指令目标方位。
+- `collision_free_rate`：预测 OBB 是否与任一场景物体 OBB 发生正体积相交。
+- `size_iou`：预测与 GT 三个尺寸分量的体积 IoU 均值。
+- `yaw_error_deg`：仅在 `loss.yaw_sensitive_ratio` 判定为 yaw-sensitive 的样本上统计，按 180° 等价计算平均角度误差。
+- `task_success_rate`：`direction_hit AND collision_free AND size_iou >= validation.size_iou_threshold`，不包含 yaw 条件。
+
+方向参照物来自 auto-label 的 `spatial_relation.placement`，相机和场景 OBB 只为 valid split 预加载并缓存。`best.pt` 按 `task_success_rate` 最高保存，`validation.size_iou_threshold` 默认是 `0.8`。
+
 ## 推理
 
 推理阶段只需要点云和语言指令，不读取 direction-filtered heatmap 或 support mask：
@@ -83,7 +95,7 @@ python tools/export_lc_bgplacenet_stage2_inference_web.py \
 
 ## Test Benchmark
 
-读取 test split 的 `predictions.json`，评估 size 体积 IoU、auto-label 语义方位命中率和场景物体 3D box 碰撞率。
+读取 test split 的 `predictions.json`，评估 size 体积 IoU、auto-label 语义方位命中率、场景物体 3D box 碰撞率、yaw 误差和联合 task success。
 
 先为固定 split 生成语义方位 metadata。脚本会从 instruction 的 `to ...` 目标短语解析目标关系和参照物名称，再用 GT placement 与 `auto_label.describe_spatial_relation` 规则反解唯一参照物 id：
 
@@ -106,6 +118,14 @@ python tools/benchmark_lc_bgplacenet_stage2.py \
 ```
 
 输出包含 `benchmark_metrics.json` 和 `per_sample_metrics.jsonl`。`direction_hit_rate` 表示预测 place box 相对 metadata 指定参照物的 `describe_spatial_relation` 结果是否等于 instruction 目标关系；碰撞检测会把预测 3D box 与场景中所有已知物体 3D box 做 OBB 相交判断；`--size-iou-threshold` 默认 0.8，可按 benchmark 口径调整。
+
+逐样本结果额外记录 `task_success`、`yaw_sensitive` 和 `yaw_error_deg`；非 yaw-sensitive 样本的 `yaw_error_deg` 为 `null`。overall 和 by-source 汇总包含 `task_success_rate`、`yaw_sensitive_sample_count`，以及 yaw 误差的 mean/median。计算口径与 validation 一致：
+
+```text
+task_success = direction_hit AND collision_free AND size_correct
+```
+
+yaw 不参与 `task_success`，并按 180° 等价计算角度误差。
 
 导出静态 benchmark 可视化网页：
 

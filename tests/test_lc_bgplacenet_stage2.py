@@ -14,9 +14,13 @@ from src.models.lc_bgplacenet.stage2 import SourceConditionedDensePlacementField
 from src.training.lc_bgplacenet_stage1 import Stage1DataSource
 from src.training.lc_bgplacenet_stage2 import (
     LCBGPlaceNetStage2Dataset,
+    Stage2ValidationContext,
+    build_collision_context,
     build_dense_heatmap_targets,
     build_stage2_index,
+    build_stage2_validation_contexts,
     compute_stage2_loss,
+    compute_stage2_task_metric_sums,
     stage2_collate,
 )
 
@@ -57,6 +61,28 @@ def _make_tiny_stage2_source(tmp_path) -> Stage1DataSource:
             "schema_version": "canonical_placement_scene/v1",
             "sample_id": sample_id,
             "voxel_point_cloud_path": f"point_clouds_voxel_1cm/{sample_id}.ply",
+            "camera": {
+                "fx": 1.0,
+                "fy": 1.0,
+                "cx": 0.0,
+                "cy": 0.0,
+                "img_w": 8,
+                "img_h": 8,
+                "E_c2w": np.eye(4).tolist(),
+            },
+            "objects": [
+                {
+                    "obj_id": "obj_0",
+                    "class_name": "toy",
+                    "bbox3d_canonical": [-1.0, -2.0, -3.0, 1.0, 2.0, 3.0],
+                    "pose_world": [
+                        [1.0, 0.0, 0.0, 1.0],
+                        [0.0, 1.0, 0.0, 2.0],
+                        [0.0, 0.0, 1.0, 3.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                }
+            ],
         },
     )
 
@@ -131,6 +157,12 @@ def _make_tiny_stage2_source(tmp_path) -> Stage1DataSource:
                 "cluster_id": 0,
                 "placement_sample_id": placement_sample_id,
                 "label": "Move toy object to the right of the block.",
+                "spatial_relation": {
+                    "placement": {
+                        "relation": "the right of",
+                        "reference_object_id": "obj_0",
+                    }
+                },
                 "visualization_png": vis_rel,
             }
         ],
@@ -155,6 +187,7 @@ def test_stage2_index_reads_placement_and_supervision_paths(tmp_path) -> None:
     assert item.direction_filtered_heatmap_ply.exists()
     np.testing.assert_allclose(item.place_box_gt[:6], [1.0, 0.0, 1.5, 2.0, 4.0, 3.0])
     assert np.isclose(item.place_box_gt[6], math.pi / 2)
+    assert item.item_id in build_stage2_validation_contexts(items)
 
 
 def test_stage2_collate_and_heatmap_target_are_support_limited(tmp_path) -> None:
@@ -296,3 +329,41 @@ def test_stage2_yaw_loss_uses_direction_sensitive_boxes() -> None:
     losses = compute_stage2_loss(outputs, _minimal_loss_batch(place_box), _loss_cfg())
 
     assert float(losses["loss_yaw"]) > 0.0
+
+
+def test_stage2_task_metrics_exclude_yaw_from_success() -> None:
+    """Task success should use direction, collision and size while reporting yaw separately."""
+    context = Stage2ValidationContext(
+        target_relation="the right of",
+        reference_corners_world=np.asarray(
+            [
+                [-1.0, -1.0, -1.0],
+                [-1.0, -1.0, 1.0],
+                [-1.0, 1.0, -1.0],
+                [-1.0, 1.0, 1.0],
+                [1.0, -1.0, -1.0],
+                [1.0, -1.0, 1.0],
+                [1.0, 1.0, -1.0],
+                [1.0, 1.0, 1.0],
+            ],
+            dtype=np.float64,
+        ),
+        camera_K=np.eye(3, dtype=np.float64),
+        camera_E_w2c=np.eye(4, dtype=np.float64),
+        collision_context=build_collision_context([]),
+    )
+    gt = torch.tensor([[4.0, 0.0, 0.0, 4.0, 2.0, 2.0, 0.0]])
+    pred = gt.clone()
+    pred[:, 6] = math.pi / 2
+
+    sums = compute_stage2_task_metric_sums(
+        {"place_box": pred},
+        {"place_box_gt": gt, "validation_contexts": [context]},
+        {"loss": {"yaw_sensitive_ratio": 0.25}, "validation": {"size_iou_threshold": 0.8}},
+    )
+
+    assert sums["direction_hit_sum"] == 1.0
+    assert sums["collision_free_sum"] == 1.0
+    assert sums["size_iou_sum"] == 1.0
+    assert sums["yaw_error_deg_sum"] == pytest.approx(90.0)
+    assert sums["task_success_sum"] == 1.0

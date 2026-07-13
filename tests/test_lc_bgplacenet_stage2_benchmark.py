@@ -11,6 +11,9 @@ from tools.benchmark_lc_bgplacenet_stage2 import (
     compute_direction_metrics,
     parse_target_direction,
     compute_size_metrics,
+    compute_task_success,
+    compute_yaw_metrics,
+    summarize_rows,
 )
 
 
@@ -117,3 +120,53 @@ def test_collision_metric_treats_box_contact_as_non_collision() -> None:
     assert metrics["collision"] is False
     assert metrics["collision_object_count"] == 0
     assert metrics["collision_object_ids"] == []
+
+
+def test_yaw_metric_uses_sensitive_boxes_and_180_degree_equivalence() -> None:
+    """Yaw error should skip near-square boxes and treat 180 degrees as equivalent."""
+    elongated_gt = np.array([0.0, 0.0, 0.0, 4.0, 2.0, 2.0, 0.0], dtype=np.float64)
+    rotated = elongated_gt.copy()
+    rotated[6] = np.pi / 2
+    equivalent = elongated_gt.copy()
+    equivalent[6] = np.pi
+    square_gt = elongated_gt.copy()
+    square_gt[3:5] = 2.0
+
+    assert compute_yaw_metrics(rotated, elongated_gt, 0.25)["yaw_error_deg"] == 90.0
+    assert compute_yaw_metrics(equivalent, elongated_gt, 0.25)["yaw_error_deg"] == 0.0
+    assert compute_yaw_metrics(square_gt, square_gt, 0.25) == {
+        "yaw_sensitive": False,
+        "yaw_error_deg": None,
+    }
+
+
+def test_benchmark_summary_reports_task_success_and_sensitive_yaw() -> None:
+    """Benchmark aggregates task success independently from yaw error."""
+    rows = [
+        {
+            "size_correct": True,
+            "size_iou": 0.9,
+            "direction_hit": True,
+            "collision": False,
+            "collision_object_count": 0,
+            "task_success": compute_task_success(True, False, True),
+            "yaw_sensitive": True,
+            "yaw_error_deg": 20.0,
+        },
+        {
+            "size_correct": True,
+            "size_iou": 0.8,
+            "direction_hit": False,
+            "collision": False,
+            "collision_object_count": 0,
+            "task_success": compute_task_success(False, False, True),
+            "yaw_sensitive": False,
+            "yaw_error_deg": None,
+        },
+    ]
+
+    summary = summarize_rows(rows)
+
+    assert summary["task_success_rate"] == 0.5
+    assert summary["yaw_sensitive_sample_count"] == 1
+    assert summary["yaw_error_deg"] == {"mean": 20.0, "median": 20.0}

@@ -35,16 +35,21 @@ from src.annotation.free_bbox.geometry import get_bbox_corners, transform_points
 from src.datasets.canonical import CameraParams, ObjectInfo, load_sample_record
 from src.training.lc_bgplacenet_stage2 import (
     Stage2IndexItem,
+    build_collision_context,
     build_sources_from_config,
     build_stage2_index,
+    compute_collision_metrics,
+    compute_size_metrics,
+    compute_task_success,
+    compute_yaw_metrics,
     load_config,
     normalize_stage1_split,
+    place_box_to_corners,
     select_stage2_split_items,
 )
 
 
 SIZE_IOU_BINS = (0.0, 0.25, 0.5, 0.75, 0.8, 0.9, 1.0)
-BOX_COLLISION_EPS_CM = 1e-6
 DIRECTION_METADATA_SCHEMA_VERSION = "lc_bgplacenet_stage2_direction_metadata/v1"
 DIRECTION_RELATIONS = (
     "the front right of",
@@ -159,36 +164,6 @@ def parse_target_direction(instruction: str) -> tuple[str, str]:
     raise ValueError(f"Unknown target relation in instruction: {instruction}")
 
 
-def compute_size_iou(pred_dims: np.ndarray, gt_dims: np.ndarray) -> float:
-    """Compute dimension-only volume IoU with w/h/l kept in corresponding order."""
-    pred = np.maximum(np.asarray(pred_dims, dtype=np.float64), 0.0)
-    gt = np.maximum(np.asarray(gt_dims, dtype=np.float64), 0.0)
-    intersection = float(np.prod(np.minimum(pred, gt)))
-    union = float(np.prod(np.maximum(pred, gt)))
-    if union <= 0.0:
-        return 0.0
-    return intersection / union
-
-
-def compute_size_metrics(
-    place_box: np.ndarray,
-    place_box_gt: np.ndarray,
-    threshold: float,
-) -> dict[str, Any]:
-    """Compute size IoU and pass/fail for one prediction."""
-    size_iou = compute_size_iou(place_box[3:6], place_box_gt[3:6])
-    return {
-        "size_iou": float(size_iou),
-        "size_correct": bool(size_iou >= float(threshold)),
-    }
-
-
-def place_box_to_corners(place_box: np.ndarray) -> np.ndarray:
-    """Convert (x, y, z, dx, dy, dz, yaw) to 8 world corners."""
-    bbox, transform = _place_box_to_bbox_and_transform(place_box)
-    return transform_points(get_bbox_corners(bbox), transform)
-
-
 def object_corners_world(obj: ObjectInfo) -> np.ndarray:
     """Return world corners for one canonical scene object."""
     return transform_points(get_bbox_corners(obj.bbox3d_canonical), obj.pose_world)
@@ -253,93 +228,6 @@ def compute_direction_metrics(
     }
 
 
-def _place_box_to_bbox_and_transform(place_box: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Convert (x, y, z, dx, dy, dz, yaw) to a centered local AABB and world transform."""
-    box = np.asarray(place_box, dtype=np.float64)
-    dims = np.maximum(box[3:6], 1e-4)
-    yaw = float(box[6])
-    c, s = math.cos(yaw), math.sin(yaw)
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = np.array(
-        [
-            [c, -s, 0.0],
-            [s, c, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-    transform[:3, 3] = box[:3]
-    bbox = np.concatenate([-dims * 0.5, dims * 0.5])
-    return bbox, transform
-
-
-def build_collision_context(scene_objects: list[dict[str, Any]]) -> dict[str, Any]:
-    """Build reusable scene object OBBs for box-box collision checks."""
-    object_obbs = [
-        _obb_from_bbox_transform(
-            str(obj.get("object_id", index)),
-            np.asarray(obj["canonical_aabb_object"], dtype=np.float64),
-            np.asarray(obj["original_pose_world"], dtype=np.float64),
-        )
-        for index, obj in enumerate(scene_objects)
-    ]
-    return {"object_obbs": object_obbs}
-
-
-def compute_collision_metrics(place_box: np.ndarray, context: dict[str, Any]) -> dict[str, Any]:
-    """Check whether one predicted yaw-only box intersects any scene object OBB."""
-    bbox, transform = _place_box_to_bbox_and_transform(place_box)
-    pred_obb = _obb_from_bbox_transform("prediction", bbox, transform)
-    colliding_ids = [
-        str(obj["object_id"])
-        for obj in context["object_obbs"]
-        if _obb_intersects(pred_obb, obj, eps=BOX_COLLISION_EPS_CM)
-    ]
-    return {
-        "collision": bool(colliding_ids),
-        "collision_object_count": int(len(colliding_ids)),
-        "collision_object_ids": colliding_ids,
-    }
-
-
-def _obb_from_bbox_transform(object_id: str, bbox3d: np.ndarray, transform: np.ndarray) -> dict[str, Any]:
-    """Convert a local AABB and object-to-world transform to an OBB record."""
-    bbox = np.asarray(bbox3d, dtype=np.float64)
-    pose = np.asarray(transform, dtype=np.float64)
-    local_center = (bbox[:3] + bbox[3:]) * 0.5
-    center = pose[:3, :3] @ local_center + pose[:3, 3]
-    half_extents = np.maximum((bbox[3:] - bbox[:3]) * 0.5, 1e-4)
-
-    axes = pose[:3, :3]
-    axis_scales = np.linalg.norm(axes, axis=0)
-    if np.any(axis_scales < 1e-12):
-        raise ValueError(f"Object {object_id} has a degenerate OBB transform")
-    axes = axes / axis_scales[None, :]
-    return {
-        "object_id": object_id,
-        "center": center.astype(np.float64),
-        "axes": axes.astype(np.float64),
-        "half_extents": (half_extents * axis_scales).astype(np.float64),
-    }
-
-
-def _obb_intersects(a: dict[str, Any], b: dict[str, Any], eps: float = BOX_COLLISION_EPS_CM) -> bool:
-    """Return True only when two OBBs have positive volume overlap."""
-    a_axes = np.asarray(a["axes"], dtype=np.float64)
-    b_axes = np.asarray(b["axes"], dtype=np.float64)
-    cross_axes = np.cross(a_axes.T[:, None, :], b_axes.T[None, :, :]).reshape(-1, 3)
-    candidate_axes = np.vstack([a_axes.T, b_axes.T, cross_axes])
-    axis_norms = np.linalg.norm(candidate_axes, axis=1)
-    candidate_axes = candidate_axes[axis_norms > 1e-8]
-    candidate_axes /= np.linalg.norm(candidate_axes, axis=1, keepdims=True)
-
-    center_delta = np.asarray(b["center"], dtype=np.float64) - np.asarray(a["center"], dtype=np.float64)
-    center_distances = np.abs(candidate_axes @ center_delta)
-    radius_a = np.abs(candidate_axes @ a_axes) @ np.asarray(a["half_extents"], dtype=np.float64)
-    radius_b = np.abs(candidate_axes @ b_axes) @ np.asarray(b["half_extents"], dtype=np.float64)
-    return bool(np.all(center_distances < radius_a + radius_b - float(eps)))
-
-
 def _build_item_lookup(cfg: dict[str, Any], split: str) -> dict[str, Stage2IndexItem]:
     """Build Stage 2 metadata for the requested fixed split."""
     sources = build_sources_from_config(cfg)
@@ -385,12 +273,20 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "direction_hit_rate": 0.0,
             "collision_rate": 0.0,
             "collision_object_count_mean": 0.0,
+            "task_success_rate": 0.0,
+            "yaw_sensitive_sample_count": 0,
+            "yaw_error_deg": {"mean": 0.0, "median": 0.0},
         }
 
     size_values = np.asarray([row["size_iou"] for row in rows], dtype=np.float64)
     direction_hits = np.asarray([row["direction_hit"] for row in rows], dtype=bool)
     collisions = np.asarray([row["collision"] for row in rows], dtype=bool)
     collision_counts = np.asarray([row["collision_object_count"] for row in rows], dtype=np.float64)
+    task_success = np.asarray([row["task_success"] for row in rows], dtype=bool)
+    yaw_values = np.asarray(
+        [row["yaw_error_deg"] for row in rows if row["yaw_sensitive"]],
+        dtype=np.float64,
+    )
     return {
         "sample_count": int(len(rows)),
         "size_accuracy": float(np.mean([row["size_correct"] for row in rows])),
@@ -406,6 +302,12 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "direction_hit_rate": float(direction_hits.mean()),
         "collision_rate": float(collisions.mean()),
         "collision_object_count_mean": float(collision_counts.mean()),
+        "task_success_rate": float(task_success.mean()),
+        "yaw_sensitive_sample_count": int(len(yaw_values)),
+        "yaw_error_deg": {
+            "mean": float(yaw_values.mean()) if len(yaw_values) else 0.0,
+            "median": float(np.median(yaw_values)) if len(yaw_values) else 0.0,
+        },
     }
 
 
@@ -447,6 +349,7 @@ def run_benchmark(
         raise ValueError(f"{len(missing_direction_ids)} prediction item_ids are missing direction metadata: {preview}")
 
     voxel_size_cm = float(cfg["data"]["voxel_size_cm"])
+    yaw_sensitive_ratio = float(cfg["loss"].get("yaw_sensitive_ratio", 0.25))
     collision_cache: dict[tuple[str, str], dict[str, Any]] = {}
     direction_scene_cache: dict[tuple[str, str], dict[str, Any]] = {}
     per_sample_rows = []
@@ -460,14 +363,24 @@ def run_benchmark(
         if scene_key not in direction_scene_cache:
             direction_scene_cache[scene_key] = load_direction_scene_context(item)
 
+        size_metrics = compute_size_metrics(place_box, place_box_gt, size_iou_threshold)
+        direction_metrics = compute_direction_metrics(
+            place_box,
+            direction_metadata[str(row["item_id"])],
+            direction_scene_cache[scene_key],
+        )
+        collision_metrics = compute_collision_metrics(place_box, collision_context)
+        yaw_metrics = compute_yaw_metrics(place_box, place_box_gt, yaw_sensitive_ratio)
         metrics = {
-            **compute_size_metrics(place_box, place_box_gt, size_iou_threshold),
-            **compute_direction_metrics(
-                place_box,
-                direction_metadata[str(row["item_id"])],
-                direction_scene_cache[scene_key],
+            **size_metrics,
+            **direction_metrics,
+            **collision_metrics,
+            **yaw_metrics,
+            "task_success": compute_task_success(
+                direction_metrics["direction_hit"],
+                collision_metrics["collision"],
+                size_metrics["size_correct"],
             ),
-            **compute_collision_metrics(place_box, collision_context),
         }
         per_sample_rows.append(
             {
@@ -488,6 +401,7 @@ def run_benchmark(
         "split": normalize_stage1_split(split),
         "parameters": {
             "size_iou_threshold": float(size_iou_threshold),
+            "yaw_sensitive_ratio": yaw_sensitive_ratio,
             "voxel_size_cm": voxel_size_cm,
             "direction_metric": "auto_label_spatial_relation",
         },
@@ -529,6 +443,12 @@ def main() -> None:
     print(f"Size IoU mean/median: {overall['size_iou']['mean']:.4f}/{overall['size_iou']['median']:.4f}")
     print(f"Direction hit rate: {overall['direction_hit_rate']:.4f}")
     print(f"Collision rate: {overall['collision_rate']:.4f}")
+    print(f"Task success rate: {overall['task_success_rate']:.4f}")
+    print(
+        "Yaw error mean/median: "
+        f"{overall['yaw_error_deg']['mean']:.4f}/{overall['yaw_error_deg']['median']:.4f} deg "
+        f"(n={overall['yaw_sensitive_sample_count']})"
+    )
 
 
 if __name__ == "__main__":
