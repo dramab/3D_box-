@@ -31,6 +31,8 @@ boxes/
   hope__scene_0000__0000__obj_0__cluster_000__box.json
 heatmaps/
   hope__scene_0000__0000__obj_0__cluster_000__heatmap.ply
+yaw_sets/
+  hope__scene_0000__0000__obj_0__cluster_000__yaw_set.npz
 visualizations/
   hope__scene_0000__0000__obj_0__cluster_000__vis.png
 ```
@@ -39,7 +41,24 @@ visualizations/
 - `*_placements.json`: 每帧汇总标注。
 - `*__box.json`: 每个簇选出的最优 3D box 单独保存；`placement.corners_world` 为模型监督使用的 yaw-only upright box，`placement.obb6d_corners_world` 为搜索阶段原始 6DoF OBB。
 - `*__heatmap.ply`: 与该最优 3D box 对应的簇级整体体素热力点云，热力值为聚类前候选框底面中心落到每个支撑面体素上的次数；最优框底面中心位于该簇热力峰值。
+- `*__yaw_set.npz`: 与 heatmap 同簇的中心-yaw 监督。每个底面中心只保存一次，`valid_yaw_mask` 标记该中心通过碰撞、稳定性、可见性、遮挡和底面中心过滤的所有 yaw。新增目录不会修改现有 JSON schema 或字段。
 - `*__vis.png`: 每个最终 freebox 一张可视化图片，绿色框与模型监督一致，显示 yaw-only upright box。
+
+`yaw_sets` 文件可按以下方式读取：
+
+```python
+with np.load(yaw_set_path) as target:
+    centers_world = target["bottom_center_world"]  # [P, 3]
+    yaw_mask = target["valid_yaw_mask"]            # [P, yaw_steps]
+    yaw_angles = target["yaw_angles_rad"]           # [yaw_steps]
+    heat_counts = target["heat_counts"]             # [P]
+```
+
+`yaw_angles_rad` 已转换为最终 yaw-only upright Box 的局部 X 轴方向。它不一定等于保留原始 roll/pitch 搜索时使用的原始 yaw。
+
+> **Stage 2 读取注意事项：** `yaw_sets` 保存的是语言方向过滤前、通过 free_bbox 几何过滤的全部可放置中心；`direction_filtered_heatmaps` 中的正样本是这些中心经过语言方向过滤后的子集。因此，构建 Stage 2 监督时必须先用 `(red == 255) & (blue == 30)` 提取方向过滤后仍保留的正点，再按 `bottom_center_world` 与对应 `yaw_set.npz` 对齐，仅读取匹配行的 `valid_yaw_mask`。不能直接把 yaw set 中的全部中心作为当前指令的正样本。
+>
+> PLY 坐标保存到小数点后四位，而 NPZ 保存 `float32` 世界坐标，对齐时应使用不大于 `1e-3 cm` 的容差或等价的定点坐标键。加载代码必须断言：每个方向过滤正点恰好匹配一个 yaw center、该行至少包含一个有效 yaw；yaw set 中存在未被方向过滤保留的额外中心是正常现象。
 
 ## 训练数据读取
 
@@ -90,7 +109,7 @@ axis_mapping = placement["yaw_only_axis_mapping"]  # canonical 轴到 yaw-only X
 ## 运行示例
 
 ```bash
-conda run -n spatial python tools/run_free_bbox_placement.py \
+python tools/run_free_bbox_placement.py \
     --dataset-dir /data/jiajun.xie/3D_Box/data/hope \
     --sample-id hope__scene_0000__0000 \
     --output-dir outputs/free_bbox_hope
@@ -99,10 +118,34 @@ conda run -n spatial python tools/run_free_bbox_placement.py \
 批量运行：
 
 ```bash
-conda run -n spatial python tools/run_free_bbox_placement.py \
+python tools/run_free_bbox_placement.py \
     --dataset-dir /data/jiajun.xie/3D_Box/data/hope \
     --all --max-frames 5 --workers 4 \
     --output-dir outputs/free_bbox_hope
 ```
 
 批量任务默认使用最多 4 个进程并发处理不同帧；可通过 `--workers` 调整并发数，设置为 `1` 时串行运行。每个进程会独立创建 pipeline，避免跨进程共享计算状态。
+
+五个 canonical 数据集可分别运行：
+
+```bash
+python tools/run_free_bbox_placement.py \
+    --dataset-dir data/dopose --all --workers 4 \
+    --output-dir outputs/free_bbox_dopose
+
+python tools/run_free_bbox_placement.py \
+    --dataset-dir data/hope --all --workers 4 \
+    --output-dir outputs/free_bbox_hope
+
+python tools/run_free_bbox_placement.py \
+    --dataset-dir data/housecat --all --workers 4 \
+    --output-dir outputs/free_bbox_housecat
+
+python tools/run_free_bbox_placement.py \
+    --dataset-dir data/omni_filter --all --workers 4 \
+    --output-dir outputs/free_bbox_omni
+
+python tools/run_free_bbox_placement.py \
+    --dataset-dir data/ycbv --all --workers 4 \
+    --output-dir outputs/free_bbox_ycbv
+```

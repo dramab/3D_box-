@@ -6,7 +6,7 @@ src/annotation/free_bbox/pipeline.py
 流程:
     CanonicalScene -> voxel PLY -> OCCUPIED/FREE 栅格 -> 逐物体:
         支撑面检测 -> 支撑面本层 FFT 碰撞搜索 -> 稳定/可见/遮挡过滤 ->
-        底面中心约束 -> DBSCAN 聚类 -> 每簇最优 3D box 和热力 PLY 输出
+        底面中心约束 -> DBSCAN 聚类 -> 每簇最优 3D box、热力 PLY 和有效 yaw 集合输出
 """
 
 from __future__ import annotations
@@ -32,12 +32,13 @@ from src.annotation.free_bbox.grid_ops import prepare_grid_base, voxelize_obb
 from src.annotation.free_bbox.io_utils import (
     load_ply,
     save_binary_mask_ply,
+    save_center_yaw_set_npz,
     save_heatmap_ply,
     save_json,
 )
 from src.annotation.free_bbox.occupancy import FREE, OCCUPIED, build_grid_from_voxel_points
 from src.annotation.free_bbox.surface import detect_support_surfaces
-from src.annotation.free_bbox.voxel_utils import make_voxel_params
+from src.annotation.free_bbox.voxel_utils import make_voxel_params, voxel_to_world
 from src.annotation.free_bbox.visualize import save_freebox_visualization
 
 
@@ -59,6 +60,7 @@ def _build_output_dirs(output_root: Path) -> dict[str, Path]:
         "placements": output_root / "placements",
         "boxes": output_root / "boxes",
         "heatmaps": output_root / "heatmaps",
+        "yaw_sets": output_root / "yaw_sets",
         "support_masks": output_root / "support_masks",
         "visualizations": output_root / "visualizations",
     }
@@ -119,6 +121,51 @@ def _support_mask_3d(surface_mask_2d: np.ndarray, table_z: int, grid_shape: tupl
     if surface_mask_2d is not None and 0 <= int(table_z) < grid_shape[2]:
         mask_3d[:, :, int(table_z)] = np.asarray(surface_mask_2d, dtype=bool)
     return mask_3d
+
+
+def _build_center_yaw_set(
+    obj,
+    record: dict,
+    yaw_data: dict,
+    vp: dict,
+) -> dict[str, np.ndarray]:
+    """将簇内候选聚合为底面中心到 yaw-only 有效角集合。"""
+    members = np.asarray(record["members"], dtype=np.int64)
+    member_centers = np.asarray(record["member_bottom_centers"], dtype=np.int64)
+    if members.ndim != 2 or members.shape[1] != 3 or member_centers.shape != members.shape:
+        raise ValueError("cluster members and member_bottom_centers must align as (N, 3)")
+
+    yaw_steps = len(yaw_data["yaw_angles"])
+    yaw_indices = members[:, 2]
+    if np.any((yaw_indices < 0) | (yaw_indices >= yaw_steps)):
+        raise ValueError("cluster member yaw index is outside yaw_data")
+
+    centers, inverse, heat_counts = np.unique(
+        member_centers,
+        axis=0,
+        return_inverse=True,
+        return_counts=True,
+    )
+    valid_yaw_mask = np.zeros((len(centers), yaw_steps), dtype=bool)
+    valid_yaw_mask[inverse, yaw_indices] = True
+
+    # 搜索 yaw 在保留 roll/pitch 时不一定等于最终 yaw-only Box 的局部 X 轴方向。
+    yaw_angles_rad = []
+    for transform in yaw_data["T_rotated"]:
+        yaw_box = build_yaw_only_upright_box(
+            obj.bbox3d_canonical,
+            np.asarray(transform, dtype=np.float64),
+            np.zeros(3, dtype=np.float64),
+        )
+        yaw_angles_rad.append(np.deg2rad(float(yaw_box["yaw_degrees"])))
+
+    return {
+        "bottom_center_voxels": centers.astype(np.int32),
+        "bottom_center_world": voxel_to_world(centers, vp).astype(np.float32),
+        "valid_yaw_mask": valid_yaw_mask,
+        "yaw_angles_rad": np.asarray(yaw_angles_rad, dtype=np.float32),
+        "heat_counts": heat_counts.astype(np.int32),
+    }
 
 
 def _build_saved_placements(
@@ -400,6 +447,7 @@ class FreeBBoxPipeline:
                     obj,
                     placements,
                     cluster_records,
+                    yaw_data,
                     support_3d,
                     surface_mask,
                     table_z,
@@ -438,6 +486,7 @@ class FreeBBoxPipeline:
         obj,
         placements: list[dict],
         cluster_records: list[dict],
+        yaw_data: dict,
         support_mask_3d: np.ndarray,
         surface_mask_2d: np.ndarray,
         table_z: int,
@@ -446,7 +495,7 @@ class FreeBBoxPipeline:
         vp: dict,
         summary_boxes: list[dict],
     ) -> None:
-        """保存每个最优 3D box 对应的 JSON、热力 PLY 和可视化图片。"""
+        """保存每簇的 Box、热力图、有效 yaw 集合和可视化图片。"""
         output_root = output_paths["root"]
         placements_by_cluster = {int(item["cluster_id"]): item for item in placements}
         for record in cluster_records:
@@ -460,9 +509,11 @@ class FreeBBoxPipeline:
             cluster_part = f"cluster_{cluster_id:03d}"
             stem = f"{scene_prefix}__{obj_part}__{cluster_part}"
             heatmap_name = f"{stem}__heatmap.ply"
+            yaw_set_name = f"{stem}__yaw_set.npz"
             box_name = f"{stem}__box.json"
             vis_name = f"{stem}__vis.png"
             heatmap_path = output_paths["heatmaps"] / heatmap_name
+            yaw_set_path = output_paths["yaw_sets"] / yaw_set_name
             box_path = output_paths["boxes"] / box_name
             vis_path = output_paths["visualizations"] / vis_name
 
@@ -474,6 +525,8 @@ class FreeBBoxPipeline:
                 heat_counts,
                 support_mask_3d=support_mask_3d,
             )
+            yaw_set = _build_center_yaw_set(obj, record, yaw_data, vp)
+            save_center_yaw_set_npz(yaw_set_path, **yaw_set)
             save_freebox_visualization(
                 scene.rgb,
                 obj.class_name,

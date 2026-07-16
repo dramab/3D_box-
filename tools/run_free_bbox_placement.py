@@ -2,15 +2,15 @@
 """
 tools/run_free_bbox_placement.py
 --------------------------------
-在 canonical HOPE 数据集上运行 free_bbox 放置标注。
+在 canonical 数据集上运行 free_bbox 放置标注。
 
 使用示例:
-    conda run -n spatial python tools/run_free_bbox_placement.py \
+    python tools/run_free_bbox_placement.py \
         --dataset-dir /data/jiajun.xie/3D_Box/data/hope \
         --sample-id hope__scene_0000__0000 \
         --output-dir outputs/free_bbox_hope
 
-    conda run -n spatial python tools/run_free_bbox_placement.py \
+    python tools/run_free_bbox_placement.py \
         --dataset-dir /data/jiajun.xie/3D_Box/data/hope \
         --all --max-frames 5 --workers 4 \
         --output-dir outputs/free_bbox_hope
@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path("outputs/free_bbox_hope"),
-        help="输出根目录；不同类型文件会保存到 boxes/、heatmaps/、support_masks/、placements/、visualizations/。",
+        help="输出根目录；额外的中心-yaw 集合保存到 yaw_sets/，现有输出目录保持不变。",
     )
     parser.add_argument("--voxel-size", type=float, default=1.0, help="体素边长，单位 cm。")
     parser.add_argument("--grid-padding", type=float, default=10.0, help="搜索栅格 padding，单位 cm。")

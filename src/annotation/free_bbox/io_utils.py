@@ -82,6 +82,43 @@ def save_json(path: str | Path, payload: dict[str, Any]) -> None:
         json.dump(payload, f, indent=2, default=_json_default)
 
 
+def save_center_yaw_set_npz(
+    path: str | Path,
+    bottom_center_voxels: np.ndarray,
+    bottom_center_world: np.ndarray,
+    valid_yaw_mask: np.ndarray,
+    yaw_angles_rad: np.ndarray,
+    heat_counts: np.ndarray,
+) -> None:
+    """保存每个可放置底面中心对应的有效 yaw 集合。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    centers_voxel = np.asarray(bottom_center_voxels, dtype=np.int32)
+    centers_world = np.asarray(bottom_center_world, dtype=np.float32)
+    yaw_mask = np.asarray(valid_yaw_mask, dtype=bool)
+    yaw_angles = np.asarray(yaw_angles_rad, dtype=np.float32)
+    counts = np.asarray(heat_counts, dtype=np.int32)
+
+    if centers_voxel.ndim != 2 or centers_voxel.shape[1] != 3:
+        raise ValueError("bottom_center_voxels must have shape (P, 3)")
+    if centers_world.shape != centers_voxel.shape:
+        raise ValueError("bottom_center_world must align with bottom_center_voxels")
+    if yaw_angles.ndim != 1 or yaw_mask.shape != (len(centers_voxel), len(yaw_angles)):
+        raise ValueError("valid_yaw_mask must have shape (P, yaw_steps)")
+    if counts.shape != (len(centers_voxel),):
+        raise ValueError("heat_counts must have shape (P,)")
+
+    np.savez_compressed(
+        path,
+        bottom_center_voxels=centers_voxel,
+        bottom_center_world=centers_world,
+        valid_yaw_mask=yaw_mask,
+        yaw_angles_rad=yaw_angles,
+        heat_counts=counts,
+    )
+
+
 def save_binary_mask_ply(
     path: str | Path,
     grid: np.ndarray,
