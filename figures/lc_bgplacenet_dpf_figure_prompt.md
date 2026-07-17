@@ -1,70 +1,41 @@
-# LC-BGPlaceNet-DPF 模型图生成 Prompt
+# SPACE-Former 模型图生成 Prompt
 
 ## 论文类型
 
-A 类 Method Paper。图示结构选择：模型架构图 + 两阶段方法总览图。
+A 类 Method Paper。图示结构选择：两阶段总览 + SPACE-Former 迭代集合预测细节。
 
 ## Prompt
 
-你是一位熟悉计算机科学、人工智能、工程制图规范和顶级学术论文视觉表达的科研绘图专家。请绘制一张 NeurIPS / CVPR / IEEE TPAMI 风格的二维扁平矢量模型架构图，白色背景，低视觉噪声，模块边界清晰，颜色只表达功能分区。
+请绘制一张 NeurIPS / CVPR / IEEE TPAMI 风格的二维扁平矢量架构图。白色背景、低视觉噪声、模块边界清晰，中文标签为主并保留模型名与张量名。
 
-本方法名为 **LC-BGPlaceNet-DPF**，用于语言条件的 3D 物体放置框预测。输入是 active voxel 点云和自然语言指令，输出包括需要移动的源物体框 `source_box=(cx,cy,cz,dx,dy,dz)`，以及最终放置框 `place_box=(x,y,z,dx,dy,dz,yaw)`。
+方法名为 **SPACE-Former (Size-Prompted Affordance and Collision Explorer)**，输入 active voxel 点云、RGB 与自然语言指令，输出 Source Box 以及最多 16 个满足语言与物理约束的放置 3D Box。
 
-请采用“共享体素-语言编码 + Stage 1 source grounding + Stage 2 dense placement field”的结构，而不是简单三栏图。
+图中包含以下主线：
 
-图中必须包含以下模块与数据流：
-
-1. 输入区：
-   - Active voxel 点云，特征为 `XYZ + RGB`
-   - 语言指令 `instruction`
-   - 训练专用监督：`direction-filtered heatmap`、`support mask`、`source_box_gt`、`place_box_gt`
-
-2. 共享编码区：
-   - `Sparse 3D Backbone`，由 `SubMConv3d` 稀疏卷积块提取 `F_3D`
-   - `Text Encoder`，使用冻结的 `RoBERTa`，输出 `text_tokens` 和 `text_global`
-   - `Voxel-Language Fusion`，以 voxel features 为 query，对 language tokens 做 multi-head cross-attention，输出 `F_vl`
-   - `Pack + Position MLP`，将 active voxel 按 batch 打包，并加入 `coords_norm` 位置编码
-
-3. Stage 1：`Single-Query Source Grounding`
-   - learnable `source_query` 与 `text_global` 相加
-   - Transformer decoder 读取 `voxel_tokens + positional embedding`
-   - 输出 `source_box [B,6]` 和 `source_feature [B,C]`
-
-4. Stage 2：`Source-Conditioned Dense Placement Field`
-   - `Source Condition`：将 `source_feature` 和 Stage 1 的 `source_size` 输入 `size_mlp` 与 `condition_mlp`
-   - 对每个 active voxel 拼接 `F_vl`、`coord PE`、`source_condition`
-   - `Dense Placement Fusion MLP` 输出 placement features
-   - 四个预测头：
-     - `heatmap_head` → `placement_heatmap_logits [Nv]`
-     - `offset_head` → `bottom_offset [Nv,3]`
-     - `yaw_head` → `yaw_sincos [Nv,2]`
-     - `size_head` → `size_residual [B,3]`
-
-5. 解码区：
-   - 对每个 batch 在 active voxel 中取 heatmap argmax
-   - `bottom_center = voxel_center + bottom_offset`
-   - `size_pred = source_size * exp(size_residual)`
-   - `yaw = atan2(sin, cos)`
-   - `center.z = bottom_center.z + size_pred.z / 2`
-   - 输出 `place_box [B,7]`
-
-6. 训练/推理区别：
-   - 用虚线标出 `direction-filtered heatmap` 和 `support mask` 只用于训练 loss
-   - 推理阶段只读取点云和语言指令，不读取 heatmap 或 support mask
+1. 共享 Stage 1：`Sparse 3D Backbone + CLIP 2D→3D Feature + Text Encoder + Voxel-Language Fusion`，输出 `F_vl`；`Single-Query Source Grounding` 输出 `source_box [B,6]` 和 `source_feature [B,256]`。
+2. 多尺度稀疏金字塔：`P1/P2/P3 stride=1/2/4`，对应 1/2/4 cm。
+3. `Text-Guided Region Cross Encoder`：`text_global` 为 Q，P3 为 K/V；两层 8-head Cross-Attention 输出 region logits，每个样本取 top-8 P3 cell（约 128 cm²）。
+4. Anchor：top-8 cell 展开到 P1 active voxel，经 FPS 得到最多 32 个 Query；不足部分由 `query_valid_mask` padding。Query 初始化为 `LayerNorm(P1 feature + world-coordinate PE)`。
+5. 四层迭代物理采样：第 0 层为 64 点外接圆柱；第 1～3 层用上一层 yaw 构造 64 点定向 Box Surface。每个点在 P1/P2/P3 做 exact active sparse hash lookup。
+6. Sample Token：`sample_feature(256) + valid(1) + is_bottom(1) + normalized_base_offset(3)`，总计 261 维。强调 inactive 零特征 token 不从 Attention 中删除。
+7. `Geometric Routing`：三个尺度分别做 Query-to-sample Cross-Attention，再做跨尺度 Attention；结合 `source_feature + log(source_size)`，只输出 geometry feature。
+8. `Semantic Routing`：Query 对 CLIP text tokens 做 Cross-Attention，只输出 semantic feature。
+9. `Factorized Fusion`：门控融合 geometry/semantic feature；融合后的 feature 统一送入 center residual、12-bin yaw 和 placement score 三个预测头。
+10. 集合输出：32 个 raw boxes 经 score 排序与 pose NMS，输出最多 16 个 Box；所有 Box Size 严格复制 Source Size。
+11. 训练虚线支路：direction-filtered positive centers 映射到 P3 并 `3×3×1` 膨胀；24-bin yaw mask 合并为 12-bin multi-hot；Hungarian matching 代价为 `2 cls + 5 center + 2 yaw-bin + corner`。
 
 视觉要求：
 
-- 中文标签为主，英文模型名和张量名保留英文
-- 全图最多三类颜色：蓝色表示共享编码，绿色表示 Stage 1，橙色表示 Stage 2 / dense placement
-- 不使用 3D 透视、阴影、发光、渐变背景、纹理、商业海报风格
-- 模块之间连接线不能穿过文字
-- 信息密度适中，只保留核心模块，不展开每个 Linear / GELU / Dropout
-- 在图底部用一行小字标注：canonical world 满足 `world-Z = 支撑面法向/重力上方向`
+- 蓝色表示共享编码，绿色表示 Source Grounding，橙色表示 SPACE-Former，灰色虚线表示训练监督。
+- 用一个局部放大框画出 bottom 点、side/top 点、active/inactive lookup 和 `normalized_base_offset`。
+- 不使用 3D 透视、阴影、发光、渐变背景或商业海报风格。
+- 模块连接线不穿过文字；不展开无关的 Linear/GELU/Dropout。
+- 底部标注：`world-Z = 支撑面法向 / 重力上方向`。
 
 ## 自检
 
-- 已使用方法模块描述，不是只基于摘要。
-- 已声明论文类型为 Method Paper。
-- 主线为 Stage 1 源物体定位到 Stage 2 稠密放置场。
-- 训练专用监督与推理路径分离。
-- 图形语言为二维扁平矢量，无装饰性效果。
+- Stage 2 是有界集合预测，不是 dense heatmap argmax。
+- 粗区域仅使用 P3 与 `text_global`。
+- 每 Query 每层每尺度固定 64 个物理采样点。
+- 明确区分 bottom 与 non-bottom，并展示 inactive token 的物理含义。
+- 输出最多 16 个 Box，尺寸严格来自 Source Size。

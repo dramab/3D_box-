@@ -402,13 +402,15 @@ def main() -> None:
     items = select_items(cfg, args.split, args.sample_id, args.object_id)
     dataset = Stage2InferenceDataset(items, max_samples=args.max_samples)
     batch_size = int(args.batch_size or cfg["training"]["batch_size"])
+    num_workers = int(cfg["training"].get("num_workers", 0))
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=int(cfg["training"].get("num_workers", 0)),
+        num_workers=num_workers,
         collate_fn=lambda batch: inference_collate(batch, voxel_size_cm=float(cfg["data"]["voxel_size_cm"])),
         pin_memory=bool(cfg["training"].get("pin_memory", True)),
+        persistent_workers=num_workers > 0,
     )
 
     split_name = "valid" if args.split == "val" else args.split
@@ -424,20 +426,23 @@ def main() -> None:
             outputs = model(batch)
             source_boxes = outputs["source_box"].detach().cpu().numpy()
             place_boxes = outputs["place_box"].detach().cpu().numpy()
-            heatmap_scores = torch.sigmoid(outputs["placement_heatmap_logits"]).detach().cpu().numpy()
-            heat_scores = heatmap_scores[outputs["best_indices"].detach().cpu().numpy()]
-            world_coords = batch["world_coords"].detach().cpu().numpy()
-            batch_indices = batch["batch_indices"].detach().cpu().numpy()
+            placement_sets = outputs["place_boxes"].detach().cpu().numpy()
+            placement_scores = outputs["place_scores"].detach().cpu().numpy()
+            placement_yaw_bins = outputs["place_yaw_bins"].detach().cpu().numpy()
+            placement_valid = outputs["place_valid_mask"].detach().cpu().numpy()
+            region_scores = torch.sigmoid(outputs["region_logits"]).detach().cpu().numpy()
+            region_points = outputs["region_world_coords"].detach().cpu().numpy()
+            region_batch_indices = outputs["region_batch_indices"].detach().cpu().numpy()
 
             for row_idx, item in enumerate(raw_items):
                 stem = f"{item.item_id}__{item.sample_id}__{item.object_id}__cluster_{item.cluster_id:03d}"
                 vis_path = output_dir / f"{stem}.png"
                 pred_heatmap_path = heatmap_dir / f"{stem}__pred_heatmap.ply"
-                row_mask = batch_indices == row_idx
+                row_mask = region_batch_indices == row_idx
                 save_predicted_heatmap_ply(
                     pred_heatmap_path,
-                    world_coords[row_mask],
-                    heatmap_scores[row_mask],
+                    region_points[row_mask],
+                    region_scores[row_mask],
                 )
                 export_visualization(
                     item,
@@ -447,6 +452,15 @@ def main() -> None:
                     line_width=int(args.line_width),
                     draw_gt=not args.no_gt,
                 )
+                valid_indices = np.flatnonzero(placement_valid[row_idx])
+                placements = [
+                    {
+                        "box": placement_sets[row_idx, index].tolist(),
+                        "score": float(placement_scores[row_idx, index]),
+                        "yaw_bin": int(placement_yaw_bins[row_idx, index]),
+                    }
+                    for index in valid_indices
+                ]
                 rows.append(
                     {
                         "item_id": item.item_id,
@@ -457,8 +471,9 @@ def main() -> None:
                         "instruction": item.instruction,
                         "source_box": source_boxes[row_idx].tolist(),
                         "place_box": place_boxes[row_idx].tolist(),
+                        "placements": placements,
                         "place_box_gt": item.place_box_gt.tolist(),
-                        "best_heatmap_score": float(heat_scores[row_idx]),
+                        "best_place_score": float(placement_scores[row_idx, 0]),
                         "visualization_png": os.fspath(vis_path),
                         "pred_heatmap_ply": os.fspath(pred_heatmap_path),
                     }

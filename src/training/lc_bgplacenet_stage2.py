@@ -1,8 +1,8 @@
 """
 LC-BGPlaceNet Stage 2 training utilities.
 
-Stage 2 trains source-conditioned dense placement prediction from canonical
-active voxel point clouds, language instructions and free_bbox supervision.
+Stage 2 trains bounded SPACE-Former set prediction from canonical active voxel
+point clouds, language instructions and free_bbox center/yaw-set supervision.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
 from PIL import Image
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial import cKDTree
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -30,7 +32,13 @@ from src.annotation.auto_label import describe_spatial_relation
 from src.annotation.free_bbox.geometry import get_bbox_corners, transform_points
 from src.annotation.free_bbox.io_utils import load_ply
 from src.datasets.canonical import CameraParams, load_sample_record
-from src.models.lc_bgplacenet.stage2 import LCBGPlaceNetDensePlacement
+from src.models.lc_bgplacenet.stage1 import aabb_iou_3d
+from src.models.lc_bgplacenet.stage2 import (
+    NUM_QUERIES,
+    NUM_YAW_BINS,
+    SPACEFormerStage2,
+    yaw_bin_angles,
+)
 from src.training.lc_bgplacenet_stage1 import (
     STAGE1_SPLIT_SCHEMA_VERSION,
     STAGE1_SPLIT_NAME_SET,
@@ -86,6 +94,7 @@ class Stage2IndexItem:
     camera_E_w2c: np.ndarray
     support_mask_ply: Path
     direction_filtered_heatmap_ply: Path
+    yaw_set_npz: Path
     source_box_gt: np.ndarray
     place_box_gt: np.ndarray
     target_relation: str
@@ -135,8 +144,9 @@ def build_stage2_index(sources: list[Stage1DataSource]) -> list[Stage2IndexItem]
             if not raw_heatmap or not support_mask:
                 continue
             direction_heatmap = _direction_filtered_heatmap_path(source.free_bbox_dir, raw_heatmap)
+            yaw_set_path = _yaw_set_path(source.free_bbox_dir, raw_heatmap)
             support_mask_path = _resolve_free_bbox_path(source.free_bbox_dir, support_mask)
-            if not direction_heatmap.exists() or not support_mask_path.exists():
+            if not direction_heatmap.exists() or not support_mask_path.exists() or not yaw_set_path.exists():
                 continue
             placement_relation = record.get("spatial_relation", {}).get("placement", {})
             target_relation = placement_relation.get("relation")
@@ -162,6 +172,7 @@ def build_stage2_index(sources: list[Stage1DataSource]) -> list[Stage2IndexItem]
                     camera_E_w2c=camera_e_w2c,
                     support_mask_ply=support_mask_path,
                     direction_filtered_heatmap_ply=direction_heatmap,
+                    yaw_set_npz=yaw_set_path,
                     source_box_gt=_source_box_from_obb(
                         obj_record["canonical_aabb_object"],
                         obj_record["original_pose_world"],
@@ -197,6 +208,14 @@ def _resolve_free_bbox_path(free_bbox_root: Path, raw_path: str | os.PathLike[st
 def _direction_filtered_heatmap_path(free_bbox_root: Path, raw_heatmap_path: str | os.PathLike[str]) -> Path:
     """Map a raw heatmap path to the direction_filtered_heatmaps directory."""
     return free_bbox_root / "direction_filtered_heatmaps" / Path(raw_heatmap_path).name
+
+
+def _yaw_set_path(free_bbox_root: Path, raw_heatmap_path: str | os.PathLike[str]) -> Path:
+    """Map one cluster heatmap path to its saved center/yaw-set NPZ."""
+    name = Path(raw_heatmap_path).name
+    if not name.endswith("__heatmap.ply"):
+        raise ValueError(f"Unexpected heatmap filename: {name}")
+    return free_bbox_root / "yaw_sets" / name.replace("__heatmap.ply", "__yaw_set.npz")
 
 
 def _place_box_from_placement(placement: dict[str, Any]) -> np.ndarray:
@@ -398,12 +417,81 @@ def _is_support_color(colors: np.ndarray) -> np.ndarray:
 
 
 def _quantize_world_points(points: np.ndarray, voxel_size_cm: float) -> np.ndarray:
-    """Quantize world coordinates to stable voxel keys for PLY alignment."""
+    """Quantize world coordinates to sparse voxel keys."""
     return np.floor(np.asarray(points, dtype=np.float64) / float(voxel_size_cm) + 1e-4).astype(np.int64)
 
 
+def _row_membership(rows: np.ndarray, candidates: np.ndarray) -> np.ndarray:
+    """Vectorize exact membership checks for fixed-width integer rows."""
+    rows = np.ascontiguousarray(rows)
+    candidates = np.ascontiguousarray(candidates, dtype=rows.dtype)
+    row_dtype = np.dtype((np.void, rows.dtype.itemsize * rows.shape[1]))
+    row_keys = rows.view(row_dtype).reshape(-1)
+    candidate_keys = candidates.view(row_dtype).reshape(-1)
+    return np.isin(row_keys, candidate_keys)
+
+
+def _fps_numpy(points: np.ndarray, count: int, seed_index: int) -> np.ndarray:
+    """Deterministic NumPy FPS used to bound one GT center set."""
+    count = min(int(count), len(points))
+    if count <= 0:
+        return np.empty((0,), dtype=np.int64)
+    selected = np.empty((count,), dtype=np.int64)
+    selected[0] = int(seed_index)
+    min_distance = np.full((len(points),), np.inf, dtype=np.float64)
+    for output_index in range(1, count):
+        distance = np.square(points - points[selected[output_index - 1]]).sum(axis=1)
+        min_distance = np.minimum(min_distance, distance)
+        selected[output_index] = int(np.argmax(min_distance))
+    return selected
+
+
+def build_space_former_targets(
+    yaw_set_path: str | Path,
+    direction_positive_points: np.ndarray,
+    coordinate_tolerance_cm: float = 1e-3,
+    max_targets: int = NUM_QUERIES,
+) -> dict[str, np.ndarray]:
+    """Build bounded GT centers with all valid physical yaw bins retained."""
+    with np.load(yaw_set_path) as yaw_set:
+        centers = np.asarray(yaw_set["bottom_center_world"], dtype=np.float32)
+        mask24 = np.asarray(yaw_set["valid_yaw_mask"], dtype=bool)
+    if mask24.shape != (len(centers), 24):
+        raise ValueError(f"Invalid yaw mask shape in {yaw_set_path}: {mask24.shape}")
+
+    matched_indices = cKDTree(centers.astype(np.float64)).query_ball_point(
+        np.asarray(direction_positive_points, dtype=np.float64),
+        r=float(coordinate_tolerance_cm),
+        p=np.inf,
+    )
+    match_counts = np.fromiter((len(indices) for indices in matched_indices), dtype=np.int64)
+    if np.any(match_counts != 1):
+        unmatched = int(np.count_nonzero(match_counts == 0))
+        ambiguous = int(np.count_nonzero(match_counts > 1))
+        raise ValueError(
+            f"Direction-positive/yaw-center alignment failed in {yaw_set_path}: "
+            f"unmatched={unmatched}, ambiguous={ambiguous}, tolerance_cm={coordinate_tolerance_cm}"
+        )
+    keep = np.zeros(len(centers), dtype=bool)
+    keep[np.fromiter((indices[0] for indices in matched_indices), dtype=np.int64)] = True
+    mask12 = mask24[:, :12] | mask24[:, 12:]
+    keep &= mask12.any(axis=1)
+    centers = centers[keep]
+    mask12 = mask12[keep]
+    if len(centers) == 0:
+        raise ValueError(f"No direction-valid center/yaw targets remain in {yaw_set_path}")
+
+    quality = 0.5 + 0.5 * mask12.sum(axis=1).astype(np.float32) / float(NUM_YAW_BINS)
+    selected = _fps_numpy(centers.astype(np.float64), max_targets, int(np.argmax(quality)))
+    return {
+        "gt_bottom_centers": centers[selected].astype(np.float32),
+        "gt_yaw_masks": mask12[selected].astype(bool),
+        "gt_affordance_quality": quality[selected].astype(np.float32),
+    }
+
+
 class LCBGPlaceNetStage2Dataset(Dataset):
-    """Dataset for dense placement Stage 2 training."""
+    """Dataset for SPACE-Former Stage 2 set-prediction training."""
 
     def __init__(
         self,
@@ -451,6 +539,10 @@ class LCBGPlaceNetStage2Dataset(Dataset):
         if len(positive_points) == 0:
             raise ValueError(f"No direction-filtered heatmap positives for {item.item_id}")
         image = np.asarray(Image.open(item.rgb_path).convert("RGB"), dtype=np.uint8)
+        set_targets = build_space_former_targets(
+            item.yaw_set_npz,
+            positive_points,
+        )
 
         return {
             "item_id": item.item_id,
@@ -468,6 +560,7 @@ class LCBGPlaceNetStage2Dataset(Dataset):
             "heatmap_positive_points": positive_points.astype(np.float32),
             "source_box_gt": item.source_box_gt,
             "place_box_gt": item.place_box_gt,
+            **set_targets,
         }
 
 
@@ -518,6 +611,10 @@ def stage2_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
     support_masks = []
     source_boxes = []
     place_boxes = []
+    gt_bottom_centers = []
+    gt_yaw_masks = []
+    gt_affordance_quality = []
+    gt_valid_masks = []
     positive_points = []
     positive_batch_indices = []
     scene_min = []
@@ -547,8 +644,8 @@ def stage2_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         spatial_max = np.maximum(spatial_max, shifted_keys.max(axis=0) + 1)
         batch_col = np.full((len(points), 1), batch_idx, dtype=np.int32)
 
-        support_keys = {tuple(key) for key in _quantize_world_points(item["support_points"], voxel_size_cm)}
-        support_mask = np.asarray([tuple(key) in support_keys for key in voxel_keys], dtype=bool)
+        support_keys = _quantize_world_points(item["support_points"], voxel_size_cm)
+        support_mask = _row_membership(voxel_keys, support_keys)
 
         positives = np.asarray(item["heatmap_positive_points"], dtype=np.float32)
         features.append(np.concatenate([point_norm, colors], axis=1).astype(np.float32))
@@ -563,6 +660,22 @@ def stage2_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         scene_max.append(point_max.astype(np.float32))
         source_boxes.append(np.asarray(item["source_box_gt"], dtype=np.float32))
         place_boxes.append(np.asarray(item["place_box_gt"], dtype=np.float32))
+        target_centers = np.asarray(item["gt_bottom_centers"], dtype=np.float32)
+        target_yaw = np.asarray(item["gt_yaw_masks"], dtype=bool)
+        target_quality = np.asarray(item["gt_affordance_quality"], dtype=np.float32)
+        target_count = min(len(target_centers), NUM_QUERIES)
+        centers_pad = np.zeros((NUM_QUERIES, 3), dtype=np.float32)
+        yaw_pad = np.zeros((NUM_QUERIES, NUM_YAW_BINS), dtype=bool)
+        quality_pad = np.zeros((NUM_QUERIES,), dtype=np.float32)
+        valid_pad = np.zeros((NUM_QUERIES,), dtype=bool)
+        centers_pad[:target_count] = target_centers[:target_count]
+        yaw_pad[:target_count] = target_yaw[:target_count]
+        quality_pad[:target_count] = target_quality[:target_count]
+        valid_pad[:target_count] = True
+        gt_bottom_centers.append(centers_pad)
+        gt_yaw_masks.append(yaw_pad)
+        gt_affordance_quality.append(quality_pad)
+        gt_valid_masks.append(valid_pad)
         instructions.append(str(item["instruction"]))
         item_ids.append(str(item["item_id"]))
         source_names.append(str(item["source_name"]))
@@ -587,6 +700,10 @@ def stage2_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         "heatmap_positive_batch_indices": torch.from_numpy(np.concatenate(positive_batch_indices, axis=0)),
         "source_box_gt": torch.from_numpy(np.stack(source_boxes, axis=0)),
         "place_box_gt": torch.from_numpy(np.stack(place_boxes, axis=0)),
+        "gt_bottom_centers": torch.from_numpy(np.stack(gt_bottom_centers, axis=0)),
+        "gt_yaw_masks": torch.from_numpy(np.stack(gt_yaw_masks, axis=0)),
+        "gt_affordance_quality": torch.from_numpy(np.stack(gt_affordance_quality, axis=0)),
+        "gt_valid_mask": torch.from_numpy(np.stack(gt_valid_masks, axis=0)),
         "scene_min": torch.from_numpy(np.stack(scene_min, axis=0)),
         "scene_max": torch.from_numpy(np.stack(scene_max, axis=0)),
         "instructions": instructions,
@@ -661,86 +778,403 @@ def nearest_voxel_per_batch(
     return torch.stack(indices, dim=0)
 
 
+def build_coarse_region_targets(
+    region_coords: torch.Tensor,
+    region_logits: torch.Tensor,
+    voxel_origins: torch.Tensor,
+    positive_points: torch.Tensor,
+    positive_batch_indices: torch.Tensor,
+    voxel_size_cm: float,
+    batch_size: int,
+) -> torch.Tensor:
+    """Map positive centers to P3 and apply a same-Z 3x3x1 dilation."""
+    targets = region_logits.new_zeros(region_logits.shape)
+    spatial_shape = region_coords[:, 1:].amax(dim=0) + 1
+
+    def key(xyz: torch.Tensor) -> torch.Tensor:
+        return (xyz[:, 0] * spatial_shape[1] + xyz[:, 1]) * spatial_shape[2] + xyz[:, 2]
+
+    xy_offsets = torch.tensor(
+        [[x, y, 0] for x in (-1, 0, 1) for y in (-1, 0, 1)],
+        device=region_coords.device,
+        dtype=torch.long,
+    )
+    for batch_index in range(int(batch_size)):
+        region_idx = torch.nonzero(region_coords[:, 0] == batch_index, as_tuple=False).flatten()
+        positives = positive_points[positive_batch_indices == batch_index]
+        if len(region_idx) == 0 or len(positives) == 0:
+            continue
+        positive_coords = torch.floor(
+            (positives - voxel_origins[batch_index]) / (4.0 * float(voxel_size_cm))
+        ).long()
+        dilated = (positive_coords[:, None, :] + xy_offsets[None, :, :]).reshape(-1, 3)
+        in_bounds = ((dilated >= 0) & (dilated < spatial_shape)).all(dim=-1)
+        positive_keys = torch.unique(key(dilated[in_bounds]))
+        targets[region_idx] = torch.isin(key(region_coords[region_idx, 1:]), positive_keys).to(targets.dtype)
+    return targets
+
+
+def compute_p3_gt_point_coverage(
+    region_coords: torch.Tensor,
+    region_logits: torch.Tensor,
+    voxel_origins: torch.Tensor,
+    positive_points: torch.Tensor,
+    positive_batch_indices: torch.Tensor,
+    voxel_size_cm: float,
+    batch_size: int,
+    num_region_cells: int,
+) -> torch.Tensor:
+    """Return macro-average GT-point coverage of selected P3 cells."""
+    spatial_shape = region_coords[:, 1:].amax(dim=0) + 1
+
+    def key(xyz: torch.Tensor) -> torch.Tensor:
+        return (xyz[:, 0] * spatial_shape[1] + xyz[:, 1]) * spatial_shape[2] + xyz[:, 2]
+
+    sample_coverages = []
+    for batch_index in range(int(batch_size)):
+        region_idx = torch.nonzero(region_coords[:, 0] == batch_index, as_tuple=False).flatten()
+        positives = positive_points[positive_batch_indices == batch_index]
+        if len(region_idx) == 0 or len(positives) == 0:
+            sample_coverages.append(region_logits.new_zeros(()))
+            continue
+        selected_count = min(int(num_region_cells), len(region_idx))
+        selected_local = torch.topk(region_logits[region_idx], k=selected_count).indices
+        selected_keys = key(region_coords[region_idx[selected_local], 1:])
+        positive_coords = torch.floor(
+            (positives - voxel_origins[batch_index]) / (4.0 * float(voxel_size_cm))
+        ).long()
+        in_bounds = ((positive_coords >= 0) & (positive_coords < spatial_shape)).all(dim=-1)
+        hits = torch.zeros(len(positives), dtype=torch.bool, device=region_coords.device)
+        hits[in_bounds] = torch.isin(key(positive_coords[in_bounds]), selected_keys)
+        sample_coverages.append(hits.to(region_logits.dtype).mean())
+    return torch.stack(sample_coverages).mean()
+
+
+def _box_corners_from_rotation(
+    bottom_centers: torch.Tensor,
+    sizes: torch.Tensor,
+    rotations: torch.Tensor,
+) -> torch.Tensor:
+    """Build ordered corners for aligned leading `(center,size,rotation)` shapes."""
+    signs = torch.tensor(
+        [
+            [-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
+            [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1],
+        ],
+        device=bottom_centers.device,
+        dtype=bottom_centers.dtype,
+    )
+    centers = bottom_centers.clone()
+    centers[..., 2] += sizes[..., 2] * 0.5
+    local = sizes[..., None, :] * signs * 0.5
+    return torch.einsum("...ij,...kj->...ki", rotations, local) + centers[..., None, :]
+
+
+def _yaw_rotations_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Use hard bin rotations in forward and soft bin weights in backward."""
+    probabilities = torch.softmax(logits, dim=-1)
+    indices = torch.argmax(probabilities, dim=-1)
+    hard = F.one_hot(indices, NUM_YAW_BINS).to(probabilities.dtype)
+    weights = hard + probabilities - probabilities.detach()
+    angles = yaw_bin_angles(logits.device, logits.dtype)
+    cosine, sine = torch.cos(angles), torch.sin(angles)
+    zeros, ones = torch.zeros_like(angles), torch.ones_like(angles)
+    rotations = torch.stack(
+        [cosine, -sine, zeros, sine, cosine, zeros, zeros, zeros, ones], dim=-1
+    ).reshape(NUM_YAW_BINS, 3, 3)
+    return torch.einsum("...k,kij->...ij", weights, rotations)
+
+
+def _minimum_valid_corner_loss(
+    pred_centers: torch.Tensor,
+    pred_sizes: torch.Tensor,
+    pred_yaw_logits: torch.Tensor,
+    target_centers: torch.Tensor,
+    target_sizes: torch.Tensor,
+    target_yaw_masks: torch.Tensor,
+) -> torch.Tensor:
+    """Return the mean minimum symmetric Chamfer-L1 over valid target yaw bins."""
+    if len(pred_centers) == 0:
+        return pred_centers.sum() * 0.0
+    pred_corners = _box_corners_from_rotation(
+        pred_centers,
+        pred_sizes,
+        _yaw_rotations_from_logits(pred_yaw_logits),
+    )
+    angles = yaw_bin_angles(pred_centers.device, pred_centers.dtype)
+    cosine, sine = torch.cos(angles), torch.sin(angles)
+    zeros, ones = torch.zeros_like(angles), torch.ones_like(angles)
+    rotations = torch.stack(
+        [cosine, -sine, zeros, sine, cosine, zeros, zeros, zeros, ones], dim=-1
+    ).reshape(NUM_YAW_BINS, 3, 3)
+    count = len(target_centers)
+    target_corners = _box_corners_from_rotation(
+        target_centers[:, None, :].expand(-1, NUM_YAW_BINS, -1),
+        target_sizes[:, None, :].expand(-1, NUM_YAW_BINS, -1),
+        rotations[None].expand(count, -1, -1, -1),
+    )
+    distance = torch.abs(
+        pred_corners[:, None, :, None, :] - target_corners[:, :, None, :, :]
+    ).sum(dim=-1)
+    chamfer = distance.amin(dim=-1).mean(dim=-1) + distance.amin(dim=-2).mean(dim=-1)
+    chamfer = chamfer.masked_fill(~target_yaw_masks, float("inf"))
+    diagonal = torch.linalg.vector_norm(target_sizes, dim=-1).clamp_min(1e-4)
+    return (chamfer.amin(dim=-1) / diagonal).mean()
+
+
+@torch.no_grad()
+def _pairwise_minimum_corner_cost(
+    pred_centers: torch.Tensor,
+    pred_sizes: torch.Tensor,
+    pred_yaw_logits: torch.Tensor,
+    target_centers: torch.Tensor,
+    target_sizes: torch.Tensor,
+    target_yaw_masks: torch.Tensor,
+) -> torch.Tensor:
+    """Compute pairwise minimum valid-yaw corner cost for matching."""
+    pred_corners = _box_corners_from_rotation(
+        pred_centers,
+        pred_sizes,
+        _yaw_rotations_from_logits(pred_yaw_logits),
+    )
+    angles = yaw_bin_angles(pred_centers.device, pred_centers.dtype)
+    cosine, sine = torch.cos(angles), torch.sin(angles)
+    zeros, ones = torch.zeros_like(angles), torch.ones_like(angles)
+    rotations = torch.stack(
+        [cosine, -sine, zeros, sine, cosine, zeros, zeros, zeros, ones], dim=-1
+    ).reshape(NUM_YAW_BINS, 3, 3)
+    target_corners = _box_corners_from_rotation(
+        target_centers[:, None, :].expand(-1, NUM_YAW_BINS, -1),
+        target_sizes[:, None, :].expand(-1, NUM_YAW_BINS, -1),
+        rotations[None].expand(len(target_centers), -1, -1, -1),
+    )
+    distance = torch.abs(
+        pred_corners[:, None, None, :, None, :] - target_corners[None, :, :, None, :, :]
+    ).sum(dim=-1)
+    chamfer = distance.amin(dim=-1).mean(dim=-1) + distance.amin(dim=-2).mean(dim=-1)
+    chamfer = chamfer.masked_fill(~target_yaw_masks[None], float("inf"))
+    diagonal = torch.linalg.vector_norm(target_sizes, dim=-1).clamp_min(1e-4)
+    return chamfer.amin(dim=-1) / diagonal[None, :]
+
+
+def _hungarian_matches(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Match queries to GT sets with one device-to-host cost transfer."""
+    batch_size = int(batch["batch_size"])
+    matches: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * batch_size
+    pending = []
+    flat_costs = []
+    for batch_index in range(batch_size):
+        query_indices = torch.nonzero(outputs["query_valid_mask"][batch_index], as_tuple=False).flatten()
+        target_indices = torch.nonzero(batch["gt_valid_mask"][batch_index], as_tuple=False).flatten()
+        if len(query_indices) == 0 or len(target_indices) == 0:
+            matches[batch_index] = (query_indices[:0], target_indices[:0])
+            continue
+        logits = outputs["raw_place_logits"][batch_index, query_indices]
+        quality = batch["gt_affordance_quality"][batch_index, target_indices]
+        cls_cost = F.binary_cross_entropy_with_logits(
+            logits[:, None].expand(-1, len(target_indices)),
+            quality[None, :].expand(len(query_indices), -1),
+            reduction="none",
+        )
+        source_size = outputs["source_box"][batch_index, 3:6].detach().clamp_min(1e-4)
+        center_cost = torch.abs(
+            outputs["pred_bottom_centers"][batch_index, query_indices, None, :]
+            - batch["gt_bottom_centers"][batch_index, None, target_indices, :]
+        ).div(source_size).mean(dim=-1)
+        pred_yaw = outputs["raw_yaw_logits"][batch_index, query_indices]
+        target_yaw = batch["gt_yaw_masks"][batch_index, target_indices].to(pred_yaw.dtype)
+        yaw_cost = F.binary_cross_entropy_with_logits(
+            pred_yaw[:, None, :].expand(-1, len(target_indices), -1),
+            target_yaw[None, :, :].expand(len(query_indices), -1, -1),
+            reduction="none",
+        ).mean(dim=-1)
+        pred_size = outputs["source_box"][batch_index, 3:6][None].expand(len(query_indices), -1)
+        target_size = batch["source_box_gt"][batch_index, 3:6][None].expand(len(target_indices), -1)
+        corner_cost = _pairwise_minimum_corner_cost(
+            outputs["pred_bottom_centers"][batch_index, query_indices],
+            pred_size,
+            pred_yaw,
+            batch["gt_bottom_centers"][batch_index, target_indices],
+            target_size,
+            batch["gt_yaw_masks"][batch_index, target_indices],
+        )
+        cost = 2.0 * cls_cost + 5.0 * center_cost + 2.0 * yaw_cost + corner_cost
+        pending.append(
+            (batch_index, query_indices, target_indices, tuple(cost.shape), cost.numel())
+        )
+        flat_costs.append(cost.reshape(-1))
+
+    if flat_costs:
+        costs_cpu = torch.cat(flat_costs).detach().float().cpu().numpy()
+        offset = 0
+        for batch_index, query_indices, target_indices, shape, count in pending:
+            cost_matrix = costs_cpu[offset : offset + count].reshape(shape)
+            offset += count
+            pred_rows, target_rows = linear_sum_assignment(cost_matrix)
+            matches[batch_index] = (
+                query_indices[torch.as_tensor(pred_rows, device=query_indices.device)],
+                target_indices[torch.as_tensor(target_rows, device=target_indices.device)],
+            )
+    if any(match is None for match in matches):
+        raise RuntimeError("Hungarian matching did not produce one result per batch item")
+    return [match for match in matches if match is not None]
+
+
+def _set_losses_for_predictions(
+    prediction: dict[str, torch.Tensor],
+    matches: list[tuple[torch.Tensor, torch.Tensor]],
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute classification, center, yaw and corner terms for one decoder layer."""
+    score_target = prediction["pred_logits"].new_zeros(prediction["pred_logits"].shape)
+    pred_centers, target_centers = [], []
+    pred_yaw, target_yaw = [], []
+    pred_sizes, target_sizes = [], []
+    for batch_index, (query_indices, target_indices) in enumerate(matches):
+        if len(query_indices) == 0:
+            continue
+        score_target[batch_index, query_indices] = batch["gt_affordance_quality"][batch_index, target_indices]
+        pred_centers.append(prediction["pred_bottom_centers"][batch_index, query_indices])
+        target_centers.append(batch["gt_bottom_centers"][batch_index, target_indices])
+        pred_yaw.append(prediction["pred_yaw_logits"][batch_index, query_indices])
+        target_yaw.append(batch["gt_yaw_masks"][batch_index, target_indices])
+        pred_sizes.append(outputs["source_box"][batch_index, 3:6][None].expand(len(query_indices), -1))
+        target_sizes.append(batch["source_box_gt"][batch_index, 3:6][None].expand(len(query_indices), -1))
+    valid_queries = outputs["query_valid_mask"]
+    cls_loss = F.binary_cross_entropy_with_logits(
+        prediction["pred_logits"][valid_queries], score_target[valid_queries]
+    )
+    if not pred_centers:
+        zero = prediction["pred_logits"].sum() * 0.0
+        return cls_loss, zero, zero, zero
+    pred_center = torch.cat(pred_centers)
+    target_center = torch.cat(target_centers)
+    pred_size = torch.cat(pred_sizes)
+    target_size = torch.cat(target_sizes)
+    pred_yaw_logits = torch.cat(pred_yaw)
+    target_yaw_mask = torch.cat(target_yaw)
+    center_loss = F.smooth_l1_loss(
+        (pred_center - target_center) / target_size.clamp_min(1e-4),
+        torch.zeros_like(pred_center),
+    )
+    yaw_loss = F.binary_cross_entropy_with_logits(pred_yaw_logits, target_yaw_mask.to(pred_yaw_logits.dtype))
+    corner_loss = _minimum_valid_corner_loss(
+        pred_center, pred_size, pred_yaw_logits, target_center, target_size, target_yaw_mask
+    )
+    return cls_loss, center_loss, yaw_loss, corner_loss
+
+
 def compute_stage2_loss(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
     cfg: dict[str, Any],
+    compute_diagnostics: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """Compute Stage 2 training loss and detached logging terms."""
+    """Compute SPACE-Former region, set-prediction and source losses."""
     loss_cfg = cfg["loss"]
-    sigma = float(cfg["data"].get("heatmap_sigma_voxels", 2.0)) * float(cfg["data"]["voxel_size_cm"])
-    heatmap_gt = build_dense_heatmap_targets(
-        world_coords=batch["world_coords"],
-        batch_indices=batch["batch_indices"],
-        positive_points=batch["heatmap_positive_points"],
-        positive_batch_indices=batch["heatmap_positive_batch_indices"],
-        support_masks=batch["support_masks"],
-        batch_size=int(batch["batch_size"]),
-        sigma=sigma,
+    focal_cfg = loss_cfg.get("focal", {})
+    region_target = build_coarse_region_targets(
+        outputs["region_sparse_coords"],
+        outputs["region_logits"],
+        outputs["voxel_origins"],
+        batch["heatmap_positive_points"],
+        batch["heatmap_positive_batch_indices"],
+        float(cfg["data"]["voxel_size_cm"]),
+        int(batch["batch_size"]),
     )
-    heat_loss_type = str(loss_cfg.get("heatmap_loss", "focal")).lower()
-    if heat_loss_type == "bce":
-        heat_loss = F.binary_cross_entropy_with_logits(outputs["placement_heatmap_logits"], heatmap_gt)
-    else:
-        focal_cfg = loss_cfg.get("focal", {})
-        heat_loss = focal_loss_with_logits(
-            outputs["placement_heatmap_logits"],
-            heatmap_gt,
-            alpha=float(focal_cfg.get("alpha", 0.25)),
-            gamma=float(focal_cfg.get("gamma", 2.0)),
+    region_loss = focal_loss_with_logits(
+        outputs["region_logits"],
+        region_target,
+        alpha=float(focal_cfg.get("alpha", 0.25)),
+        gamma=float(focal_cfg.get("gamma", 2.0)),
+    )
+    p3_gt_point_coverage = None
+    if compute_diagnostics:
+        model_cfg = cfg.get("model", {})
+        space_cfg = model_cfg.get("space_former", model_cfg.get("placement", {}))
+        p3_gt_point_coverage = compute_p3_gt_point_coverage(
+            outputs["region_sparse_coords"],
+            outputs["region_logits"],
+            outputs["voxel_origins"],
+            batch["heatmap_positive_points"],
+            batch["heatmap_positive_batch_indices"],
+            float(cfg["data"]["voxel_size_cm"]),
+            int(batch["batch_size"]),
+            int(space_cfg.get("num_region_cells", 8)),
         )
+    matches = _hungarian_matches(outputs, batch)
+    final_prediction = {
+        "pred_bottom_centers": outputs["pred_bottom_centers"],
+        "pred_yaw_logits": outputs["raw_yaw_logits"],
+        "pred_logits": outputs["raw_place_logits"],
+    }
+    cls_loss, center_loss, yaw_loss, corner_loss = _set_losses_for_predictions(
+        final_prediction, matches, outputs, batch
+    )
+    auxiliary = outputs["raw_place_logits"].sum() * 0.0
+    for prediction in outputs["decoder_aux_outputs"]:
+        aux_terms = _set_losses_for_predictions(prediction, matches, outputs, batch)
+        auxiliary = auxiliary + 2.0 * aux_terms[0] + 5.0 * aux_terms[1] + 2.0 * aux_terms[2] + aux_terms[3]
 
-    place_gt = batch["place_box_gt"]
-    bottom_gt = place_gt[:, 0:3].clone()
-    bottom_gt[:, 2] = place_gt[:, 2] - place_gt[:, 5] * 0.5
-    pos_idx = nearest_voxel_per_batch(batch["world_coords"], batch["batch_indices"], bottom_gt)
-    offset_gt = bottom_gt - batch["world_coords"][pos_idx]
-    offset_loss = F.smooth_l1_loss(outputs["bottom_offset"][pos_idx], offset_gt)
-    center_loss = F.smooth_l1_loss(outputs["place_box"][:, 0:3], place_gt[:, 0:3])
-    center_total = offset_loss + center_loss
-    size_loss = F.smooth_l1_loss(outputs["size_pred"], place_gt[:, 3:6])
-
-    yaw_ratio = torch.abs(place_gt[:, 3] - place_gt[:, 4]) / torch.minimum(
-        place_gt[:, 3],
-        place_gt[:, 4],
-    ).clamp_min(1e-6)
-    yaw_sensitive = yaw_ratio >= float(loss_cfg.get("yaw_sensitive_ratio", 0.25))
-    if torch.any(yaw_sensitive):
-        yaw_target = torch.stack([torch.sin(place_gt[:, 6]), torch.cos(place_gt[:, 6])], dim=-1)
-        yaw_pred = F.normalize(outputs["yaw_sincos"][outputs["best_indices"]], dim=-1, eps=1e-6)
-        yaw_loss = F.smooth_l1_loss(yaw_pred[yaw_sensitive], yaw_target[yaw_sensitive])
-    else:
-        yaw_loss = outputs["placement_heatmap_logits"].sum() * 0.0
-
-    src_loss, src_terms = source_box_loss(
+    source_cfg = loss_cfg["source"]
+    source_loss, source_terms = source_box_loss(
         outputs["source_box"],
         batch["source_box_gt"],
-        lambda_center=float(loss_cfg["source"]["lambda_center"]),
-        lambda_size=float(loss_cfg["source"]["lambda_size"]),
-        lambda_iou=float(loss_cfg["source"]["lambda_iou"]),
+        lambda_center=float(source_cfg.get("lambda_center", 2.0)),
+        lambda_size=float(source_cfg.get("lambda_size", 1.5)),
+        lambda_iou=float(source_cfg.get("lambda_iou", 0.2)),
     )
     total = (
-        float(loss_cfg["lambda_heat"]) * heat_loss
-        + float(loss_cfg["lambda_center"]) * center_total
-        + float(loss_cfg["lambda_size"]) * size_loss
-        + float(loss_cfg["lambda_yaw"]) * yaw_loss
-        + float(loss_cfg["lambda_src"]) * src_loss
+        float(loss_cfg.get("lambda_region", 1.0)) * region_loss
+        + float(loss_cfg.get("lambda_cls", 2.0)) * cls_loss
+        + float(loss_cfg.get("lambda_center", 5.0)) * center_loss
+        + float(loss_cfg.get("lambda_yaw", 2.0)) * yaw_loss
+        + float(loss_cfg.get("lambda_corner", 1.0)) * corner_loss
+        + float(loss_cfg.get("lambda_src", 1.0)) * source_loss
+        + float(loss_cfg.get("lambda_aux", 0.5)) * auxiliary
     )
     terms = {
         "loss": total,
-        "loss_heat": heat_loss.detach(),
-        "loss_center": center_total.detach(),
-        "loss_offset": offset_loss.detach(),
-        "loss_place_center": center_loss.detach(),
-        "loss_size": size_loss.detach(),
+        "loss_region": region_loss.detach(),
+        "loss_cls": cls_loss.detach(),
+        "loss_center": center_loss.detach(),
         "loss_yaw": yaw_loss.detach(),
-        "loss_src": src_loss.detach(),
-        "heatmap_gt_max": heatmap_gt.max().detach(),
-        "heatmap_gt_support_mean": heatmap_gt[batch["support_masks"]].mean().detach()
-        if torch.any(batch["support_masks"])
-        else heatmap_gt.mean().detach(),
+        "loss_corner": corner_loss.detach(),
+        "loss_aux": auxiliary.detach(),
+        "loss_src": source_loss.detach(),
+        "region_positive_count": region_target.sum().detach(),
+        "region_selected_cell_count": outputs["region_selected_cell_count"].sum().detach(),
+        "expanded_p1_candidate_count": outputs["expanded_p1_candidate_count"].sum().detach(),
+        "valid_query_count": outputs["query_valid_mask"].sum().detach(),
+        "padded_query_count": (~outputs["query_valid_mask"]).sum().detach(),
     }
-    terms.update(src_terms)
+    if p3_gt_point_coverage is not None:
+        terms["p3_gt_point_coverage"] = p3_gt_point_coverage.detach()
+    for key, value in outputs["sampling_logs"].items():
+        terms[key] = value.detach()
+        if key.endswith("_sample_active_count"):
+            total_key = key.replace("_sample_active_count", "_sample_total_count")
+            denominator = outputs["sampling_logs"][total_key].clamp_min(1)
+            terms[key.replace("_count", "_ratio")] = (value / denominator).detach()
+        if key.endswith("_sample_feature_nonzero_count"):
+            total_key = key.replace("_sample_feature_nonzero_count", "_sample_total_count")
+            denominator = outputs["sampling_logs"][total_key].clamp_min(1)
+            terms[key.replace("_count", "_ratio")] = (value / denominator).detach()
+        if key.endswith("_bottom_active_count"):
+            denominator = outputs["sampling_logs"][key.replace("_active_count", "_sample_count")].clamp_min(1)
+            terms[key.replace("_count", "_ratio")] = (value / denominator).detach()
+        if key.endswith("_nonbottom_active_count"):
+            denominator = outputs["sampling_logs"][key.replace("_active_count", "_sample_count")].clamp_min(1)
+            terms[key.replace("_count", "_ratio")] = (value / denominator).detach()
+        if key.endswith("_all_zero_sample_query_count"):
+            terms[key.replace("_count", "_ratio")] = (
+                value / outputs["query_valid_mask"].sum().clamp_min(1)
+            ).detach()
+    terms.update(source_terms)
     return terms
 
 
@@ -749,38 +1183,100 @@ def compute_stage2_task_metric_sums(
     batch: dict[str, Any],
     cfg: dict[str, Any],
 ) -> dict[str, float]:
-    """Compute additive task metric statistics for one validation batch."""
+    """Compute top-1 inference and top-5 candidate task metrics."""
     place_pred = outputs["place_box"].detach().cpu().numpy()
     place_gt = batch["place_box_gt"].detach().cpu().numpy()
+    place_sets = outputs["place_boxes"].detach().cpu().numpy()
+    place_set_masks = outputs["place_valid_mask"].detach().cpu().numpy()
+    place_yaw_bins = outputs["place_yaw_bins"].detach().cpu().numpy()
+    gt_centers = batch["gt_bottom_centers"].detach().cpu().numpy()
+    gt_yaw_masks = batch["gt_yaw_masks"].detach().cpu().numpy()
+    gt_valid_masks = batch["gt_valid_mask"].detach().cpu().numpy()
     contexts = batch["validation_contexts"]
     size_iou_threshold = float(cfg.get("validation", {}).get("size_iou_threshold", 0.8))
-    yaw_sensitive_ratio = float(cfg["loss"].get("yaw_sensitive_ratio", 0.25))
 
     direction_hits = []
     collision_free = []
     size_ious = []
     task_success = []
-    yaw_errors = []
-    for pred, gt, context in zip(place_pred, place_gt, contexts):
+    task_success_top5 = []
+    yaw_bin_valid = []
+    valid_pose_count = 0
+    emitted_pose_count = 0
+    duplicate_pairs = 0
+    possible_pairs = 0
+    for sample_index, (pred, gt, context) in enumerate(zip(place_pred, place_gt, contexts)):
         size_metrics = compute_size_metrics(pred, gt, size_iou_threshold)
         direction_hit = compute_direction_hit(pred, context)
         collision = compute_collision_metrics(pred, context.collision_context)["collision"]
-        yaw_metrics = compute_yaw_metrics(pred, gt, yaw_sensitive_ratio)
         direction_hits.append(direction_hit)
         collision_free.append(not collision)
         size_ious.append(size_metrics["size_iou"])
         task_success.append(compute_task_success(direction_hit, collision, size_metrics["size_correct"]))
-        if yaw_metrics["yaw_sensitive"]:
-            yaw_errors.append(yaw_metrics["yaw_error_deg"])
+
+        candidate_task_results = []
+        center_yaw_results = []
+        emitted = np.flatnonzero(place_set_masks[sample_index])
+        emitted_pose_count += len(emitted)
+        valid_gt = gt_valid_masks[sample_index]
+        target_centers = gt_centers[sample_index, valid_gt]
+        target_yaw = gt_yaw_masks[sample_index, valid_gt]
+        for output_index in emitted:
+            box = place_sets[sample_index, output_index]
+            bottom = box[:3].copy()
+            bottom[2] -= box[5] * 0.5
+            if len(target_centers) == 0:
+                center_yaw_valid = False
+            else:
+                distance = np.linalg.norm(target_centers - bottom[None, :], axis=1)
+                nearest = int(np.argmin(distance))
+                center_yaw_valid = bool(
+                    distance[nearest] <= 2.0
+                    and target_yaw[nearest, int(place_yaw_bins[sample_index, output_index])]
+                )
+            box_size_ok = compute_size_metrics(box, gt, size_iou_threshold)["size_correct"]
+            box_direction_ok = compute_direction_hit(box, context)
+            box_collision = compute_collision_metrics(box, context.collision_context)["collision"]
+            candidate_success = compute_task_success(box_direction_ok, box_collision, box_size_ok)
+            center_yaw_results.append(center_yaw_valid)
+            candidate_task_results.append(candidate_success)
+            valid_pose_count += int(candidate_success)
+        task_success_top5.append(any(candidate_task_results[:5]))
+        yaw_bin_valid.append(bool(center_yaw_results[0]) if center_yaw_results else False)
+
+        for left in range(len(emitted)):
+            for right in range(left + 1, len(emitted)):
+                possible_pairs += 1
+                box_a = place_sets[sample_index, emitted[left]]
+                box_b = place_sets[sample_index, emitted[right]]
+                distance = np.linalg.norm((box_a[:3] - box_b[:3]) / np.maximum(box_a[3:6], 1e-4))
+                yaw_delta = abs(int(place_yaw_bins[sample_index, emitted[left]]) - int(place_yaw_bins[sample_index, emitted[right]]))
+                yaw_delta = min(yaw_delta, NUM_YAW_BINS - yaw_delta)
+                duplicate_pairs += int(distance < 0.25 and yaw_delta <= 1)
+
+    source_pred = outputs["source_box"].detach().cpu().numpy()
+    source_gt = batch["source_box_gt"].detach().cpu().numpy()
+    source_center_mae = np.abs(source_pred[:, :3] - source_gt[:, :3]).mean(axis=1)
+    source_size_iou = [compute_size_iou(pred[3:6], gt[3:6]) for pred, gt in zip(source_pred, source_gt)]
+    source_box_iou = aabb_iou_3d(
+        outputs["source_box"].detach(), batch["source_box_gt"]
+    ).sum()
 
     return {
         "sample_count": float(len(place_pred)),
         "direction_hit_sum": float(sum(direction_hits)),
         "collision_free_sum": float(sum(collision_free)),
         "size_iou_sum": float(sum(size_ious)),
-        "yaw_error_deg_sum": float(sum(yaw_errors)),
-        "yaw_sensitive_count": float(len(yaw_errors)),
         "task_success_sum": float(sum(task_success)),
+        "task_success_top5_sum": float(sum(task_success_top5)),
+        "yaw_bin_valid_at_1_sum": float(sum(yaw_bin_valid)),
+        "valid_pose_count": float(valid_pose_count),
+        "emitted_pose_count": float(emitted_pose_count),
+        "duplicate_pair_count": float(duplicate_pairs),
+        "possible_pair_count": float(possible_pairs),
+        "source_center_mae_sum": float(np.sum(source_center_mae)),
+        "source_size_iou_sum": float(np.sum(source_size_iou)),
+        "source_box_iou_sum": float(source_box_iou.cpu()),
     }
 
 
@@ -792,18 +1288,59 @@ def _make_loader(
 ) -> DataLoader:
     data_cfg = cfg["data"]
     train_cfg = cfg["training"]
+    num_workers = int(train_cfg.get("num_workers", 0))
     return DataLoader(
         dataset,
         batch_size=int(train_cfg["batch_size"]),
         shuffle=shuffle if sampler is None else False,
         sampler=sampler,
-        num_workers=int(train_cfg.get("num_workers", 0)),
+        num_workers=num_workers,
         collate_fn=lambda batch: stage2_collate(batch, voxel_size_cm=float(data_cfg["voxel_size_cm"])),
         pin_memory=bool(train_cfg.get("pin_memory", True)),
+        persistent_workers=num_workers > 0,
     )
 
 
-def load_stage1_weights(model: LCBGPlaceNetDensePlacement, checkpoint_path: str | Path, device: torch.device) -> list[str]:
+def _optimizer_learning_rates(optimizer: torch.optim.Optimizer) -> dict[str, float]:
+    """Return the Stage 1 and Stage 2 optimizer-group learning rates."""
+    if len(optimizer.param_groups) != 2:
+        raise ValueError(f"Expected two optimizer parameter groups, got {len(optimizer.param_groups)}")
+    return {
+        "lr_stage1": float(optimizer.param_groups[0]["lr"]),
+        "lr_stage2": float(optimizer.param_groups[1]["lr"]),
+    }
+
+
+def _override_optimizer_learning_rates(optimizer: torch.optim.Optimizer, base_lr: float) -> None:
+    """Apply config learning rates after restoring optimizer state."""
+    rates = (float(base_lr) * 0.1, float(base_lr))
+    if len(optimizer.param_groups) != len(rates):
+        raise ValueError(f"Expected two optimizer parameter groups, got {len(optimizer.param_groups)}")
+    for group, learning_rate in zip(optimizer.param_groups, rates):
+        group["lr"] = learning_rate
+        group["initial_lr"] = learning_rate
+
+
+def _build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: dict[str, Any],
+) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
+    """Build the task-success plateau scheduler from training config."""
+    scheduler_cfg = cfg["training"].get("lr_scheduler", {})
+    scheduler_type = str(scheduler_cfg.get("type", "reduce_on_plateau")).lower()
+    if scheduler_type != "reduce_on_plateau":
+        raise ValueError(f"Unsupported Stage 2 lr_scheduler type: {scheduler_type}")
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode=str(scheduler_cfg.get("mode", "max")),
+        factor=float(scheduler_cfg.get("factor", 0.5)),
+        patience=int(scheduler_cfg.get("patience", 3)),
+        threshold=float(scheduler_cfg.get("threshold", 0.001)),
+        threshold_mode=str(scheduler_cfg.get("threshold_mode", "abs")),
+    )
+
+
+def load_stage1_weights(model: SPACEFormerStage2, checkpoint_path: str | Path, device: torch.device) -> list[str]:
     """Initialize shared Stage 1 modules from a Stage 1 checkpoint."""
     checkpoint = torch.load(Path(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
@@ -816,6 +1353,44 @@ def load_stage1_weights(model: LCBGPlaceNetDensePlacement, checkpoint_path: str 
     skipped = sorted(key for key in state_dict if key not in compatible)
     model.load_state_dict(compatible, strict=False)
     return skipped
+
+
+def _format_stage2_log(payload: dict[str, Any]) -> str:
+    """Format one concise terminal summary while metrics.jsonl keeps all fields."""
+    split = str(payload["split"])
+    fields = {
+        "train": (
+            ("loss", "loss"),
+            ("loss_region", "region"),
+            ("loss_cls", "cls"),
+            ("loss_center", "center"),
+            ("loss_yaw", "yaw"),
+            ("loss_corner", "corner"),
+            ("source_iou", "src_iou"),
+            ("p3_gt_point_coverage", "p3_gt_cov"),
+            ("lr_stage1", "lr_s1"),
+            ("lr_stage2", "lr_s2"),
+        ),
+        "valid": (
+            ("loss", "loss"),
+            ("task_success_rate", "task@1"),
+            ("task_success_top5", "task@5"),
+            ("valid_pose_rate", "valid_pose"),
+            ("direction_hit_rate", "direction"),
+            ("collision_free_rate", "collision_free"),
+            ("size_iou", "size_iou"),
+            ("p3_gt_point_coverage", "p3_gt_cov"),
+            ("lr_stage1", "lr_s1"),
+            ("lr_stage2", "lr_s2"),
+        ),
+    }[split]
+    parts = [f"[{split}]", f"epoch={int(payload['epoch'])}", f"step={int(payload['step'])}"]
+    for key, label in fields:
+        if key not in payload:
+            continue
+        value = float(payload[key])
+        parts.append(f"{label}={value:.2e}" if key.startswith("lr_") else f"{label}={value:.4f}")
+    return " ".join(parts)
 
 
 def train_stage2(
@@ -862,7 +1437,7 @@ def train_stage2(
         )
         validation_contexts = build_stage2_validation_contexts(val_set.items)
 
-        model = LCBGPlaceNetDensePlacement(cfg["model"]).to(device)
+        model = SPACEFormerStage2(cfg["model"]).to(device)
         init_checkpoint = stage1_checkpoint or cfg["training"].get("stage1_pretrained_checkpoint")
         if resume_checkpoint is None and init_checkpoint:
             skipped = load_stage1_weights(model, init_checkpoint, device)
@@ -875,11 +1450,30 @@ def train_stage2(
         if distributed:
             model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
         trainable_model = model.module if distributed else model
+        base_lr = float(cfg["training"]["lr"])
+        stage1_prefixes = (
+            "voxel_image_encoder",
+            "backbone",
+            "text_encoder",
+            "fusion",
+            "pos_mlp",
+            "source_grounding",
+        )
+        stage1_parameters = []
+        stage2_parameters = []
+        for name, parameter in trainable_model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            target = stage1_parameters if name.startswith(stage1_prefixes) else stage2_parameters
+            target.append(parameter)
         optimizer = torch.optim.AdamW(
-            [p for p in trainable_model.parameters() if p.requires_grad],
-            lr=float(cfg["training"]["lr"]),
+            [
+                {"params": stage1_parameters, "lr": base_lr * 0.1},
+                {"params": stage2_parameters, "lr": base_lr},
+            ],
             weight_decay=float(cfg["training"].get("weight_decay", 0.0)),
         )
+        scheduler = _build_lr_scheduler(optimizer, cfg)
 
         train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True) if distributed else None
         val_sampler = DistributedSampler(val_set, num_replicas=world_size, rank=rank, shuffle=False) if distributed else None
@@ -899,10 +1493,19 @@ def train_stage2(
             start_epoch = int(checkpoint["epoch"]) + 1
             global_step = int(checkpoint["step"])
             best_task_success_rate = float(checkpoint.get("best_task_success_rate", -math.inf))
+            if "scheduler" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler"])
+            elif math.isfinite(best_task_success_rate):
+                # Existing checkpoints predate the scheduler; seed its plateau baseline.
+                scheduler.step(best_task_success_rate)
+            _override_optimizer_learning_rates(optimizer, base_lr)
+            scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
             if _is_main_process(rank):
+                resumed_lrs = _optimizer_learning_rates(optimizer)
                 print(
                     f"Resumed Stage 2 from {resume_path} at epoch={start_epoch}, "
-                    f"step={global_step}, best_task_success_rate={best_task_success_rate:.6f}"
+                    f"step={global_step}, best_task_success_rate={best_task_success_rate:.6f}, "
+                    f"lr_stage1={resumed_lrs['lr_stage1']:.2e}, lr_stage2={resumed_lrs['lr_stage2']:.2e}"
                 )
 
         if _is_main_process(rank):
@@ -915,26 +1518,41 @@ def train_stage2(
             train_iter = _progress(train_loader, show_progress, desc=f"stage2 train epoch {epoch}", total=len(train_loader))
             for batch in train_iter:
                 global_step += 1
+                log_every = int(cfg["training"].get("log_every", 20))
+                should_log = global_step % log_every == 0
                 batch = move_batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
-                outputs = model(batch)
-                losses = compute_stage2_loss(outputs, batch, cfg)
+                outputs = model(batch, collect_diagnostics=should_log)
+                losses = compute_stage2_loss(
+                    outputs,
+                    batch,
+                    cfg,
+                    compute_diagnostics=should_log,
+                )
                 losses["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(trainable_model.parameters(), float(cfg["training"].get("grad_clip_norm", 1.0)))
                 optimizer.step()
 
-                if show_progress:
+                if show_progress and global_step % 20 == 0:
                     train_iter.set_postfix(loss=f"{float(losses['loss'].detach().cpu()):.4f}", step=global_step)
 
-                if _is_main_process(rank) and global_step % int(cfg["training"].get("log_every", 20)) == 0:
-                    log_payload = {
-                        "split": "train",
-                        "epoch": epoch,
-                        "step": global_step,
-                        **{k: float(v.detach().cpu()) for k, v in losses.items()},
-                    }
-                    _append_jsonl(metrics_path, log_payload)
-                    print(json.dumps(log_payload, ensure_ascii=False))
+                if should_log:
+                    log_values = {key: value.detach().float().clone() for key, value in losses.items()}
+                    if distributed:
+                        for key, value in log_values.items():
+                            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+                            if not key.endswith("_count"):
+                                value.div_(world_size)
+                    if _is_main_process(rank):
+                        log_payload = {
+                            "split": "train",
+                            "epoch": epoch,
+                            "step": global_step,
+                            **{key: float(value.cpu()) for key, value in log_values.items()},
+                            **_optimizer_learning_rates(optimizer),
+                        }
+                        _append_jsonl(metrics_path, log_payload)
+                        print(_format_stage2_log(log_payload))
 
                 if max_steps is not None and global_step >= int(max_steps):
                     break
@@ -948,23 +1566,34 @@ def train_stage2(
                 show_progress=show_progress,
                 distributed=distributed,
             )
+            epoch_lrs = _optimizer_learning_rates(optimizer)
+            current_success_rate = val_metrics.get("task_success_rate", -math.inf)
+            is_best = current_success_rate > best_task_success_rate
+            if is_best:
+                best_task_success_rate = current_success_rate
+            scheduler.step(current_success_rate)
             if _is_main_process(rank):
-                val_payload = {"split": "valid", "epoch": epoch, "step": global_step, **val_metrics}
+                val_payload = {
+                    "split": "valid",
+                    "epoch": epoch,
+                    "step": global_step,
+                    **val_metrics,
+                    **epoch_lrs,
+                }
                 _append_jsonl(metrics_path, val_payload)
-                print(json.dumps(val_payload, ensure_ascii=False))
+                print(_format_stage2_log(val_payload))
 
                 checkpoint = {
                     "model": trainable_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
                     "epoch": epoch,
                     "step": global_step,
                     "best_task_success_rate": best_task_success_rate,
+                    **_optimizer_learning_rates(optimizer),
                     "config": cfg,
                 }
-                current_success_rate = val_metrics.get("task_success_rate", -math.inf)
-                if current_success_rate > best_task_success_rate:
-                    best_task_success_rate = current_success_rate
-                    checkpoint["best_task_success_rate"] = best_task_success_rate
+                if is_best:
                     torch.save(checkpoint, output_dir / "best.pt")
                 torch.save(checkpoint, output_dir / "last.pt")
 
@@ -979,7 +1608,7 @@ def train_stage2(
 
 @torch.no_grad()
 def evaluate_stage2(
-    model: LCBGPlaceNetDensePlacement | DistributedDataParallel,
+    model: SPACEFormerStage2 | DistributedDataParallel,
     loader: DataLoader,
     cfg: dict[str, Any],
     device: torch.device,
@@ -995,34 +1624,82 @@ def evaluate_stage2(
         "direction_hit_sum": 0.0,
         "collision_free_sum": 0.0,
         "size_iou_sum": 0.0,
-        "yaw_error_deg_sum": 0.0,
-        "yaw_sensitive_count": 0.0,
         "task_success_sum": 0.0,
+        "task_success_top5_sum": 0.0,
+        "yaw_bin_valid_at_1_sum": 0.0,
+        "valid_pose_count": 0.0,
+        "emitted_pose_count": 0.0,
+        "duplicate_pair_count": 0.0,
+        "possible_pair_count": 0.0,
+        "source_center_mae_sum": 0.0,
+        "source_size_iou_sum": 0.0,
+        "source_box_iou_sum": 0.0,
+        "p3_gt_point_coverage_sum": 0.0,
     }
+    validation_log_sums: dict[str, float] = {}
     val_iter = _progress(loader, show_progress, desc="stage2 valid", total=len(loader))
     for batch in val_iter:
         batch["validation_contexts"] = [validation_contexts[item_id] for item_id in batch["item_ids"]]
         batch = move_batch_to_device(batch, device)
-        outputs = model(batch)
+        outputs = model(batch, collect_diagnostics=True)
         losses = compute_stage2_loss(outputs, batch, cfg)
         metric_sums = compute_stage2_task_metric_sums(outputs, batch, cfg)
         totals["loss_sum"] += float(losses["loss"].detach().cpu()) * metric_sums["sample_count"]
+        totals["p3_gt_point_coverage_sum"] += (
+            float(losses["p3_gt_point_coverage"].detach().cpu()) * metric_sums["sample_count"]
+        )
         for key, value in metric_sums.items():
             totals[key] += value
+        for key, value in losses.items():
+            if key in {"valid_query_count", "padded_query_count", "region_selected_cell_count", "expanded_p1_candidate_count"} or (
+                key.startswith("layer") and key.endswith("_count")
+            ):
+                validation_log_sums[key] = validation_log_sums.get(key, 0.0) + float(value.detach().cpu())
 
     if distributed:
         keys = list(totals)
         values = torch.tensor([totals[key] for key in keys], dtype=torch.float64, device=device)
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
         totals = {key: float(value.cpu()) for key, value in zip(keys, values)}
+        log_keys = sorted(validation_log_sums)
+        if log_keys:
+            log_values = torch.tensor(
+                [validation_log_sums[key] for key in log_keys], dtype=torch.float64, device=device
+            )
+            dist.all_reduce(log_values, op=dist.ReduceOp.SUM)
+            validation_log_sums = {
+                key: float(value.cpu()) for key, value in zip(log_keys, log_values)
+            }
 
     sample_count = max(totals["sample_count"], 1.0)
-    yaw_count = max(totals["yaw_sensitive_count"], 1.0)
-    return {
+    emitted_pose_count = max(totals["emitted_pose_count"], 1.0)
+    possible_pair_count = max(totals["possible_pair_count"], 1.0)
+    metrics = {
         "loss": totals["loss_sum"] / sample_count,
         "direction_hit_rate": totals["direction_hit_sum"] / sample_count,
         "collision_free_rate": totals["collision_free_sum"] / sample_count,
         "size_iou": totals["size_iou_sum"] / sample_count,
-        "yaw_error_deg": totals["yaw_error_deg_sum"] / yaw_count,
         "task_success_rate": totals["task_success_sum"] / sample_count,
+        "task_success_top5": totals["task_success_top5_sum"] / sample_count,
+        "yaw_bin_valid_at_1": totals["yaw_bin_valid_at_1_sum"] / sample_count,
+        "valid_pose_rate": totals["valid_pose_count"] / emitted_pose_count,
+        "duplicate_pair_rate": totals["duplicate_pair_count"] / possible_pair_count,
+        "source_center_mae": totals["source_center_mae_sum"] / sample_count,
+        "source_size_iou": totals["source_size_iou_sum"] / sample_count,
+        "source_box_iou": totals["source_box_iou_sum"] / sample_count,
+        "p3_gt_point_coverage": totals["p3_gt_point_coverage_sum"] / sample_count,
     }
+    sampling_metrics = dict(validation_log_sums)
+    for key, value in validation_log_sums.items():
+        denominator_key = None
+        if key.endswith("_sample_active_count") or key.endswith("_sample_feature_nonzero_count"):
+            denominator_key = key.rsplit("_sample_", 1)[0] + "_sample_total_count"
+        elif key.endswith("_bottom_active_count") or key.endswith("_nonbottom_active_count"):
+            denominator_key = key.replace("_active_count", "_sample_count")
+        elif key.endswith("_all_zero_sample_query_count"):
+            denominator_key = "valid_query_count"
+        if denominator_key is not None:
+            denominator = max(validation_log_sums.get(denominator_key, 0.0), 1.0)
+            sampling_metrics[key.replace("_count", "_ratio")] = value / denominator
+    metrics.update({f"sampling/{key}": value for key, value in sampling_metrics.items()})
+    return metrics

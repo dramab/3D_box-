@@ -1,8 +1,6 @@
 data:
   # 输入 active 点云的体素大小，单位为厘米；应与 point_clouds_voxel_1cm 保持一致。
   voxel_size_cm: 1.0
-  # dense heatmap 高斯半径，单位为 voxel 数。
-  heatmap_sigma_voxels: 2.0
   # 复用 Stage 1 固定 train/valid/test 划分文件。
   split_dir: data/splits/lc_bgplacenet_stage1
   valid_fraction: 0.1
@@ -52,25 +50,21 @@ model:
     num_heads: 8
     num_layers: 4
     dropout: 0.1
-  placement:
+  space_former:
+    voxel_size_cm: 1.0
+    num_heads: 8
     dropout: 0.1
-    # Dense Placement Fusion 后使用 spconv sparse neck 聚合局部体素上下文。
-    neck_num_blocks: 4
-    use_source_center: false
-    heatmap_loss: focal
-    size_refinement: exp_residual
-    yaw_repr: sincos
-    yaw_sensitive_ratio: 0.25
-    near_square_yaw: random
+    # P3 hard proposal 保留得分最高的 8 个区域，再展开为固定 32 个 Query。
+    num_region_cells: 8
 
 loss:
-  lambda_heat: 1.0
-  lambda_center: 1.0
-  lambda_size: 1.0
-  lambda_yaw: 0.5
-  lambda_src: 0.2
-  heatmap_loss: focal
-  yaw_sensitive_ratio: 0.25
+  lambda_region: 300.0
+  lambda_cls: 1.0
+  lambda_center: 2.0
+  lambda_yaw: 1.0
+  lambda_corner: 0.5
+  lambda_src: 0.5
+  lambda_aux: 0.1
   focal:
     alpha: 0.25
     gamma: 2.0
@@ -80,21 +74,28 @@ loss:
     lambda_iou: 0.2
 
 validation:
-  # task_success = direction_hit AND collision_free AND size_iou >= threshold；yaw 仅单独统计。
   size_iou_threshold: 0.8
 
 training:
-  output_dir: outputs/lc_bgplacenet_stage2_clip16
+  output_dir: outputs/lc_bgplacenet_stage2_clip16_data_yaw
   # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
-  stage1_pretrained_checkpoint: /data/limengfei/xingqunqi/3D_box-/outputs/lc_bgplacenet_stage1_clip16/best.pt
+  stage1_pretrained_checkpoint:
   device: auto
   seed: 20260624
   epochs: 45
-  batch_size: 8
+  batch_size: 12
   num_workers: 8
   pin_memory: true
   progress_bar: true
-  lr: 0.0001
+  lr: 0.00001
+  # Stage 1 参数组自动使用主学习率的 0.1 倍。
+  lr_scheduler:
+    type: reduce_on_plateau
+    mode: max
+    factor: 0.5
+    patience: 3
+    threshold: 0.001
+    threshold_mode: abs
   weight_decay: 0.01
   grad_clip_norm: 1.0
-  log_every: 100
+  log_every: 300

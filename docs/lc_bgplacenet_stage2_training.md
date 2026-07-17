@@ -1,38 +1,67 @@
-# LC-BGPlaceNet Stage 2 训练说明
+# SPACE-Former Stage 2 训练说明
 
-Stage 2 实现 `LC-BGPlaceNet-DPF`：保留 Stage 1 source grounding，并在所有 active voxel 上预测 source-conditioned dense placement field。
+Stage 2 使用 `SPACE-Former`（Size-Prompted Affordance and Collision Explorer）完成有界集合预测。模型复用并联合训练 Stage 1 的 Backbone、语言融合与 Source Grounding；CLIP 延续配置中的冻结状态。
 
-Dense Placement Fusion 会先融合 voxel-language feature、坐标编码和 source condition，然后经过 spconv sparse neck 聚合局部体素上下文，再输出 heatmap、bottom offset、yaw 和 size residual。
+## 数据与监督
 
-## 输入监督
+每条训练样本读取：
 
-训练样本来自 `configs/lc_bgplacenet_stage2.yaml` 中的数据源：
+- `point_clouds_voxel_1cm/*.ply`：1 cm active voxel 点云。
+- canonical `samples/*.json`：RGB、相机参数和 Source GT。
+- `direction_filtered_heatmaps/*__heatmap.ply`：当前语言方向过滤后的合法底面中心。
+- `yaw_sets/*__yaw_set.npz`：每个底面中心对应的 24-bin 多 yaw 集合。
+- auto-label：自然语言指令及关系参照物。
 
-- `point_clouds_voxel_1cm/*.ply`：active voxel 点云，字段为 `(x, y, z, r, g, b)`。
-- canonical `samples/*.json` 中的 `rgb_path` 与 `camera`：用于复用 Stage 1 输入端的
-  CLIP ViT-B/16 2D->3D splat 特征；224 输入下对应 14x14=196 个 patch token，
-  Stage 2 不再新增单独的图像融合分支。
-- `outputs/auto_labels_*/all_labels.json`：语言指令、`sample_id`、`object_id` 和 `cluster_id`。
-- `outputs/free_bbox_*/placements/*.json`：source box、place box、raw heatmap 和 support mask 路径。
-- `outputs/free_bbox_*/direction_filtered_heatmaps/*.ply`：只用于训练的方向过滤 heatmap。
-- `outputs/free_bbox_*/support_masks/*.ply`：只用于将 dense heatmap label 限制在支撑区域内。
+数据集先按 1 cm world coordinate 对齐方向过滤正点和 yaw set，只保留二者交集。24 个 yaw bin 通过 `mask[:12] OR mask[12:]` 合并为 12 个 180° 等价 bin。GT 中心超过 32 个时使用空间 FPS；不足时由 `gt_valid_mask` padding。
 
-`place_box_gt` 使用 free_bbox placement 中的 `center_world`、`yaw_only_dimensions` 和 `yaw_degrees` 构造，格式为 `(x, y, z, dx, dy, dz, yaw)`。
+canonical world 必须满足：
 
-## 训练
+```text
+world-Z = 支撑面法向 / 重力上方向
+```
 
-配置文件不默认绑定 Stage 1 checkpoint，需要通过命令行显式传入：
+## 固定模型规模
 
-`model.placement.neck_num_blocks` 控制 Dense Placement Fusion 后的 spconv sparse neck 深度，默认使用 2 个同分辨率 residual SubMConv block，保持 active voxel 顺序与数量不变。
+```text
+P1/P2/P3 stride  = 1/2/4
+P3 cell          = 4 cm × 4 cm = 16 cm²
+coarse top cells = 8（约 128 cm²，不要求连续）
+queries          = 32
+samples/query    = 64 × 3 scales × 4 layers
+feature_dim      = 256
+yaw_bins         = 12
+max output       = 16
+```
 
-Stage 2 的 `model.backbone.in_channels` 需要与 Stage 1 一致；当前为 `70`，
-即原始 6 维点特征加 64 维 CLIP splat 特征。旧 Stage 1 checkpoint 中形状不匹配的
-文本编码器参数或 6 通道 backbone 第一层参数会在初始化时跳过。
+P3 粗区域预测仅使用 P3 feature 和 `text_global`。`space_former.num_region_cells` 控制 hard top-K，当前 top-8 P3 cell 展开到其覆盖的 P1 active voxel 后，最多 FPS 采样 32 个 Anchor；候选不足时不扩区，padding Query 由 `query_valid_mask` 屏蔽。
+
+第 0 个 Decoder 层使用 64 点外接圆柱模板；后 3 层使用上一层 yaw 构建 64 点定向 Box Surface。P1/P2/P3 均执行最近 active sparse voxel hash lookup。未命中的零特征 token 不会被 Attention 删除，其 `sample_valid_mask=0` 仍携带“踩空/净空”含义。
+
+## 损失与优化
+
+总损失为：
+
+```text
+L = 2 L_region + 2 L_cls + 5 L_center + 2 L_yaw
+    + L_corner + L_source + 0.5 L_aux
+
+L_source = 2 L_source-center + 1.5 L_source-size + 0.2 L_source-IoU
+```
+
+匹配代价为 `2 C_cls + 5 C_center + 2 C_yaw-bin + C_corner`。Yaw 使用 12 维 multi-hot `BCEWithLogits`，角点项在 GT 的全部有效 yaw 中取最小值。
+
+Stage 1 参数组使用 `training.lr × 0.1`，SPACE-Former 使用完整 `training.lr`。`ReduceLROnPlateau(mode=max)` 监控 validation `task_success_rate`，绝对提升不足 `0.001` 连续停滞超过 3 个 epoch 后将两个参数组学习率同时乘以 `0.5`。最佳 checkpoint 仅按 validation 的 top-1 `task_success_rate` 保存，不设置 Source IoU 门槛。该指标与推理最终采用的位姿一致，成功条件为尺寸 IoU ≥ 0.8、满足文本空间方向关系且与场景已有物体无碰撞。
+
+训练保持 FP32。P1/P2/P3 的 sparse lookup 排序索引在一次 forward 内由四层 Decoder 复用；训练不执行 pose NMS，采样诊断仅在日志 step 计算；每个 batch 的 Hungarian 代价只进行一次 GPU→CPU 传输，仍使用 SciPy 精确匹配。进度条最多每 20 step 同步一次 loss。
+
+## 运行
+
+单卡训练：
 
 ```bash
 python tools/train_lc_bgplacenet_stage2.py \
   --config configs/lc_bgplacenet_stage2.yaml \
-  --stage1-checkpoint outputs/lc_bgplacenet_stage1_support/best.pt
+  --stage1-checkpoint outputs/lc_bgplacenet_stage1_clip16/best.pt
 ```
 
 多卡训练：
@@ -40,15 +69,14 @@ python tools/train_lc_bgplacenet_stage2.py \
 ```bash
 torchrun --nproc_per_node=4 tools/train_lc_bgplacenet_stage2.py \
   --config configs/lc_bgplacenet_stage2.yaml \
-  --stage1-checkpoint outputs/lc_bgplacenet_stage1_support/best.pt
+  --stage1-checkpoint outputs/lc_bgplacenet_stage1_clip16/best.pt
 ```
 
-快速 smoke test：
+快速检查：
 
 ```bash
 python tools/train_lc_bgplacenet_stage2.py \
   --config configs/lc_bgplacenet_stage2.yaml \
-  --stage1-checkpoint outputs/lc_bgplacenet_stage1_support/best.pt \
   --max-steps 2 --max-train-samples 4 --max-val-samples 2
 ```
 
@@ -57,116 +85,38 @@ python tools/train_lc_bgplacenet_stage2.py \
 ```bash
 python tools/train_lc_bgplacenet_stage2.py \
   --config configs/lc_bgplacenet_stage2.yaml \
-  --resume outputs/lc_bgplacenet_stage2/last.pt
+  --resume outputs/lc_bgplacenet_stage2_clip16/last.pt
 ```
 
-## Validation 指标
+`training.epochs` 表示总 epoch 上限，而非恢复后追加的 epoch 数。checkpoint 中的模型、AdamW moments 和 scheduler 历史会恢复；旧 checkpoint 没有 scheduler state 时，以 `best_task_success_rate` 初始化平台基线。随后始终由当前配置的 `training.lr` 覆盖 checkpoint 学习率，并保持 Stage 1/Stage 2 为 `0.1:1`。例如恢复已完成 epoch 54 的 checkpoint，若要继续训练，必须将 `training.epochs` 设置为大于 55。
 
-每轮 validation 保留总 `loss`，并记录以下任务指标：
+## 日志与验证
 
-- `direction_hit_rate`：预测 place box 是否满足指令目标方位。
-- `collision_free_rate`：预测 OBB 是否与任一场景物体 OBB 发生正体积相交。
-- `size_iou`：预测与 GT 三个尺寸分量的体积 IoU 均值。
-- `yaw_error_deg`：仅在 `loss.yaw_sensitive_ratio` 判定为 yaw-sensitive 的样本上统计，按 180° 等价计算平均角度误差。
-- `task_success_rate`：`direction_hit AND collision_free AND size_iou >= validation.size_iou_threshold`，不包含 yaw 条件。
+`metrics.jsonl` 每个 `log_every` 和 validation epoch 记录：粗区域选择数、P1 候选数、有效/填充 Query 数，以及逐层逐尺度的采样总数、active 数、非零特征数、bottom/non-bottom 命中数和全零 Query 数。每个 epoch 同时记录 `lr_stage1` 与 `lr_stage2`，checkpoint 保存 scheduler state 和调度后的两组学习率。日志均为 detached 聚合值，DDP validation 使用 all-reduce 汇总。终端仅显示 loss、核心子损失和主要验证指标的单行摘要，完整诊断字段仍保存在 `metrics.jsonl`。
 
-方向参照物来自 auto-label 的 `spatial_relation.placement`，相机和场景 OBB 只为 valid split 预加载并缓存。`best.pt` 按 `task_success_rate` 最高保存，`validation.size_iou_threshold` 默认是 `0.8`。
+主要验证指标包括：
+
+- `task_success_rate`、`task_success_top5`，分别统计 top-1 和前 5 个候选中的任务成功率。
+- `valid_pose_rate`、`duplicate_pair_rate`。
+- `direction_hit_rate`、`collision_free_rate`、`size_iou`。
+- `p3_gt_point_coverage`：每条样本 direction-positive GT 点落入实际 top-8 P3 cell 的比例，再对验证样本宏平均。
+- `source_center_mae`、`source_size_iou`。
 
 ## 推理
-
-推理阶段需要点云、RGB、camera 和语言指令，不读取 direction-filtered heatmap 或 support mask：
 
 ```bash
 python tools/infer_lc_bgplacenet_stage2.py \
   --config configs/lc_bgplacenet_stage2.yaml \
-  --checkpoint outputs/lc_bgplacenet_stage2/best.pt \
+  --checkpoint outputs/lc_bgplacenet_stage2_clip16/best.pt \
   --split valid --max-samples 20
 ```
 
-输出目录默认为 `outputs/lc_bgplacenet_stage2/inference_stage2_<split>`，包含：
+`predictions.json` 中 `place_box` 保留 top-1 兼容字段，`placements` 保存最多 16 个 `{box, score, yaw_bin}`。`pred_heatmaps/*.ply` 现在可视化 P3 粗区域概率，而非旧版 dense placement heatmap。
 
-- `predictions.json`：每个样本的 `source_box`、`place_box` 和最高 heatmap 分数。
-- `*.png`：RGB 投影可视化，包含预测 source box、预测 place box 和 GT place box。
-- `pred_heatmaps/*.ply`：每个样本 active voxel 的预测 placement heatmap，颜色从蓝、青、黄到红表示单样本内相对热度由低到高。
-
-将推理 PNG、预测 heatmap 和输入指令导出为白底缩略图网页：
+## 测试
 
 ```bash
-python tools/export_lc_bgplacenet_stage2_inference_web.py \
-    --config configs/lc_bgplacenet_stage2.yaml \
-    --input-dir outputs/lc_bgplacenet_stage2/inference_stage2_test \
-    --split test
+pytest -q tests/test_lc_bgplacenet_stage2.py
 ```
 
-生成的 `index.html` 支持搜索、随机打乱样本顺序，以及点击样本卡片放大查看预测图和 heatmap。
-
-## Test Benchmark
-
-读取 test split 的 `predictions.json`，评估 size 体积 IoU、auto-label 语义方位命中率、场景物体 3D box 碰撞率、yaw 误差和联合 task success。
-
-先为固定 split 生成语义方位 metadata。脚本会从 instruction 的 `to ...` 目标短语解析目标关系和参照物名称，再用 GT placement 与 `auto_label.describe_spatial_relation` 规则反解唯一参照物 id：
-
-```bash
-python tools/generate_lc_bgplacenet_stage2_direction_metadata.py \
-  --config configs/lc_bgplacenet_stage2.yaml \
-  --split test \
-  --output outputs/lc_bgplacenet_stage2/direction_metadata_test.json
-```
-
-然后运行 benchmark：
-
-```bash
-python tools/benchmark_lc_bgplacenet_stage2.py \
-  --config configs/lc_bgplacenet_stage2.yaml \
-  --predictions outputs/lc_bgplacenet_stage2/inference_stage2_test/predictions.json \
-  --direction-metadata outputs/lc_bgplacenet_stage2/direction_metadata_test.json \
-  --split test \
-  --output-dir outputs/lc_bgplacenet_stage2/benchmark_stage2_test
-```
-
-输出包含 `benchmark_metrics.json` 和 `per_sample_metrics.jsonl`。`direction_hit_rate` 表示预测 place box 相对 metadata 指定参照物的 `describe_spatial_relation` 结果是否等于 instruction 目标关系；碰撞检测会把预测 3D box 与场景中所有已知物体 3D box 做 OBB 相交判断；`--size-iou-threshold` 默认 0.8，可按 benchmark 口径调整。
-
-逐样本结果额外记录 `task_success`、`yaw_sensitive` 和 `yaw_error_deg`；非 yaw-sensitive 样本的 `yaw_error_deg` 为 `null`。overall 和 by-source 汇总包含 `task_success_rate`、`yaw_sensitive_sample_count`，以及 yaw 误差的 mean/median。计算口径与 validation 一致：
-
-```text
-task_success = direction_hit AND collision_free AND size_correct
-```
-
-yaw 不参与 `task_success`，并按 180° 等价计算角度误差。
-
-导出静态 benchmark 可视化网页：
-
-```bash
-python tools/export_lc_bgplacenet_stage2_benchmark_web.py \
-  --config configs/lc_bgplacenet_stage2.yaml \
-  --input-dir outputs/lc_bgplacenet_stage2/inference_stage2_test \
-  --benchmark-dir outputs/lc_bgplacenet_stage2/benchmark_stage2_test \
-  --split test
-```
-
-输出默认为 `outputs/lc_bgplacenet_stage2/benchmark_stage2_test/web_vis/index.html`。网页包含预测 / GT 投影、XY 俯视诊断图、direction/size/collision 状态，以及按错误类型筛选和排序的控件。
-
-## 监督可视化
-
-只导出 train split 的 Stage 2 监督可视化：
-
-```bash
-python tools/export_lc_bgplacenet_stage2_supervision_vis.py \
-  --config configs/lc_bgplacenet_stage2.yaml
-```
-
-输出目录默认为 `outputs/lc_bgplacenet_stage2/supervision_vis`，包含：
-
-- `rgb_boxes/*.png`：`source_box_gt` 和 `place_box_gt` 的 RGB 投影可视化。
-- `gaussian_heatmaps/*.ply`：训练时使用的 support-limited Gaussian heatmap target，半径来自 `data.heatmap_sigma_voxels * data.voxel_size_cm`。
-- `index.json`：每个导出样本对应的输入监督路径、输出可视化路径和 box 数值。
-
-## 坐标规范
-
-Stage 2 的底面中心到几何中心转换依赖 canonical world 满足：
-
-```text
-world-Z = 支撑面法向/重力上方向
-```
-
-如果新增或修改数据集转换脚本，需要继续在转换阶段保证该规范，并在 preprocess 中记录坐标规范化信息。
+测试覆盖 top-8 区域展开及不足 8 个 cell、P3 GT 覆盖率宏平均、Query padding、64 点模板、缓存 active lookup、Hungarian 匹配、训练 NMS 跳过、学习率恢复与平台衰减、多 yaw 合并、集合输出和 Source 联合反向传播。
