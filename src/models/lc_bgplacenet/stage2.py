@@ -276,14 +276,16 @@ class RegionCrossBlock(nn.Module):
 class TextGuidedRegionPredictor(nn.Module):
     """Predict coarse regions from P3 and all valid text tokens."""
 
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float) -> None:
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float, num_layers: int) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
-        self.blocks = nn.ModuleList([RegionCrossBlock(hidden_dim, num_heads, dropout) for _ in range(2)])
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        self.blocks = nn.ModuleList([RegionCrossBlock(hidden_dim, num_heads, dropout) for _ in range(num_layers)])
         self.compat_query = nn.Linear(hidden_dim, hidden_dim)
         self.compat_key = nn.Linear(hidden_dim, hidden_dim)
         self.logit_mlp = nn.Sequential(
@@ -858,7 +860,12 @@ class SPACEFormerStage2(nn.Module):
         dropout = float(space_cfg.get("dropout", 0.1))
         self.voxel_size_cm = float(space_cfg.get("voxel_size_cm", 1.0))
         self.pyramid = SparseFeaturePyramid(hidden_dim)
-        self.region_predictor = TextGuidedRegionPredictor(hidden_dim, num_heads, dropout)
+        self.region_predictor = TextGuidedRegionPredictor(
+            hidden_dim,
+            num_heads,
+            dropout,
+            num_layers=int(space_cfg["region_cross_num_layers"]),
+        )
         self.anchor_generator = BoundedAnchorGenerator(
             hidden_dim,
             num_region_cells=int(space_cfg.get("num_region_cells", 8)),

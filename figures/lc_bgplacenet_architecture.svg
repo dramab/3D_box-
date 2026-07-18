@@ -1381,7 +1381,7 @@ z
    </g>
    <g id="text_55">
     <text style="font-size: 8.2px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(512.502931 624.238611)">text_global(Q) ↔ P3(K/V)</text>
-    <text style="font-size: 8.2px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(518.7439 634.44697)">2-layer Cross Encoder</text>
+    <text style="font-size: 8.2px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(518.7439 634.44697)">4-layer Cross Encoder</text>
    </g>
    <g id="text_56">
     <text style="font-weight: 700; font-size: 10.5px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; text-anchor: middle; fill: #17324d" x="724.896" y="604.489636" transform="rotate(-0 724.896 604.489636)">Top-8</text>

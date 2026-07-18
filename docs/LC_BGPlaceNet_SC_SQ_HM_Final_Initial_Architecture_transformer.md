@@ -9,7 +9,7 @@ Stage 1 language-fused active voxels F_vl
         │
         ├─ Sparse Pyramid: P1(1 cm), P2(2 cm), P3(4 cm)
         │
-text_tokens ──> 2-layer Region Cross Encoder ──> top-8 P3 cells
+text_tokens ──> 4-layer Region Cross Encoder ──> top-8 P3 cells
                                                        │
                                       expand to covered P1 active voxels
                                                        │
@@ -25,7 +25,7 @@ Source Grounding 同时输出 `source_box` 与 `source_feature`。Source Size �
 
 ## 2. Text-Guided Region Cross Encoder
 
-P3 feature 是 K/V，所有有效 `text_tokens` 是 Q。两层均使用 8-head Cross-Attention 和 `256→1024→256` FFN。更新后的每个文本 token 与每个 P3 feature 做逐 head compatibility，再沿 token 维使用带 attention mask 的 log-mean-exp 聚合，使方向词和对象词的强匹配不会被平均稀释：
+P3 feature 是 K/V，所有有效 `text_tokens` 是 Q。Cross Block 层数由 `model.space_former.region_cross_num_layers` 定义，当前为四层；每层均使用 8-head Cross-Attention 和 `256→1024→256` FFN。更新后的每个文本 token 与每个 P3 feature 做逐 head compatibility，再沿 token 维使用带 attention mask 的 log-mean-exp 聚合，使方向词和对象词的强匹配不会被平均稀释：
 
 ```text
 a_ij = mean_h((Wq_h t_j) · (Wk_h f_i) / sqrt(32))

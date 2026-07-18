@@ -54,6 +54,8 @@ model:
     voxel_size_cm: 1.0
     num_heads: 8
     dropout: 0.1
+    # Text-Guided Region Cross Encoder 的 Cross Block 层数。
+    region_cross_num_layers: 4
     # P3 hard proposal 保留得分最高的 8 个区域，再展开为固定 32 个 Query。
     num_region_cells: 8
 

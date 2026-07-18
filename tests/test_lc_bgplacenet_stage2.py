@@ -7,6 +7,7 @@ import math
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
@@ -405,7 +406,8 @@ def test_p3_gt_point_coverage_is_macro_average_and_handles_short_topk() -> None:
 
 
 def test_region_predictor_uses_all_valid_text_tokens_and_masks_padding() -> None:
-    predictor = TextGuidedRegionPredictor(hidden_dim=8, num_heads=2, dropout=0.0)
+    predictor = TextGuidedRegionPredictor(hidden_dim=8, num_heads=2, dropout=0.0, num_layers=4)
+    assert len(predictor.blocks) == 4
     p3_features = torch.randn(2, 8)
     text_tokens = torch.randn(1, 3, 8, requires_grad=True)
     logits, _ = predictor(
@@ -421,6 +423,11 @@ def test_region_predictor_uses_all_valid_text_tokens_and_masks_padding() -> None
     assert torch.count_nonzero(text_tokens.grad[0, 0]) > 0
     assert torch.count_nonzero(text_tokens.grad[0, 1]) > 0
     torch.testing.assert_close(text_tokens.grad[0, 2], torch.zeros(8))
+
+
+def test_region_predictor_rejects_non_positive_num_layers() -> None:
+    with pytest.raises(ValueError, match="num_layers must be positive"):
+        TextGuidedRegionPredictor(hidden_dim=8, num_heads=2, dropout=0.0, num_layers=0)
 
 
 def test_region_gaussian_target_uses_direction_filtered_positive_points() -> None:

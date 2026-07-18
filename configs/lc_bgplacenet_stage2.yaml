@@ -56,11 +56,13 @@ model:
     voxel_size_cm: 1.0
     num_heads: 8
     dropout: 0.1
+    # Text-Guided Region Cross Encoder 的 Cross Block 层数。
+    region_cross_num_layers: 4
     # P3 hard proposal 保留得分最高的 8 个区域，再展开为固定 32 个 Query。
     num_region_cells: 8
 
 loss:
-  lambda_region: 300.0
+  lambda_region: 500.0
   lambda_cls: 1.0
   lambda_center: 2.0
   lambda_yaw: 1.0
@@ -79,7 +81,7 @@ validation:
   size_iou_threshold: 0.8
 
 training:
-  output_dir: outputs/lc_bgplacenet_stage2_clip16_data_yaw_guss
+  output_dir: outputs/lc_bgplacenet_stage2_clip16_data_yaw_guss_cross8
   # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
   stage1_pretrained_checkpoint:
   device: auto
