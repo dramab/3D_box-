@@ -33,7 +33,7 @@ yaw_bins         = 12
 max output       = 16
 ```
 
-P3 粗区域预测仅使用 P3 feature 和 `text_global`。`space_former.num_region_cells` 控制 hard top-K，当前 top-8 P3 cell 展开到其覆盖的 P1 active voxel 后，最多 FPS 采样 32 个 Anchor；候选不足时不扩区，padding Query 由 `query_valid_mask` 屏蔽。
+P3 粗区域预测使用 P3 feature 和完整 `text_tokens`。每个有效 token 先查询 P3 memory，再与各 P3 cell 计算 compatibility，并通过带 attention mask 的 log-mean-exp 聚合，使方向词和对象词的强匹配能够主导区域分数。Region target 由 `direction_filtered_heatmaps` 正点生成三维高斯分布，标准差为 `data.heatmap_sigma_voxels × data.voxel_size_cm`。`space_former.num_region_cells` 控制 hard top-K，当前 top-8 P3 cell 展开到其覆盖的 P1 active voxel 后，最多 FPS 采样 32 个 Anchor；候选不足时不扩区，padding Query 由 `query_valid_mask` 屏蔽。
 
 第 0 个 Decoder 层使用 64 点外接圆柱模板；后 3 层使用上一层 yaw 构建 64 点定向 Box Surface。P1/P2/P3 均执行最近 active sparse voxel hash lookup。未命中的零特征 token 不会被 Attention 删除，其 `sample_valid_mask=0` 仍携带“踩空/净空”含义。
 

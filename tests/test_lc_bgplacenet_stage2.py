@@ -19,6 +19,7 @@ from src.models.lc_bgplacenet.stage2 import (
     NUM_SAMPLES,
     NUM_YAW_BINS,
     SPACEFormerDecoder,
+    TextGuidedRegionPredictor,
     build_box_surface_template,
     build_cylinder_template,
     fold_yaw_mask_24_to_12,
@@ -36,6 +37,7 @@ from src.training.lc_bgplacenet_stage2 import (
     _optimizer_learning_rates,
     _override_optimizer_learning_rates,
     build_space_former_targets,
+    build_dense_heatmap_targets,
     build_stage2_index,
     compute_p3_gt_point_coverage,
     compute_stage2_loss,
@@ -402,6 +404,39 @@ def test_p3_gt_point_coverage_is_macro_average_and_handles_short_topk() -> None:
     torch.testing.assert_close(all_cells_coverage, torch.tensor(1.0))
 
 
+def test_region_predictor_uses_all_valid_text_tokens_and_masks_padding() -> None:
+    predictor = TextGuidedRegionPredictor(hidden_dim=8, num_heads=2, dropout=0.0)
+    p3_features = torch.randn(2, 8)
+    text_tokens = torch.randn(1, 3, 8, requires_grad=True)
+    logits, _ = predictor(
+        p3_features,
+        torch.zeros(2, dtype=torch.long),
+        text_tokens,
+        torch.tensor([[True, True, False]]),
+        batch_size=1,
+    )
+
+    logits.sum().backward()
+
+    assert torch.count_nonzero(text_tokens.grad[0, 0]) > 0
+    assert torch.count_nonzero(text_tokens.grad[0, 1]) > 0
+    torch.testing.assert_close(text_tokens.grad[0, 2], torch.zeros(8))
+
+
+def test_region_gaussian_target_uses_direction_filtered_positive_points() -> None:
+    targets = build_dense_heatmap_targets(
+        world_coords=torch.tensor([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]]),
+        batch_indices=torch.zeros(3, dtype=torch.long),
+        positive_points=torch.tensor([[0.0, 0.0, 0.0]]),
+        positive_batch_indices=torch.zeros(1, dtype=torch.long),
+        support_masks=torch.ones(3, dtype=torch.bool),
+        batch_size=1,
+        sigma=2.0,
+    )
+
+    torch.testing.assert_close(targets, torch.exp(torch.tensor([0.0, -0.5, -2.0])))
+
+
 def test_sample_token_is_261_dims_without_scale_or_occupancy_embedding() -> None:
     routing = GeometricRouting(hidden_dim=256, num_heads=8, dropout=0.0)
     for projector in routing.sample_projectors:
@@ -498,6 +533,8 @@ def test_space_former_loss_backpropagates_to_source_prediction() -> None:
     centers = torch.tensor([[[1.0, 0.0, 0.0], [3.0, 0.0, 0.0]]], requires_grad=True)
     outputs = {
         "region_sparse_coords": torch.tensor([[0, 0, 0, 0], [0, 1, 0, 0]]),
+        "region_world_coords": torch.tensor([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]]),
+        "region_batch_indices": torch.tensor([0, 0]),
         "region_logits": torch.zeros(2, requires_grad=True),
         "voxel_origins": torch.zeros(1, 3),
         "query_valid_mask": torch.tensor([[True, True]]),

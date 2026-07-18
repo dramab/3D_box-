@@ -1,6 +1,8 @@
 data:
   # 输入 active 点云的体素大小，单位为厘米；应与 point_clouds_voxel_1cm 保持一致。
   voxel_size_cm: 1.0
+  # direction-filtered 正点高斯监督的标准差，单位为输入 voxel 数。
+  heatmap_sigma_voxels: 2.0
   # 复用 Stage 1 固定 train/valid/test 划分文件。
   split_dir: data/splits/lc_bgplacenet_stage1
   valid_fraction: 0.1
@@ -77,7 +79,7 @@ validation:
   size_iou_threshold: 0.8
 
 training:
-  output_dir: outputs/lc_bgplacenet_stage2_clip16_data_yaw
+  output_dir: outputs/lc_bgplacenet_stage2_clip16_data_yaw_guss
   # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
   stage1_pretrained_checkpoint:
   device: auto
@@ -87,7 +89,7 @@ training:
   num_workers: 8
   pin_memory: true
   progress_bar: true
-  lr: 0.00001
+  lr: 0.0001
   # Stage 1 参数组自动使用主学习率的 0.1 倍。
   lr_scheduler:
     type: reduce_on_plateau

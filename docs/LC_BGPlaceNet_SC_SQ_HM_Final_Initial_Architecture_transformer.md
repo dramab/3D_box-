@@ -9,7 +9,7 @@ Stage 1 language-fused active voxels F_vl
         │
         ├─ Sparse Pyramid: P1(1 cm), P2(2 cm), P3(4 cm)
         │
-text_global ──> 2-layer Region Cross Encoder ──> top-8 P3 cells
+text_tokens ──> 2-layer Region Cross Encoder ──> top-8 P3 cells
                                                        │
                                       expand to covered P1 active voxels
                                                        │
@@ -25,14 +25,15 @@ Source Grounding 同时输出 `source_box` 与 `source_feature`。Source Size �
 
 ## 2. Text-Guided Region Cross Encoder
 
-P3 feature 是 K/V，`text_global` 是单个 Q。两层均使用 8-head Cross-Attention 和 `256→1024→256` FFN。更新后的文本 Query 与每个 P3 feature 做逐 head compatibility：
+P3 feature 是 K/V，所有有效 `text_tokens` 是 Q。两层均使用 8-head Cross-Attention 和 `256→1024→256` FFN。更新后的每个文本 token 与每个 P3 feature 做逐 head compatibility，再沿 token 维使用带 attention mask 的 log-mean-exp 聚合，使方向词和对象词的强匹配不会被平均稀释：
 
 ```text
-a_i = mean_h((Wq_h t) · (Wk_h f_i) / sqrt(32))
+a_ij = mean_h((Wq_h t_j) · (Wk_h f_i) / sqrt(32))
+a_i = logsumexp_j(a_ij) - log(number_of_valid_tokens)
 region_logit_i = a_i + MLP([f_i, a_i])
 ```
 
-Region GT 将方向过滤后的正中心量化到 P3，并执行同一 Z 层的 `3×3×1` XY 膨胀。推理按 `space_former.num_region_cells` 直接取每个样本 top-K，当前为 top-8，不设阈值。`p3_gt_point_coverage` 统计每条样本 direction-positive GT 点落入实际 top-8 cell 的比例，并进行样本宏平均。
+Region GT 直接在 P3 world coordinates 上，以 `direction_filtered_heatmaps` 正点为中心生成三维高斯 soft target；标准差由 `data.heatmap_sigma_voxels × data.voxel_size_cm` 唯一定义。推理按 `space_former.num_region_cells` 直接取每个样本 top-K，当前为 top-8，不设阈值。`p3_gt_point_coverage` 统计每条样本 direction-positive GT 点落入实际 top-8 cell 的比例，并进行样本宏平均。
 
 ## 3. Query
 

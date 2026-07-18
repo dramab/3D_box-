@@ -730,7 +730,7 @@ def build_dense_heatmap_targets(
     sigma: float,
     chunk_size: int = 4096,
 ) -> torch.Tensor:
-    """Build dense Gaussian heatmap targets and zero labels outside support."""
+    """Build Gaussian targets on supplied world coordinates and zero labels outside support."""
     targets = world_coords.new_zeros((world_coords.shape[0],))
     sigma2 = 2.0 * float(sigma) * float(sigma)
     for batch_idx in range(int(batch_size)):
@@ -776,42 +776,6 @@ def nearest_voxel_per_batch(
         dist2 = (coords[idx] - targets[batch_idx]).pow(2).sum(dim=1)
         indices.append(idx[torch.argmin(dist2)])
     return torch.stack(indices, dim=0)
-
-
-def build_coarse_region_targets(
-    region_coords: torch.Tensor,
-    region_logits: torch.Tensor,
-    voxel_origins: torch.Tensor,
-    positive_points: torch.Tensor,
-    positive_batch_indices: torch.Tensor,
-    voxel_size_cm: float,
-    batch_size: int,
-) -> torch.Tensor:
-    """Map positive centers to P3 and apply a same-Z 3x3x1 dilation."""
-    targets = region_logits.new_zeros(region_logits.shape)
-    spatial_shape = region_coords[:, 1:].amax(dim=0) + 1
-
-    def key(xyz: torch.Tensor) -> torch.Tensor:
-        return (xyz[:, 0] * spatial_shape[1] + xyz[:, 1]) * spatial_shape[2] + xyz[:, 2]
-
-    xy_offsets = torch.tensor(
-        [[x, y, 0] for x in (-1, 0, 1) for y in (-1, 0, 1)],
-        device=region_coords.device,
-        dtype=torch.long,
-    )
-    for batch_index in range(int(batch_size)):
-        region_idx = torch.nonzero(region_coords[:, 0] == batch_index, as_tuple=False).flatten()
-        positives = positive_points[positive_batch_indices == batch_index]
-        if len(region_idx) == 0 or len(positives) == 0:
-            continue
-        positive_coords = torch.floor(
-            (positives - voxel_origins[batch_index]) / (4.0 * float(voxel_size_cm))
-        ).long()
-        dilated = (positive_coords[:, None, :] + xy_offsets[None, :, :]).reshape(-1, 3)
-        in_bounds = ((dilated >= 0) & (dilated < spatial_shape)).all(dim=-1)
-        positive_keys = torch.unique(key(dilated[in_bounds]))
-        targets[region_idx] = torch.isin(key(region_coords[region_idx, 1:]), positive_keys).to(targets.dtype)
-    return targets
 
 
 def compute_p3_gt_point_coverage(
@@ -1077,14 +1041,17 @@ def compute_stage2_loss(
     """Compute SPACE-Former region, set-prediction and source losses."""
     loss_cfg = cfg["loss"]
     focal_cfg = loss_cfg.get("focal", {})
-    region_target = build_coarse_region_targets(
-        outputs["region_sparse_coords"],
-        outputs["region_logits"],
-        outputs["voxel_origins"],
-        batch["heatmap_positive_points"],
-        batch["heatmap_positive_batch_indices"],
-        float(cfg["data"]["voxel_size_cm"]),
-        int(batch["batch_size"]),
+    sigma = float(cfg["data"].get("heatmap_sigma_voxels", 2.0)) * float(
+        cfg["data"]["voxel_size_cm"]
+    )
+    region_target = build_dense_heatmap_targets(
+        world_coords=outputs["region_world_coords"],
+        batch_indices=outputs["region_batch_indices"],
+        positive_points=batch["heatmap_positive_points"],
+        positive_batch_indices=batch["heatmap_positive_batch_indices"],
+        support_masks=torch.ones_like(outputs["region_logits"], dtype=torch.bool),
+        batch_size=int(batch["batch_size"]),
+        sigma=sigma,
     )
     region_loss = focal_loss_with_logits(
         outputs["region_logits"],
@@ -1146,7 +1113,7 @@ def compute_stage2_loss(
         "loss_corner": corner_loss.detach(),
         "loss_aux": auxiliary.detach(),
         "loss_src": source_loss.detach(),
-        "region_positive_count": region_target.sum().detach(),
+        "region_target_mass": region_target.sum().detach(),
         "region_selected_cell_count": outputs["region_selected_cell_count"].sum().detach(),
         "expanded_p1_candidate_count": outputs["expanded_p1_candidate_count"].sum().detach(),
         "valid_query_count": outputs["query_valid_mask"].sum().detach(),

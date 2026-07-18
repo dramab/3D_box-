@@ -251,7 +251,7 @@ class SparseFeaturePyramid(nn.Module):
 
 
 class RegionCrossBlock(nn.Module):
-    """Update one text-global query by cross-attending to P3 memory."""
+    """Update text-token queries by cross-attending to P3 memory."""
 
     def __init__(self, hidden_dim: int, num_heads: int, dropout: float) -> None:
         super().__init__()
@@ -274,7 +274,7 @@ class RegionCrossBlock(nn.Module):
 
 
 class TextGuidedRegionPredictor(nn.Module):
-    """Predict top-level coarse regions from P3 and a text-global condition."""
+    """Predict coarse regions from P3 and all valid text tokens."""
 
     def __init__(self, hidden_dim: int, num_heads: int, dropout: float) -> None:
         super().__init__()
@@ -296,7 +296,8 @@ class TextGuidedRegionPredictor(nn.Module):
         self,
         p3_features: torch.Tensor,
         p3_batch_indices: torch.Tensor,
-        text_global: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_attention_mask: torch.Tensor,
         batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         counts = torch.bincount(p3_batch_indices, minlength=batch_size)
@@ -308,15 +309,24 @@ class TextGuidedRegionPredictor(nn.Module):
             memory[batch_index, : len(indices)] = p3_features[indices]
             padding_mask[batch_index, : len(indices)] = False
 
-        text_query = text_global.unsqueeze(1)
+        text_query = text_tokens
         for block in self.blocks:
             text_query = block(text_query, memory, padding_mask)
 
-        q = self.compat_query(text_query.squeeze(1)).reshape(batch_size, self.num_heads, self.head_dim)
+        q = self.compat_query(text_query).reshape(
+            batch_size, text_tokens.shape[1], self.num_heads, self.head_dim
+        )
         k = self.compat_key(p3_features).reshape(-1, self.num_heads, self.head_dim)
-        compatibility = (q[p3_batch_indices] * k).sum(dim=-1).mean(dim=-1) / math.sqrt(self.head_dim)
+        token_compatibility = (
+            (q[p3_batch_indices] * k[:, None]).sum(dim=-1).mean(dim=-1) / math.sqrt(self.head_dim)
+        )
+        valid_tokens = text_attention_mask[p3_batch_indices]
+        token_compatibility = token_compatibility.masked_fill(
+            ~valid_tokens, torch.finfo(token_compatibility.dtype).min
+        )
+        compatibility = torch.logsumexp(token_compatibility, dim=-1) - valid_tokens.sum(dim=-1).log()
         logits = compatibility + self.logit_mlp(torch.cat([p3_features, compatibility[:, None]], dim=-1)).squeeze(-1)
-        return logits, text_query.squeeze(1)
+        return logits, text_query
 
 
 class BoundedAnchorGenerator(nn.Module):
@@ -901,7 +911,11 @@ class SPACEFormerStage2(nn.Module):
             prepare_sparse_lookup_index(level)
         p3_batch_indices = pyramid[2]["coords"][:, 0]
         region_logits, _ = self.region_predictor(
-            pyramid[2]["features"], p3_batch_indices, text_global, batch_size
+            pyramid[2]["features"],
+            p3_batch_indices,
+            text_tokens,
+            text_attention_mask,
+            batch_size,
         )
         anchors = self.anchor_generator(
             pyramid[0],
