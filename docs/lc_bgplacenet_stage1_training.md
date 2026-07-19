@@ -32,8 +32,10 @@ Stage 1 数据索引只保留 `all_labels.json` 中 `visualization_png` 实际�
 ## 固定数据划分
 
 Stage 1 使用固定的 `train/valid/test` 清单，不在每次训练时重新随机划分。
-划分粒度是 `(source_name, sample_id)`，同一 canonical frame 下的所有物体和语言样本
-会落在同一个 split，避免同一帧同时出现在训练和验证/测试中。
+划分粒度是 `(source_name, scene_id)`，同一 canonical scene 下的所有帧、物体和语言样本
+会落在同一个 split，避免同一场景同时出现在训练和验证/测试中。场景作为不可拆分单元，
+按场景包含的语言条件 instance 数量加权分配，使 `train/valid/test` 的 instance 数量尽可能
+接近 `80%/10%/10%`；实际比例和相对目标的偏差记录在 `manifest.json`。
 
 首次生成：
 
@@ -45,7 +47,7 @@ python tools/generate_lc_bgplacenet_stage1_splits.py \
 默认输出：
 
 ```text
-data/splits/lc_bgplacenet_stage1/
+data/splits/scene_aligned/
   manifest.json
   train.json
   valid.json

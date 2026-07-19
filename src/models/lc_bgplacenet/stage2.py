@@ -406,6 +406,36 @@ class BoundedAnchorGenerator(nn.Module):
         }
 
 
+def aggregate_sparse_mask(
+    source_coords: torch.Tensor,
+    source_mask: torch.Tensor,
+    target_coords: torch.Tensor,
+    target_spatial_shape: list[int],
+    stride: int,
+) -> torch.Tensor:
+    """将 P1 active support 按整数 sparse key 聚合到目标尺度。"""
+    if source_mask.shape != (len(source_coords),):
+        raise ValueError("source_mask must align with source sparse coordinates")
+    shape = torch.as_tensor(target_spatial_shape, device=target_coords.device, dtype=torch.long)
+    source_coarse = torch.cat(
+        [
+            source_coords[:, :1].long(),
+            torch.div(source_coords[:, 1:].long(), int(stride), rounding_mode="floor"),
+        ],
+        dim=1,
+    )
+
+    def linear_key(coords: torch.Tensor) -> torch.Tensor:
+        return (
+            ((coords[:, 0] * shape[0] + coords[:, 1]) * shape[1] + coords[:, 2])
+            * shape[2]
+            + coords[:, 3]
+        )
+
+    support_keys = linear_key(source_coarse[source_mask])
+    return torch.isin(linear_key(target_coords.long()), support_keys)
+
+
 def prepare_sparse_lookup_index(level: dict[str, Any]) -> None:
     """Cache sorted sparse voxel keys once for repeated decoder lookups."""
     if "lookup_sorted_keys" in level:
@@ -963,6 +993,7 @@ class SPACEFormerStage2(nn.Module):
             "source_feature": source_out["source_feature"],
             "region_logits": region_logits,
             "region_sparse_coords": pyramid[2]["coords"],
+            "region_spatial_shape": pyramid[2]["spatial_shape"],
             "region_world_coords": pyramid[2]["world_coords"],
             "region_batch_indices": p3_batch_indices,
             "voxel_origins": voxel_origins,

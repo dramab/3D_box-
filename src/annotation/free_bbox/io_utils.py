@@ -128,11 +128,14 @@ def save_binary_mask_ply(
     """
     将整体体素点云保存为二值 mask PLY。
 
-    OCCUPIED 和 mask=True 的体素都会输出；支撑面体素为白色，
-    其余为深灰色。这会保留形态学运算补出的非占据体素。
+    仅输出模型可见的 OCCUPIED 体素；active support 为白色，其余为深灰色。
     """
     mask = np.asarray(mask_3d, dtype=bool)
-    output_idx = np.argwhere((grid == OCCUPIED) | mask)
+    if mask.shape != grid.shape:
+        raise ValueError("mask_3d must align with grid")
+    if np.any(mask & (grid != OCCUPIED)):
+        raise ValueError("support mask contains non-active voxels")
+    output_idx = np.argwhere(grid == OCCUPIED)
     colors = np.full((len(output_idx), 3), [55, 55, 55], dtype=np.uint8)
     if len(output_idx) > 0:
         active = mask[output_idx[:, 0], output_idx[:, 1], output_idx[:, 2]]
@@ -151,13 +154,23 @@ def save_heatmap_ply(
     将整体体素点云保存为热力 PLY。
 
     heat_counts>0 的支撑面体素按黄到红着色；支撑面但计数为 0 的体素为蓝色；
-    其他 OCCUPIED 体素为灰色。输出点集是 OCCUPIED、支撑面和正热力
-    体素的并集，以保留形态学运算补出的体素。
+    其他 OCCUPIED 体素为灰色。support 和正热力均必须是模型输入中的
+    active voxel，输出点集与 OCCUPIED 网格一致。
     """
     counts = np.asarray(heat_counts, dtype=np.int64)
-    output_mask = (grid == OCCUPIED) | (counts > 0)
+    if counts.shape != grid.shape:
+        raise ValueError("heat_counts must align with grid")
+    output_mask = grid == OCCUPIED
     if support_mask_3d is not None:
-        output_mask |= np.asarray(support_mask_3d, dtype=bool)
+        support_mask = np.asarray(support_mask_3d, dtype=bool)
+        if support_mask.shape != grid.shape:
+            raise ValueError("support_mask_3d must align with grid")
+        if np.any(support_mask & ~output_mask):
+            raise ValueError("support mask contains non-active voxels")
+        if np.any((counts > 0) & ~support_mask):
+            raise ValueError("heatmap positive contains non-support voxels")
+    elif np.any((counts > 0) & ~output_mask):
+        raise ValueError("heatmap positive contains non-active voxels")
     output_idx = np.argwhere(output_mask)
     colors = np.full((len(output_idx), 3), [60, 60, 60], dtype=np.uint8)
 

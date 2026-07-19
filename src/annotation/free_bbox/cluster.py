@@ -202,6 +202,7 @@ def cluster_placements_best(
     yaw_data: dict,
     landing_z: int,
     surface_mask_2d: np.ndarray,
+    center_mask_2d: np.ndarray,
     vp: dict,
     eps: float | None = None,
     min_samples: int = 1,
@@ -210,6 +211,9 @@ def cluster_placements_best(
 ) -> tuple[np.ndarray, list[dict], list[dict], np.ndarray]:
     """
     对候选框聚类，并为每个簇选择一个最优 3D box。
+
+    center_mask_2d 只负责约束候选中心；surface_mask_2d 是补全后的
+    支撑面，只用于支撑面积和障碍间隙等物理量计算。
 
     输出:
         reps: (K, 3) int，每簇一个代表候选
@@ -221,7 +225,7 @@ def cluster_placements_best(
         return np.empty((0, 3), dtype=int), [], [], np.empty((0, 3), dtype=int)
 
     bottom_centers = compute_bottom_center_voxels(candidates, yaw_data, landing_z)
-    center_keep = _valid_bottom_center_mask(bottom_centers, surface_mask_2d)
+    center_keep = _valid_bottom_center_mask(bottom_centers, center_mask_2d)
     candidates = candidates[center_keep]
     bottom_centers = bottom_centers[center_keep]
     if len(candidates) == 0:

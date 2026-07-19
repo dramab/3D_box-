@@ -9,12 +9,14 @@
 ## 主要规则
 
 - 支撑面检测沿用旧 `free_bbox` 逻辑：优先在体素点云中 RANSAC 检测水平面，失败时回退到体素栅格逐层连通域。
+- free_bbox 栅格原点按 voxel size 对齐到 canonical active 点云使用的世界格线，禁止以任意浮点 `scene_min` 建立第二套错位网格。
+- 形态学补全后的 `completed support mask` 只用于 footprint 支撑率、稳定性和净空计算；与支撑层 active occupancy 相交得到的 `active center mask` 用于候选底面中心、heatmap 和 yaw 监督。
 - 支撑面候选会扣除 `table_z±1` 范围内所有场景物体 OBB 的 XY 投影，避免把薄物体或其它实体表面误选为可放置平面。
 - OBB 体素化使用体素 AABB 与 OBB 的相交判断，边界接触也按占据处理，避免薄物体因没有覆盖体素中心而漏检。
 - 3D box 的候选底层放在支撑面本层，不再使用 `table_z + 1`。
 - 聚类仍使用 DBSCAN，但每个簇只输出一个最优 3D box。
 - 簇内最优选择顺序为：底面中心热力最大、支撑面积最大、距离簇中心最近、距离碰撞障碍最近距离最大。
-- 聚类前会强制过滤：候选 3D box 的底面中心体素必须落在支撑面 mask 上。
+- 无碰撞候选生成后立即过滤：候选 3D box 的底面中心必须落在 `active center mask`；聚类阶段会再次执行相同校验。
 - 输出给模型监督和可视化的 `corners_world` / `transform_world` 统一为 yaw-only upright box：去掉 roll/pitch，并根据原 OBB 哪个局部轴最接近 world-Z 重排尺寸，使竖直尺寸落在输出 Z 轴。
 - 搜索阶段仍可通过默认配置保留原始 roll/pitch 来做碰撞、可见性和遮挡过滤；对应的原始 6DoF 放置框会保存在 `obb6d_*` 字段中，便于排查。
 
@@ -37,10 +39,10 @@ visualizations/
   hope__scene_0000__0000__obj_0__cluster_000__vis.png
 ```
 
-- `*_support_mask.ply`: 每帧一份整体体素点云二值 mask，白色表示检测到的支撑面体素；点集同时保留形态学运算补出的非原始占据体素。
+- `*_support_mask.ply`: 每帧一份与模型输入 active voxel 对齐的二值 mask，白色表示允许作为候选底面中心的 active support；形态学补出的非 active 体素不写入模型监督 PLY。
 - `*_placements.json`: 每帧汇总标注。
 - `*__box.json`: 每个簇选出的最优 3D box 单独保存；`placement.corners_world` 为模型监督使用的 yaw-only upright box，`placement.obb6d_corners_world` 为搜索阶段原始 6DoF OBB。
-- `*__heatmap.ply`: 与该最优 3D box 对应的簇级整体体素热力点云，热力值为聚类前候选框底面中心落到每个支撑面体素上的次数；最优框底面中心位于该簇热力峰值。
+- `*__heatmap.ply`: 与该最优 3D box 对应的簇级 active 体素热力点云；所有正热力中心都必须属于 `active center mask`，最优框底面中心位于该簇热力峰值。
 - `*__yaw_set.npz`: 与 heatmap 同簇的中心-yaw 监督。每个底面中心只保存一次，`valid_yaw_mask` 标记该中心通过碰撞、稳定性、可见性、遮挡和底面中心过滤的所有 yaw。新增目录不会修改现有 JSON schema 或字段。
 - `*__vis.png`: 每个最终 freebox 一张可视化图片，绿色框与模型监督一致，显示 yaw-only upright box。
 
@@ -58,7 +60,7 @@ with np.load(yaw_set_path) as target:
 
 > **Stage 2 读取注意事项：** `yaw_sets` 保存的是语言方向过滤前、通过 free_bbox 几何过滤的全部可放置中心；`direction_filtered_heatmaps` 中的正样本是这些中心经过语言方向过滤后的子集。因此，构建 Stage 2 监督时必须先用 `(red == 255) & (blue == 30)` 提取方向过滤后仍保留的正点，再按 `bottom_center_world` 与对应 `yaw_set.npz` 对齐，仅读取匹配行的 `valid_yaw_mask`。不能直接把 yaw set 中的全部中心作为当前指令的正样本。
 >
-> PLY 坐标保存到小数点后四位，而 NPZ 保存 `float32` 世界坐标，对齐时应使用不大于 `1e-3 cm` 的容差或等价的定点坐标键。加载代码必须断言：每个方向过滤正点恰好匹配一个 yaw center、该行至少包含一个有效 yaw；yaw set 中存在未被方向过滤保留的额外中心是正常现象。
+> Stage 2 按 canonical voxel key 关联 PLY 正点与 NPZ yaw center，并严格断言 support、heatmap 正点和 yaw center 都属于输入 active voxel；不再使用最近 active voxel 吸附或距离容错。yaw set 中存在未被方向过滤保留的额外中心是正常现象。
 
 ## 训练数据读取
 

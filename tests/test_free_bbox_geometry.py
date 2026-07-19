@@ -3,13 +3,67 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from src.annotation.free_bbox.cluster import cluster_placements_best
 from src.annotation.free_bbox.geometry import build_yaw_only_upright_box, rotation_z_3x3
 from src.annotation.free_bbox.grid_ops import voxelize_obb
-from src.annotation.free_bbox.occupancy import OCCUPIED
-from src.annotation.free_bbox.pipeline import _build_center_yaw_set
+from src.annotation.free_bbox.occupancy import OCCUPIED, build_grid_from_voxel_points
+from src.annotation.free_bbox.pipeline import (
+    _active_center_mask_2d,
+    _build_center_yaw_set,
+    _validate_active_aligned_supervision,
+)
 from src.annotation.free_bbox.surface import _remove_excluded_surface_voxels
+from src.annotation.free_bbox.voxel_utils import world_to_voxel
+
+
+def test_free_bbox_grid_uses_the_canonical_voxel_lattice() -> None:
+    """free_bbox local key 加原点 key 后必须等于 canonical active key。"""
+    points = np.array([[-1.2, 0.2, 2.8], [1.7, 2.4, -0.3]], dtype=np.float64)
+
+    _, grid_min, voxel_size = build_grid_from_voxel_points(
+        points,
+        voxel_size=1.0,
+        padding=0.3,
+    )
+
+    np.testing.assert_allclose(grid_min / voxel_size, np.round(grid_min / voxel_size))
+    local_keys = world_to_voxel(
+        points,
+        {"origin": grid_min.tolist(), "voxel_size": voxel_size},
+    )
+    origin_key = np.rint(grid_min / voxel_size).astype(np.int64)
+    np.testing.assert_array_equal(
+        local_keys + origin_key,
+        np.floor(points / voxel_size).astype(np.int64),
+    )
+
+
+def test_active_center_mask_keeps_completed_support_with_active_evidence() -> None:
+    completed = np.ones((3, 3), dtype=bool)
+    active_grid = np.zeros((3, 3, 2), dtype=np.uint8)
+    active_grid[0, 0, 0] = OCCUPIED
+    active_grid[1, 1, 1] = OCCUPIED
+
+    center_mask = _active_center_mask_2d(completed, table_z=0, active_grid=active_grid)
+
+    assert center_mask.sum() == 1
+    assert center_mask[0, 0]
+    assert not center_mask[1, 1]
+
+
+def test_active_aligned_supervision_rejects_virtual_centers() -> None:
+    support = np.zeros((2, 2, 1), dtype=bool)
+    support[0, 0, 0] = True
+    heat = np.zeros_like(support, dtype=np.int64)
+    heat[0, 0, 0] = 1
+    targets = {"bottom_center_voxels": np.array([[0, 0, 0]], dtype=np.int32)}
+
+    _validate_active_aligned_supervision(support, heat, targets)
+    targets["bottom_center_voxels"] = np.array([[1, 1, 0]], dtype=np.int32)
+    with pytest.raises(ValueError, match="not an active support"):
+        _validate_active_aligned_supervision(support, heat, targets)
 
 
 def test_surface_exclusion_projects_obb_within_one_z_voxel() -> None:
@@ -144,6 +198,7 @@ def test_cluster_selects_box_at_heatmap_peak_before_support_area() -> None:
         yaw_data,
         landing_z=0,
         surface_mask_2d=surface,
+        center_mask_2d=surface,
         vp={"origin": [0.0, 0.0, 0.0], "voxel_size": 1.0},
         eps=20.0,
     )
@@ -165,6 +220,7 @@ def test_cluster_prefers_centroid_distance_before_clearance() -> None:
         _make_single_voxel_yaw_data(),
         landing_z=0,
         surface_mask_2d=surface,
+        center_mask_2d=surface,
         vp={"origin": [0.0, 0.0, 0.0], "voxel_size": 1.0},
         eps=20.0,
     )
@@ -185,8 +241,32 @@ def test_cluster_uses_clearance_when_centroid_distance_ties() -> None:
         _make_single_voxel_yaw_data(),
         landing_z=0,
         surface_mask_2d=surface,
+        center_mask_2d=surface,
         vp={"origin": [0.0, 0.0, 0.0], "voxel_size": 1.0},
         eps=20.0,
     )
 
     assert reps.tolist() == [[6, 2, 0]]
+
+
+def test_cluster_uses_active_mask_only_for_bottom_centers() -> None:
+    """补全 support 可参与支撑计算，但候选中心必须落在 active center mask。"""
+    grid = np.zeros((8, 6, 2), dtype=np.uint8)
+    completed_support = np.ones(grid.shape[:2], dtype=bool)
+    active_centers = np.zeros_like(completed_support)
+    active_centers[2, 2] = True
+    candidates = np.array([[2, 2, 0], [5, 2, 0]], dtype=int)
+
+    reps, _, _, filtered = cluster_placements_best(
+        candidates,
+        grid,
+        _make_single_voxel_yaw_data(),
+        landing_z=0,
+        surface_mask_2d=completed_support,
+        center_mask_2d=active_centers,
+        vp={"origin": [0.0, 0.0, 0.0], "voxel_size": 1.0},
+        eps=20.0,
+    )
+
+    assert filtered.tolist() == [[2, 2, 0]]
+    assert reps.tolist() == [[2, 2, 0]]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from src.training.lc_bgplacenet_stage1 import (
     stage1_item_to_split_record,
     stage1_collate,
     source_box_loss,
+    write_stage1_splits,
 )
 
 
@@ -62,6 +64,7 @@ def _make_tiny_stage1_source(tmp_path) -> Stage1DataSource:
         {
             "schema_version": "canonical_placement_scene/v1",
             "sample_id": sample_id,
+            "scene_id": "scene_0000",
             "rgb_path": f"rgb/{sample_id}.png",
             "voxel_point_cloud_path": f"point_clouds_voxel_1cm/{sample_id}.ply",
             "camera": {
@@ -152,7 +155,7 @@ def test_stage1_dataset_reads_fixed_split_file(tmp_path) -> None:
         {
             "schema_version": STAGE1_SPLIT_SCHEMA_VERSION,
             "split": "train",
-            "group_by": ["source_name", "sample_id"],
+            "group_by": ["source_name", "scene_id"],
             "item_count": 1,
             "items": [stage1_item_to_split_record(items[0])],
         },
@@ -167,6 +170,44 @@ def test_stage1_dataset_reads_fixed_split_file(tmp_path) -> None:
 
     assert len(dataset) == 1
     assert dataset[0]["sample_id"] == "toy__scene_0000__0000"
+
+
+def test_write_stage1_splits_groups_scenes_and_balances_item_counts(tmp_path) -> None:
+    """Scene groups stay intact while item counts follow the requested ratio."""
+    source = _make_tiny_stage1_source(tmp_path)
+    base_item = build_stage1_index([source])[0]
+    scene_sizes = {"scene_train": 8, "scene_valid": 1, "scene_test": 1}
+    items = []
+    item_index = 0
+    for scene_id, count in scene_sizes.items():
+        for _ in range(count):
+            items.append(
+                replace(
+                    base_item,
+                    item_id=f"item_{item_index}",
+                    label_index=item_index,
+                    sample_id=f"toy__{scene_id}__{item_index:04d}",
+                    scene_id=scene_id,
+                )
+            )
+            item_index += 1
+
+    manifest = write_stage1_splits(
+        items,
+        tmp_path / "splits",
+        valid_fraction=0.1,
+        test_fraction=0.1,
+        seed=7,
+    )
+
+    assert manifest["group_by"] == ["source_name", "scene_id"]
+    assert manifest["split_item_counts"] == {"train": 8, "valid": 1, "test": 1}
+    scene_splits = {}
+    for split_name in ("train", "valid", "test"):
+        payload = json.loads((tmp_path / "splits" / f"{split_name}.json").read_text())
+        for row in payload["items"]:
+            scene_splits.setdefault(row["scene_id"], set()).add(split_name)
+    assert all(len(splits) == 1 for splits in scene_splits.values())
 
 
 def test_stage1_collate_builds_sparse_batch(tmp_path) -> None:

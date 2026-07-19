@@ -23,7 +23,6 @@ import torch.nn.functional as F
 import yaml
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
-from scipy.spatial import cKDTree
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -37,6 +36,7 @@ from src.models.lc_bgplacenet.stage2 import (
     NUM_QUERIES,
     NUM_YAW_BINS,
     SPACEFormerStage2,
+    aggregate_sparse_mask,
     yaw_bin_angles,
 )
 from src.training.lc_bgplacenet_stage1 import (
@@ -417,8 +417,8 @@ def _is_support_color(colors: np.ndarray) -> np.ndarray:
 
 
 def _quantize_world_points(points: np.ndarray, voxel_size_cm: float) -> np.ndarray:
-    """Quantize world coordinates to sparse voxel keys."""
-    return np.floor(np.asarray(points, dtype=np.float64) / float(voxel_size_cm) + 1e-4).astype(np.int64)
+    """按 canonical ``floor(world / voxel_size)`` 规则生成 voxel key。"""
+    return np.floor(np.asarray(points, dtype=np.float64) / float(voxel_size_cm)).astype(np.int64)
 
 
 def _row_membership(rows: np.ndarray, candidates: np.ndarray) -> np.ndarray:
@@ -449,31 +449,27 @@ def _fps_numpy(points: np.ndarray, count: int, seed_index: int) -> np.ndarray:
 def build_space_former_targets(
     yaw_set_path: str | Path,
     direction_positive_points: np.ndarray,
-    coordinate_tolerance_cm: float = 1e-3,
+    voxel_size_cm: float = 1.0,
     max_targets: int = NUM_QUERIES,
 ) -> dict[str, np.ndarray]:
-    """Build bounded GT centers with all valid physical yaw bins retained."""
+    """按 canonical voxel key 筛选方向有效中心并保留全部合法 yaw。"""
     with np.load(yaw_set_path) as yaw_set:
         centers = np.asarray(yaw_set["bottom_center_world"], dtype=np.float32)
         mask24 = np.asarray(yaw_set["valid_yaw_mask"], dtype=bool)
     if mask24.shape != (len(centers), 24):
         raise ValueError(f"Invalid yaw mask shape in {yaw_set_path}: {mask24.shape}")
 
-    matched_indices = cKDTree(centers.astype(np.float64)).query_ball_point(
-        np.asarray(direction_positive_points, dtype=np.float64),
-        r=float(coordinate_tolerance_cm),
-        p=np.inf,
-    )
-    match_counts = np.fromiter((len(indices) for indices in matched_indices), dtype=np.int64)
-    if np.any(match_counts != 1):
-        unmatched = int(np.count_nonzero(match_counts == 0))
-        ambiguous = int(np.count_nonzero(match_counts > 1))
+    center_keys = _quantize_world_points(centers, voxel_size_cm)
+    positive_keys = _quantize_world_points(direction_positive_points, voxel_size_cm)
+    if len(np.unique(center_keys, axis=0)) != len(center_keys):
+        raise ValueError(f"Yaw-set contains duplicate canonical voxel keys: {yaw_set_path}")
+    positive_in_yaw_set = _row_membership(positive_keys, center_keys)
+    if not np.all(positive_in_yaw_set):
         raise ValueError(
-            f"Direction-positive/yaw-center alignment failed in {yaw_set_path}: "
-            f"unmatched={unmatched}, ambiguous={ambiguous}, tolerance_cm={coordinate_tolerance_cm}"
+            f"Direction-positive/yaw-center voxel alignment failed in {yaw_set_path}: "
+            f"unmatched={int(np.count_nonzero(~positive_in_yaw_set))}"
         )
-    keep = np.zeros(len(centers), dtype=bool)
-    keep[np.fromiter((indices[0] for indices in matched_indices), dtype=np.int64)] = True
+    keep = _row_membership(center_keys, positive_keys)
     mask12 = mask24[:, :12] | mask24[:, 12:]
     keep &= mask12.any(axis=1)
     centers = centers[keep]
@@ -502,9 +498,11 @@ class LCBGPlaceNetStage2Dataset(Dataset):
         max_samples: int | None = None,
         items: list[Stage2IndexItem] | None = None,
         split_dir: str | Path | None = None,
+        voxel_size_cm: float = 1.0,
     ) -> None:
         split_name = normalize_stage1_split(split)
         self.split = split_name
+        self.voxel_size_cm = float(voxel_size_cm)
         if items is None:
             if sources is None:
                 raise ValueError("sources must be provided when items is None")
@@ -542,6 +540,7 @@ class LCBGPlaceNetStage2Dataset(Dataset):
         set_targets = build_space_former_targets(
             item.yaw_set_npz,
             positive_points,
+            voxel_size_cm=self.voxel_size_cm,
         )
 
         return {
@@ -645,9 +644,22 @@ def stage2_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         batch_col = np.full((len(points), 1), batch_idx, dtype=np.int32)
 
         support_keys = _quantize_world_points(item["support_points"], voxel_size_cm)
+        support_is_active = _row_membership(support_keys, voxel_keys)
+        if not np.all(support_is_active):
+            raise ValueError(
+                f"Active support is not a subset of the input point cloud: "
+                f"item_id={item['item_id']}, unmatched={int(np.count_nonzero(~support_is_active))}"
+            )
         support_mask = _row_membership(voxel_keys, support_keys)
 
         positives = np.asarray(item["heatmap_positive_points"], dtype=np.float32)
+        positive_keys = _quantize_world_points(positives, voxel_size_cm)
+        positive_is_support = _row_membership(positive_keys, support_keys)
+        if not np.all(positive_is_support):
+            raise ValueError(
+                f"Heatmap positive is not an active support voxel: "
+                f"item_id={item['item_id']}, unmatched={int(np.count_nonzero(~positive_is_support))}"
+            )
         features.append(np.concatenate([point_norm, colors], axis=1).astype(np.float32))
         sparse_coords.append(np.concatenate([batch_col, shifted_keys.astype(np.int32)], axis=1))
         world_coords.append(points)
@@ -760,22 +772,6 @@ def focal_loss_with_logits(
     pt = prob * targets + (1.0 - prob) * (1.0 - targets)
     alpha_t = float(alpha) * targets + (1.0 - float(alpha)) * (1.0 - targets)
     return (alpha_t * (1.0 - pt).pow(float(gamma)) * bce).mean()
-
-
-def nearest_voxel_per_batch(
-    coords: torch.Tensor,
-    batch_indices: torch.Tensor,
-    targets: torch.Tensor,
-) -> torch.Tensor:
-    """Find the nearest active voxel to one target point per batch item."""
-    indices = []
-    for batch_idx in range(targets.shape[0]):
-        idx = torch.nonzero(batch_indices == batch_idx, as_tuple=False).flatten()
-        if len(idx) == 0:
-            raise ValueError(f"batch item {batch_idx} has no active voxels")
-        dist2 = (coords[idx] - targets[batch_idx]).pow(2).sum(dim=1)
-        indices.append(idx[torch.argmin(dist2)])
-    return torch.stack(indices, dim=0)
 
 
 def compute_p3_gt_point_coverage(
@@ -1044,12 +1040,19 @@ def compute_stage2_loss(
     sigma = float(cfg["data"].get("heatmap_sigma_voxels", 2.0)) * float(
         cfg["data"]["voxel_size_cm"]
     )
+    region_support_mask = aggregate_sparse_mask(
+        batch["sparse_coords"],
+        batch["support_masks"],
+        outputs["region_sparse_coords"],
+        outputs["region_spatial_shape"],
+        stride=4,
+    )
     region_target = build_dense_heatmap_targets(
         world_coords=outputs["region_world_coords"],
         batch_indices=outputs["region_batch_indices"],
         positive_points=batch["heatmap_positive_points"],
         positive_batch_indices=batch["heatmap_positive_batch_indices"],
-        support_masks=torch.ones_like(outputs["region_logits"], dtype=torch.bool),
+        support_masks=region_support_mask,
         batch_size=int(batch["batch_size"]),
         sigma=sigma,
     )
@@ -1392,6 +1395,7 @@ def train_stage2(
             max_samples=max_train_samples or data_cfg.get("max_train_samples"),
             items=all_items,
             split_dir=split_dir,
+            voxel_size_cm=float(data_cfg["voxel_size_cm"]),
         )
         val_set = LCBGPlaceNetStage2Dataset(
             sources=None,
@@ -1401,6 +1405,7 @@ def train_stage2(
             max_samples=max_val_samples or data_cfg.get("max_valid_samples", data_cfg.get("max_val_samples")),
             items=all_items,
             split_dir=split_dir,
+            voxel_size_cm=float(data_cfg["voxel_size_cm"]),
         )
         validation_contexts = build_stage2_validation_contexts(val_set.items)
 

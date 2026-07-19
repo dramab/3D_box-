@@ -53,8 +53,10 @@ def build_grid_from_voxel_points(
 
     voxel_size = float(voxel_size)
     padding = float(padding)
-    grid_min = bounds_points.min(axis=0) - padding
-    grid_max = bounds_points.max(axis=0) + padding
+    # canonical active 点云按 floor(world / voxel_size) 聚合；free_bbox 必须复用
+    # 同一世界格线，否则导出的 support/heatmap key 会与模型输入错位。
+    grid_min = np.floor((bounds_points.min(axis=0) - padding) / voxel_size) * voxel_size
+    grid_max = np.ceil((bounds_points.max(axis=0) + padding) / voxel_size) * voxel_size
     grid_shape = np.maximum(
         np.ceil((grid_max - grid_min) / voxel_size).astype(int),
         1,

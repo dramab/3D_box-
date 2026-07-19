@@ -2,10 +2,10 @@ data:
   # 输入 active 点云的体素大小，单位为厘米；应与 point_clouds_voxel_1cm 保持一致。
   voxel_size_cm: 1.0
   # 固定 train/valid/test 划分文件目录；先运行 tools/generate_lc_bgplacenet_stage1_splits.py 生成。
-  split_dir: outputs/data_split
-  # 生成固定 split 时，按 canonical sample 分组划入验证集的比例。
+  split_dir: data/splits/scene_aligned
+  # 生成固定 split 时，以 canonical scene 为不可拆分分组，按 instance 数量逼近该验证集比例。
   valid_fraction: 0.1
-  # 生成固定 split 时，按 canonical sample 分组划入测试集的比例。
+  # 生成固定 split 时，以 canonical scene 为不可拆分分组，按 instance 数量逼近该测试集比例。
   test_fraction: 0.1
   # 仅用于固定 split 生成；生成后训练/推理直接读取 split 文件。
   split_seed: 20260624
@@ -86,13 +86,13 @@ loss:
 
 training:
   # 保存 metrics.jsonl、last.pt 和 best.pt 的输出目录。
-  output_dir: outputs/lc_bgplacenet_stage1_clip16_data_yaw
+  output_dir: outputs/lc_bgplacenet_stage1_clip16_aligned_scene_split
   # auto 表示优先使用 CUDA，CUDA 不可用时使用 CPU。
   device: auto
   # 用于训练复现的随机种子。
   seed: 20260624
   # 对训练集完整遍历的轮数。
-  epochs: 60
+  epochs: 50
   # 每次优化器更新使用的样本数。
   batch_size: 15
   # DataLoader worker 进程数量。

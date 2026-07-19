@@ -3,10 +3,10 @@
 Generate fixed train/valid/test split files for LC-BGPlaceNet Stage 1.
 
 使用示例:
-    conda run -n spatial python tools/generate_lc_bgplacenet_stage1_splits.py \
+    python tools/generate_lc_bgplacenet_stage1_splits.py \
         --config configs/lc_bgplacenet_stage1.yaml
 
-    conda run -n spatial python tools/generate_lc_bgplacenet_stage1_splits.py \
+    python tools/generate_lc_bgplacenet_stage1_splits.py \
         --config configs/lc_bgplacenet_stage1.yaml \
         --overwrite
 """
@@ -41,8 +41,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Split output directory. Defaults to data.split_dir from the config.",
     )
-    parser.add_argument("--valid-fraction", type=float, default=None, help="Validation group fraction.")
-    parser.add_argument("--test-fraction", type=float, default=None, help="Test group fraction.")
+    parser.add_argument("--valid-fraction", type=float, default=None, help="Target validation item fraction.")
+    parser.add_argument("--test-fraction", type=float, default=None, help="Target test item fraction.")
     parser.add_argument("--seed", type=int, default=None, help="Split seed. Defaults to data.split_seed.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing split files.")
     return parser.parse_args()

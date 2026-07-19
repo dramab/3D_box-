@@ -123,6 +123,44 @@ def _support_mask_3d(surface_mask_2d: np.ndarray, table_z: int, grid_shape: tupl
     return mask_3d
 
 
+def _active_center_mask_2d(
+    completed_support_mask_2d: np.ndarray,
+    table_z: int,
+    active_grid: np.ndarray,
+) -> np.ndarray:
+    """只保留支撑层中真实存在于模型 active 点云的候选中心。"""
+    completed = np.asarray(completed_support_mask_2d, dtype=bool)
+    z = int(table_z)
+    if completed.shape != active_grid.shape[:2]:
+        raise ValueError("completed support mask must align with active grid XY")
+    if z < 0 or z >= active_grid.shape[2]:
+        return np.zeros_like(completed)
+    return completed & (active_grid[:, :, z] == OCCUPIED)
+
+
+def _validate_active_aligned_supervision(
+    active_support_3d: np.ndarray,
+    heat_counts: np.ndarray,
+    yaw_targets: dict[str, np.ndarray],
+) -> None:
+    """确保 heatmap 与 yaw-set 只监督 active support 体素。"""
+    support = np.asarray(active_support_3d, dtype=bool)
+    counts = np.asarray(heat_counts)
+    if counts.shape != support.shape:
+        raise ValueError("heat counts must align with active support grid")
+    if np.any((counts > 0) & ~support):
+        raise ValueError("heatmap positive center is not an active support voxel")
+
+    centers = np.asarray(yaw_targets["bottom_center_voxels"], dtype=np.int64)
+    if len(centers) == 0:
+        raise ValueError("yaw-set must contain at least one active support center")
+    in_bounds = ((centers >= 0) & (centers < np.asarray(support.shape))).all(axis=1)
+    if not np.all(in_bounds):
+        raise ValueError("yaw-set center is outside the active support grid")
+    if not np.all(support[centers[:, 0], centers[:, 1], centers[:, 2]]):
+        raise ValueError("yaw-set center is not an active support voxel")
+
+
 def _build_center_yaw_set(
     obj,
     record: dict,
@@ -261,6 +299,7 @@ class FreeBBoxPipeline:
         grid_base = prepare_grid_base(grid_scene, scene.objects, vp)
         entity_voxel_mask = _object_obb_voxel_mask(scene.objects, vp, grid_base.shape)
         frame_support_mask = np.zeros(grid_scene.shape, dtype=bool)
+        frame_completed_support_mask = np.zeros(grid_scene.shape, dtype=bool)
 
         camera = scene.camera
         K = camera.K
@@ -315,7 +354,7 @@ class FreeBBoxPipeline:
                 )
                 continue
 
-            table_z, surface_mask = detect_support_surfaces(
+            table_z, completed_support_mask = detect_support_surfaces(
                 grid_other,
                 vp,
                 min_area=cfg.min_surface_area,
@@ -323,7 +362,7 @@ class FreeBBoxPipeline:
                 target_voxels=target_voxels,
                 exclude_voxel_mask=entity_voxel_mask,
             )
-            if table_z is None or surface_mask is None:
+            if table_z is None or completed_support_mask is None:
                 all_results[obj.obj_id] = FreeBBoxResult(
                     obj_id=obj.obj_id,
                     class_name=obj.class_name,
@@ -332,8 +371,19 @@ class FreeBBoxPipeline:
                 )
                 continue
 
-            support_3d = _support_mask_3d(surface_mask, table_z, grid_scene.shape)
-            frame_support_mask |= support_3d
+            active_center_mask = _active_center_mask_2d(
+                completed_support_mask,
+                table_z,
+                grid_scene,
+            )
+            active_support_3d = _support_mask_3d(active_center_mask, table_z, grid_scene.shape)
+            completed_support_3d = _support_mask_3d(
+                completed_support_mask,
+                table_z,
+                grid_scene.shape,
+            )
+            frame_support_mask |= active_support_3d
+            frame_completed_support_mask |= completed_support_3d
 
             candidates, meta, yaw_data = find_table_placements(
                 grid_base,
@@ -341,7 +391,8 @@ class FreeBBoxPipeline:
                 obj.pose_world,
                 vp,
                 table_z,
-                surface_mask,
+                completed_support_mask,
+                center_mask_2d=active_center_mask,
                 safety_margin=cfg.safety_margin,
                 yaw_steps=cfg.yaw_steps,
                 preserve_orientation=cfg.preserve_orientation,
@@ -352,7 +403,7 @@ class FreeBBoxPipeline:
             candidates = filter_stable_placements(
                 candidates,
                 yaw_data,
-                surface_mask,
+                completed_support_mask,
                 min_support_ratio=cfg.min_support_ratio,
                 chunk_size=cfg.stability_chunk_size,
             )
@@ -393,7 +444,8 @@ class FreeBBoxPipeline:
                 grid_base,
                 yaw_data,
                 landing_z,
-                surface_mask,
+                completed_support_mask,
+                active_center_mask,
                 vp,
                 eps=cfg.dbscan_eps,
                 min_samples=cfg.dbscan_min_samples,
@@ -430,11 +482,14 @@ class FreeBBoxPipeline:
                 "canonical_aabb_object": np.asarray(obj.bbox3d_canonical, dtype=np.float64).tolist(),
                 "original_pose_world": np.asarray(obj.pose_world, dtype=np.float64).tolist(),
                 "original_aabb_world": orig_aabb.tolist(),
+                "num_collision_free_candidates": int(meta["collision_free_raw"]),
                 "num_raw_candidates": n_raw,
                 "num_after_stability": int(n_stable),
                 "num_after_visibility": int(n_visible),
                 "num_after_occlusion": int(n_occlusion),
                 "num_after_bottom_center": int(n_bottom_center),
+                "support_voxels_completed": int(completed_support_mask.sum()),
+                "support_voxels_active_center": int(active_center_mask.sum()),
                 "placements": placements,
             }
             summary_objects.append(object_summary)
@@ -448,8 +503,8 @@ class FreeBBoxPipeline:
                     placements,
                     cluster_records,
                     yaw_data,
-                    support_3d,
-                    surface_mask,
+                    active_support_3d,
+                    completed_support_mask,
                     table_z,
                     grid_scene,
                     grid_base,
@@ -471,6 +526,13 @@ class FreeBBoxPipeline:
                     "unit": scene.unit,
                     "voxel_point_cloud_path": os.fspath(scene.voxel_point_cloud_path),
                     "support_mask_ply": _relative_output_path(output_root, support_mask_path),
+                    "support_alignment": {
+                        "method": "active_center_on_completed_support",
+                        "voxel_origin": np.asarray(grid_min, dtype=np.float64).tolist(),
+                        "voxel_size_cm": float(voxel_size),
+                        "completed_support_voxels": int(frame_completed_support_mask.sum()),
+                        "active_center_voxels": int(frame_support_mask.sum()),
+                    },
                     "objects": summary_objects,
                     "box_files": summary_boxes,
                 },
@@ -487,8 +549,8 @@ class FreeBBoxPipeline:
         placements: list[dict],
         cluster_records: list[dict],
         yaw_data: dict,
-        support_mask_3d: np.ndarray,
-        surface_mask_2d: np.ndarray,
+        active_support_3d: np.ndarray,
+        completed_support_mask_2d: np.ndarray,
         table_z: int,
         grid_scene: np.ndarray,
         grid_vis: np.ndarray,
@@ -518,15 +580,20 @@ class FreeBBoxPipeline:
             vis_path = output_paths["visualizations"] / vis_name
 
             heat_counts = build_heat_counts(record["member_bottom_centers"], grid_scene.shape)
+            yaw_targets = _build_center_yaw_set(obj, record, yaw_data, vp)
+            _validate_active_aligned_supervision(
+                active_support_3d,
+                heat_counts,
+                yaw_targets,
+            )
             save_heatmap_ply(
                 heatmap_path,
                 grid_scene,
                 vp,
                 heat_counts,
-                support_mask_3d=support_mask_3d,
+                support_mask_3d=active_support_3d,
             )
-            yaw_set = _build_center_yaw_set(obj, record, yaw_data, vp)
-            save_center_yaw_set_npz(yaw_set_path, **yaw_set)
+            save_center_yaw_set_npz(yaw_set_path, **yaw_targets)
             save_freebox_visualization(
                 scene.rgb,
                 obj.class_name,
@@ -539,7 +606,7 @@ class FreeBBoxPipeline:
                 np.asarray(scene.camera.E_c2w, dtype=np.float64)[:3, 3],
                 grid_vis,
                 vis_path,
-                surface_mask_2d,
+                completed_support_mask_2d,
                 table_z,
                 placement,
             )

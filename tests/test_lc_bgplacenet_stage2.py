@@ -21,6 +21,7 @@ from src.models.lc_bgplacenet.stage2 import (
     NUM_YAW_BINS,
     SPACEFormerDecoder,
     TextGuidedRegionPredictor,
+    aggregate_sparse_mask,
     build_box_surface_template,
     build_cylinder_template,
     fold_yaw_mask_24_to_12,
@@ -234,8 +235,8 @@ def test_yaw_24_bins_fold_into_12_equivalent_bins() -> None:
     assert folded[1, 8]
 
 
-def test_target_alignment_tolerates_ply_rounding_boundaries(tmp_path) -> None:
-    """PLY rounding must not split coordinates across zero or fixed-point boundaries."""
+def test_target_alignment_uses_canonical_voxel_keys(tmp_path) -> None:
+    """同一 canonical voxel 内的 PLY 浮点差异不影响监督关联。"""
     yaw_set_path = tmp_path / "yaw_set.npz"
     yaw_mask = np.zeros((2, 24), dtype=bool)
     yaw_mask[0, 0] = True
@@ -334,6 +335,21 @@ def test_region_selection_uses_all_cells_when_fewer_than_eight() -> None:
     )
     assert outputs["region_selected_cell_count"].item() == 4
     assert outputs["query_valid_mask"].sum().item() == 4
+
+
+def test_active_support_mask_aggregates_from_p1_to_p3_keys() -> None:
+    p1_coords = torch.tensor([[0, 0, 0, 0], [0, 3, 0, 0], [0, 4, 0, 0]])
+    p3_coords = torch.tensor([[0, 0, 0, 0], [0, 1, 0, 0]])
+
+    mask = aggregate_sparse_mask(
+        p1_coords,
+        torch.tensor([False, True, False]),
+        p3_coords,
+        [2, 1, 1],
+        stride=4,
+    )
+
+    assert mask.tolist() == [True, False]
 
 
 def test_sparse_lookup_returns_active_mask_and_keeps_inactive_zero_tokens() -> None:
@@ -444,6 +460,20 @@ def test_region_gaussian_target_uses_direction_filtered_positive_points() -> Non
     torch.testing.assert_close(targets, torch.exp(torch.tensor([0.0, -0.5, -2.0])))
 
 
+def test_region_gaussian_target_is_zero_outside_active_support() -> None:
+    targets = build_dense_heatmap_targets(
+        world_coords=torch.tensor([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
+        batch_indices=torch.zeros(2, dtype=torch.long),
+        positive_points=torch.tensor([[0.0, 0.0, 0.0]]),
+        positive_batch_indices=torch.zeros(1, dtype=torch.long),
+        support_masks=torch.tensor([True, False]),
+        batch_size=1,
+        sigma=2.0,
+    )
+
+    torch.testing.assert_close(targets, torch.tensor([1.0, 0.0]))
+
+
 def test_sample_token_is_261_dims_without_scale_or_occupancy_embedding() -> None:
     routing = GeometricRouting(hidden_dim=256, num_heads=8, dropout=0.0)
     for projector in routing.sample_projectors:
@@ -543,6 +573,7 @@ def test_space_former_loss_backpropagates_to_source_prediction() -> None:
         "region_world_coords": torch.tensor([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]]),
         "region_batch_indices": torch.tensor([0, 0]),
         "region_logits": torch.zeros(2, requires_grad=True),
+        "region_spatial_shape": [2, 1, 1],
         "voxel_origins": torch.zeros(1, 3),
         "query_valid_mask": torch.tensor([[True, True]]),
         "raw_place_logits": raw_logits,
@@ -558,6 +589,8 @@ def test_space_former_loss_backpropagates_to_source_prediction() -> None:
     yaw_target[0, 0, 0] = True
     batch = {
         "batch_size": 1,
+        "sparse_coords": torch.tensor([[0, 0, 0, 0], [0, 4, 0, 0]]),
+        "support_masks": torch.tensor([True, False]),
         "heatmap_positive_points": torch.tensor([[0.0, 0.0, 0.0]]),
         "heatmap_positive_batch_indices": torch.tensor([0]),
         "gt_bottom_centers": torch.tensor([[[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]),

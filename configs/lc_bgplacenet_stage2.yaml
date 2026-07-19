@@ -4,7 +4,7 @@ data:
   # direction-filtered 正点高斯监督的标准差，单位为输入 voxel 数。
   heatmap_sigma_voxels: 2.0
   # 复用 Stage 1 固定 train/valid/test 划分文件。
-  split_dir: data/splits/lc_bgplacenet_stage1
+  split_dir: data/splits/scene_aligned
   valid_fraction: 0.1
   test_fraction: 0.1
   split_seed: 20260624
@@ -81,7 +81,7 @@ validation:
   size_iou_threshold: 0.8
 
 training:
-  output_dir: outputs/lc_bgplacenet_stage2_clip16_data_yaw_guss_cross8
+  output_dir: outputs/lc_bgplacenet_stage2_space_former_aligned
   # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
   stage1_pretrained_checkpoint:
   device: auto

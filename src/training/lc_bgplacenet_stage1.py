@@ -35,7 +35,7 @@ from src.annotation.free_bbox.io_utils import load_ply
 from src.models.lc_bgplacenet.stage1 import LCBGPlaceNetStage1, aabb_iou_3d
 
 
-STAGE1_SPLIT_SCHEMA_VERSION = "lc_bgplacenet_stage1_splits/v1"
+STAGE1_SPLIT_SCHEMA_VERSION = "lc_bgplacenet_stage1_splits/v2"
 STAGE1_SPLIT_NAMES = ("train", "valid", "test")
 STAGE1_SPLIT_NAME_SET = set(STAGE1_SPLIT_NAMES)
 
@@ -58,6 +58,7 @@ class Stage1IndexItem:
     label_index: int
     source_name: str
     sample_id: str
+    scene_id: str
     object_id: str
     instruction: str
     dataset_dir: Path
@@ -72,6 +73,7 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
     """Build resolved Stage 1 sample metadata from all data sources."""
     items: list[Stage1IndexItem] = []
     payload_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    scene_id_cache: dict[tuple[str, str], str] = {}
 
     for source in sources:
         with source.labels_path.open("r", encoding="utf-8") as f:
@@ -89,6 +91,7 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
                 placement_path = source.free_bbox_dir / "placements" / f"{sample_id}__placements.json"
                 with placement_path.open("r", encoding="utf-8") as f:
                     payload_cache[cache_key] = json.load(f)
+                scene_id_cache[cache_key] = _resolve_scene_id(source.dataset_dir, sample_id)
             payload = payload_cache[cache_key]
 
             obj_record = _find_object_record(payload, object_id)
@@ -104,6 +107,7 @@ def build_stage1_index(sources: list[Stage1DataSource]) -> list[Stage1IndexItem]
                     label_index=label_index,
                     source_name=source.name,
                     sample_id=sample_id,
+                    scene_id=scene_id_cache[cache_key],
                     object_id=object_id,
                     instruction=instruction,
                     dataset_dir=source.dataset_dir,
@@ -152,6 +156,7 @@ def stage1_item_to_split_record(item: Stage1IndexItem) -> dict[str, Any]:
         "label_index": int(item.label_index),
         "source_name": item.source_name,
         "sample_id": item.sample_id,
+        "scene_id": item.scene_id,
         "object_id": item.object_id,
         "instruction": item.instruction,
     }
@@ -165,7 +170,7 @@ def write_stage1_splits(
     seed: int = 0,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Write fixed train/valid/test split files grouped by canonical sample."""
+    """Write scene-disjoint splits balanced by language-conditioned item count."""
     if not items:
         raise ValueError("No Stage 1 items available for split generation")
     valid_fraction = float(valid_fraction)
@@ -181,33 +186,19 @@ def write_stage1_splits(
         joined = ", ".join(str(path) for path in existing[:3])
         raise FileExistsError(f"Split files already exist: {joined}; pass overwrite=True to replace them")
 
-    rng = random.Random(int(seed))
-    source_groups: dict[str, set[tuple[str, str]]] = {}
+    scene_groups: dict[tuple[str, str], list[Stage1IndexItem]] = {}
     for item in items:
-        source_groups.setdefault(item.source_name, set()).add((item.source_name, item.sample_id))
-
-    group_to_split: dict[tuple[str, str], str] = {}
-    for source_name in sorted(source_groups):
-        groups = sorted(source_groups[source_name])
-        rng.shuffle(groups)
-        valid_count = _holdout_count(len(groups), valid_fraction)
-        test_count = _holdout_count(len(groups), test_fraction)
-        while valid_count + test_count >= len(groups) and (valid_count > 0 or test_count > 0):
-            if valid_count >= test_count and valid_count > 0:
-                valid_count -= 1
-            elif test_count > 0:
-                test_count -= 1
-
-        for group in groups[:valid_count]:
-            group_to_split[group] = "valid"
-        for group in groups[valid_count : valid_count + test_count]:
-            group_to_split[group] = "test"
-        for group in groups[valid_count + test_count :]:
-            group_to_split[group] = "train"
+        scene_groups.setdefault((item.source_name, item.scene_id), []).append(item)
+    group_to_split = _assign_scene_groups_by_item_count(
+        scene_groups,
+        valid_fraction=valid_fraction,
+        test_fraction=test_fraction,
+        seed=int(seed),
+    )
 
     split_items: dict[str, list[Stage1IndexItem]] = {split: [] for split in STAGE1_SPLIT_NAMES}
     for item in items:
-        split_name = group_to_split[(item.source_name, item.sample_id)]
+        split_name = group_to_split[(item.source_name, item.scene_id)]
         split_items[split_name].append(item)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -215,7 +206,7 @@ def write_stage1_splits(
         payload = {
             "schema_version": STAGE1_SPLIT_SCHEMA_VERSION,
             "split": split_name,
-            "group_by": ["source_name", "sample_id"],
+            "group_by": ["source_name", "scene_id"],
             "item_count": len(split_rows),
             "items": [stage1_item_to_split_record(item) for item in split_rows],
         }
@@ -234,12 +225,90 @@ def write_stage1_splits(
     return manifest
 
 
-def _holdout_count(total: int, fraction: float) -> int:
-    """Convert a fraction to a holdout group count while keeping a train group."""
-    count = int(round(total * float(fraction)))
-    if fraction > 0.0 and total >= 3:
-        count = max(count, 1)
-    return count
+def _assign_scene_groups_by_item_count(
+    scene_groups: dict[tuple[str, str], list[Stage1IndexItem]],
+    valid_fraction: float,
+    test_fraction: float,
+    seed: int,
+) -> dict[tuple[str, str], str]:
+    """Assign indivisible scenes while keeping item counts close to target ratios."""
+    rng = random.Random(int(seed))
+    weighted_groups = [(group, len(rows)) for group, rows in sorted(scene_groups.items())]
+    rng.shuffle(weighted_groups)
+    # Largest scenes are placed first; shuffled equal-size scenes retain seeded ordering.
+    weighted_groups.sort(key=lambda pair: pair[1], reverse=True)
+
+    fractions = {
+        "train": 1.0 - float(valid_fraction) - float(test_fraction),
+        "valid": float(valid_fraction),
+        "test": float(test_fraction),
+    }
+    total_items = sum(weight for _group, weight in weighted_groups)
+    targets = {split: total_items * fraction for split, fraction in fractions.items()}
+    eligible_splits = [split for split in STAGE1_SPLIT_NAMES if targets[split] > 0.0]
+    assigned_counts = {split: 0 for split in STAGE1_SPLIT_NAMES}
+    group_to_split: dict[tuple[str, str], str] = {}
+
+    groups_by_source: dict[str, list[tuple[tuple[str, str], int]]] = {}
+    for group, weight in weighted_groups:
+        groups_by_source.setdefault(group[0], []).append((group, weight))
+    # Keep every sufficiently large source represented in all requested splits.
+    for source_name in sorted(groups_by_source):
+        source_groups = groups_by_source[source_name]
+        if len(source_groups) < len(eligible_splits):
+            continue
+        seed_groups = [source_groups[0], *reversed(source_groups[-(len(eligible_splits) - 1) :])]
+        for split_name, (group, weight) in zip(eligible_splits, seed_groups):
+            group_to_split[group] = split_name
+            assigned_counts[split_name] += weight
+
+    for group, weight in weighted_groups:
+        if group in group_to_split:
+            continue
+        split_name = min(
+            eligible_splits,
+            key=lambda split: assigned_counts[split] / targets[split],
+        )
+        group_to_split[group] = split_name
+        assigned_counts[split_name] += weight
+
+    source_split_counts: dict[str, dict[str, int]] = {
+        source: {split: 0 for split in STAGE1_SPLIT_NAMES} for source in groups_by_source
+    }
+    weights = dict(weighted_groups)
+    for group, split_name in group_to_split.items():
+        source_split_counts[group[0]][split_name] += 1
+
+    # Move whole scenes only when doing so strictly reduces the total item-ratio error.
+    while True:
+        best_move: tuple[float, tuple[str, str], str, str] | None = None
+        for group, source_split in sorted(group_to_split.items()):
+            source_name = group[0]
+            if source_split_counts[source_name][source_split] <= 1:
+                continue
+            weight = weights[group]
+            for target_split in eligible_splits:
+                if target_split == source_split:
+                    continue
+                before = abs(assigned_counts[source_split] - targets[source_split]) + abs(
+                    assigned_counts[target_split] - targets[target_split]
+                )
+                after = abs(assigned_counts[source_split] - weight - targets[source_split]) + abs(
+                    assigned_counts[target_split] + weight - targets[target_split]
+                )
+                move = (after - before, group, source_split, target_split)
+                if move[0] < -1e-12 and (best_move is None or move < best_move):
+                    best_move = move
+        if best_move is None:
+            break
+        _error_delta, group, source_split, target_split = best_move
+        weight = weights[group]
+        group_to_split[group] = target_split
+        assigned_counts[source_split] -= weight
+        assigned_counts[target_split] += weight
+        source_split_counts[group[0]][source_split] -= 1
+        source_split_counts[group[0]][target_split] += 1
+    return group_to_split
 
 
 def _stage1_split_manifest(
@@ -252,7 +321,7 @@ def _stage1_split_manifest(
     """Build split metadata for quick inspection."""
     split_group_counts = {split: 0 for split in STAGE1_SPLIT_NAMES}
     source_counts: dict[str, dict[str, dict[str, int]]] = {}
-    for (source_name, _sample_id), split_name in group_to_split.items():
+    for (source_name, _scene_id), split_name in group_to_split.items():
         source_counts.setdefault(
             source_name,
             {
@@ -267,15 +336,26 @@ def _stage1_split_manifest(
         for item in rows:
             source_counts[item.source_name]["items"][split_name] += 1
 
+    item_count = int(sum(len(rows) for rows in split_items.values()))
+    train_fraction = 1.0 - float(valid_fraction) - float(test_fraction)
+    target_fractions = {"train": train_fraction, "valid": float(valid_fraction), "test": float(test_fraction)}
+    actual_fractions = {
+        split: len(split_items[split]) / item_count for split in STAGE1_SPLIT_NAMES
+    }
     return {
         "schema_version": STAGE1_SPLIT_SCHEMA_VERSION,
         "seed": int(seed),
         "valid_fraction": float(valid_fraction),
         "test_fraction": float(test_fraction),
-        "group_by": ["source_name", "sample_id"],
-        "item_count": int(sum(len(rows) for rows in split_items.values())),
+        "group_by": ["source_name", "scene_id"],
+        "item_count": item_count,
         "group_count": int(len(group_to_split)),
         "split_item_counts": {split: len(split_items[split]) for split in STAGE1_SPLIT_NAMES},
+        "target_item_fractions": target_fractions,
+        "split_item_fractions": actual_fractions,
+        "split_item_fraction_errors": {
+            split: actual_fractions[split] - target_fractions[split] for split in STAGE1_SPLIT_NAMES
+        },
         "split_group_counts": split_group_counts,
         "source_counts": source_counts,
     }
@@ -350,6 +430,18 @@ def build_sources_from_config(cfg: dict[str, Any]) -> list[Stage1DataSource]:
             )
         )
     return sources
+
+
+def _resolve_scene_id(dataset_dir: Path, sample_id: str) -> str:
+    """Read the canonical scene identifier used as the split group key."""
+    sample_json = dataset_dir / "samples" / f"{sample_id}.json"
+    if not sample_json.exists():
+        raise FileNotFoundError(f"Canonical sample JSON not found: {sample_json}")
+    with sample_json.open("r", encoding="utf-8") as f:
+        scene_id = json.load(f).get("scene_id")
+    if not scene_id:
+        raise ValueError(f"Canonical sample JSON must contain scene_id: {sample_json}")
+    return str(scene_id)
 
 
 def _resolve_voxel_path(dataset_dir: Path, sample_id: str, placement_payload: dict[str, Any]) -> Path:

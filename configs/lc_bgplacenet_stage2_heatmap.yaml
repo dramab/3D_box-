@@ -2,7 +2,7 @@ data:
   # 输入 active 点云的体素大小，单位为厘米；应与 point_clouds_voxel_1cm 保持一致。
   voxel_size_cm: 1.0
   # 复用 Stage 1 固定 train/valid/test 划分文件。
-  split_dir: data/splits/lc_bgplacenet_stage1
+  split_dir: data/splits/scene_aligned
   valid_fraction: 0.1
   test_fraction: 0.1
   split_seed: 20260624
@@ -76,7 +76,7 @@ loss:
     lambda_iou: 0.2
 
 training:
-  output_dir: outputs/lc_bgplacenet_stage2_heatmap_ft
+  output_dir: outputs/lc_bgplacenet_stage2_space_former_aligned_heatmap_ft
   # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
   stage1_pretrained_checkpoint:
   device: auto

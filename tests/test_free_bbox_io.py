@@ -1,6 +1,7 @@
 """free_bbox PLY 输出点集测试。"""
 
 import numpy as np
+import pytest
 
 from src.annotation.free_bbox.io_utils import (
     load_ply,
@@ -19,10 +20,23 @@ def _point_colors(points: np.ndarray, colors: np.ndarray) -> dict[tuple[float, .
     }
 
 
-def test_binary_mask_ply_keeps_non_occupied_support_voxels(tmp_path) -> None:
-    """形态学运算补出的非占据支撑体素应写入 PLY。"""
+def test_binary_mask_ply_rejects_non_active_support_voxels(tmp_path) -> None:
+    """模型 support mask 不得包含形态学补出的非 active 体素。"""
     grid = np.zeros((3, 3, 1), dtype=np.uint8)
     grid[0, 0, 0] = OCCUPIED
+    support = np.zeros_like(grid, dtype=bool)
+    support[1, 1, 0] = True
+    vp = {"origin": [0.0, 0.0, 0.0], "voxel_size": 1.0}
+
+    output_path = tmp_path / "support_mask.ply"
+    with pytest.raises(ValueError, match="non-active"):
+        save_binary_mask_ply(output_path, grid, vp, support)
+
+
+def test_binary_mask_ply_keeps_only_active_grid_points(tmp_path) -> None:
+    grid = np.zeros((3, 3, 1), dtype=np.uint8)
+    grid[0, 0, 0] = OCCUPIED
+    grid[1, 1, 0] = OCCUPIED
     support = np.zeros_like(grid, dtype=bool)
     support[1, 1, 0] = True
     vp = {"origin": [0.0, 0.0, 0.0], "voxel_size": 1.0}
@@ -36,14 +50,15 @@ def test_binary_mask_ply_keeps_non_occupied_support_voxels(tmp_path) -> None:
     assert point_colors[(1.5, 1.5, 0.5)] == (255, 255, 255)
 
 
-def test_heatmap_ply_keeps_non_occupied_support_and_heat_voxels(tmp_path) -> None:
-    """支撑面和正热力体素不在原始占据网格中时仍应写入 PLY。"""
+def test_heatmap_ply_uses_only_active_support_voxels(tmp_path) -> None:
+    """正热力必须同时属于 active occupancy 和 active support。"""
     grid = np.zeros((4, 3, 1), dtype=np.uint8)
     grid[0, 0, 0] = OCCUPIED
+    grid[1, 1, 0] = OCCUPIED
     support = np.zeros_like(grid, dtype=bool)
     support[1, 1, 0] = True
     heat_counts = np.zeros_like(grid, dtype=np.int64)
-    heat_counts[2, 1, 0] = 3
+    heat_counts[1, 1, 0] = 3
     vp = {"origin": [0.0, 0.0, 0.0], "voxel_size": 1.0}
 
     output_path = tmp_path / "heatmap.ply"
@@ -51,9 +66,12 @@ def test_heatmap_ply_keeps_non_occupied_support_and_heat_voxels(tmp_path) -> Non
     points, colors = load_ply(output_path)
     point_colors = _point_colors(points, colors)
 
-    assert len(points) == 3
-    assert point_colors[(1.5, 1.5, 0.5)] == (55, 120, 210)
-    assert point_colors[(2.5, 1.5, 0.5)] == (255, 0, 30)
+    assert len(points) == 2
+    assert point_colors[(1.5, 1.5, 0.5)] == (255, 0, 30)
+
+    heat_counts[2, 1, 0] = 1
+    with pytest.raises(ValueError, match="non-support"):
+        save_heatmap_ply(output_path, grid, vp, heat_counts, support_mask_3d=support)
 
 
 def test_center_yaw_set_npz_round_trip(tmp_path) -> None:

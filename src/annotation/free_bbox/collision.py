@@ -5,7 +5,8 @@ FFT 碰撞检测：在 (X, Y, yaw) 配置空间中搜索放置候选。
 
 相对旧实现的关键变化：
 1. landing_z 使用支撑面 table_z 本层，而不是 table_z + 1；
-2. 碰撞障碍中清除支撑面自身，允许 3D box 的底层落在支撑面体素层。
+2. 碰撞障碍中清除支撑面自身，允许 3D box 的底层落在支撑面体素层；
+3. 候选底面中心在生成阶段即限制到模型可见的 active support。
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from src.annotation.free_bbox.geometry import (
     compute_placed_transform_with_orientation,
     rotation_matrix_to_euler_zyx,
 )
+from src.annotation.free_bbox.filters import filter_bottom_center_on_surface
 from src.annotation.free_bbox.grid_ops import dilate_obstacles_xy, voxelize_obb
 from src.annotation.free_bbox.occupancy import OCCUPIED
 
@@ -98,12 +100,13 @@ def find_table_placements(
     vp: dict,
     table_z: int,
     surface_mask_2d: np.ndarray | None,
+    center_mask_2d: np.ndarray | None = None,
     safety_margin: float = 0.5,
     yaw_steps: int = 24,
     preserve_orientation: bool = True,
 ) -> tuple[np.ndarray, dict, dict]:
     """
-    在支撑面本层搜索无碰撞放置位置。
+    在补全支撑面上搜索无碰撞位置，并将底面中心限制到 active center mask。
 
     输出 candidates 格式为 (N, 3)，每行为 [grid_x, grid_y, yaw_index]。
     """
@@ -144,7 +147,6 @@ def find_table_placements(
     yaw_vmin_rot = []
     yaw_T_rotated = []
     yaw_footprints = []
-    valid_yaw_count = 0
     total_raw = 0
 
     empty_voxels = np.empty((0, 3), dtype=int)
@@ -196,7 +198,6 @@ def find_table_placements(
         if n_free > 0:
             yaw_col = np.full(n_free, yaw_idx, dtype=int)
             all_candidates.append(np.stack([cand_x, cand_y, yaw_col], axis=1))
-            valid_yaw_count += 1
 
         yaw_rel_voxels.append(rel_rot)
         yaw_vmin_rot.append(vmin_rot.astype(np.float64))
@@ -213,11 +214,19 @@ def find_table_placements(
         "original_yaw_index": 0,
         "pose_info": pose_info,
     }
+    if center_mask_2d is not None:
+        candidates, _ = filter_bottom_center_on_surface(
+            candidates,
+            yaw_data,
+            landing_z,
+            center_mask_2d,
+        )
     meta = {
         "total_xy": int(grid_x * grid_y),
-        "valid_raw": int(total_raw),
+        "collision_free_raw": int(total_raw),
+        "valid_raw": int(len(candidates)),
         "yaw_steps": int(yaw_steps),
-        "valid_yaw_angles": int(valid_yaw_count),
+        "valid_yaw_angles": int(len(np.unique(candidates[:, 2]))) if len(candidates) else 0,
         "landing_z": int(landing_z),
         "table_z": int(table_z),
         "safety_margin": float(safety_margin),
