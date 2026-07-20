@@ -7,6 +7,7 @@ import math
 from dataclasses import replace
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
@@ -16,6 +17,7 @@ from src.training.lc_bgplacenet_stage1 import (
     LCBGPlaceNetStage1Dataset,
     Stage1DataSource,
     STAGE1_SPLIT_SCHEMA_VERSION,
+    STAGE1_SUPPORTED_SPLIT_SCHEMA_VERSIONS,
     build_stage1_index,
     compute_stage1_metrics,
     stage1_item_to_split_record,
@@ -145,7 +147,8 @@ def test_stage1_dataset_reads_source_box_and_instruction(tmp_path) -> None:
     assert sample["instruction"] == "Move toy object to the right of the block."
 
 
-def test_stage1_dataset_reads_fixed_split_file(tmp_path) -> None:
+@pytest.mark.parametrize("schema_version", sorted(STAGE1_SUPPORTED_SPLIT_SCHEMA_VERSIONS))
+def test_stage1_dataset_reads_fixed_split_file(tmp_path, schema_version) -> None:
     """A fixed split file selects samples without re-running random splitting."""
     source = _make_tiny_stage1_source(tmp_path)
     items = build_stage1_index([source])
@@ -153,9 +156,12 @@ def test_stage1_dataset_reads_fixed_split_file(tmp_path) -> None:
     _write_json(
         split_dir / "train.json",
         {
-            "schema_version": STAGE1_SPLIT_SCHEMA_VERSION,
+            "schema_version": schema_version,
             "split": "train",
-            "group_by": ["source_name", "scene_id"],
+            "group_by": [
+                "source_name",
+                "sample_id" if schema_version.endswith("/v1") else "scene_id",
+            ],
             "item_count": 1,
             "items": [stage1_item_to_split_record(items[0])],
         },
@@ -170,6 +176,24 @@ def test_stage1_dataset_reads_fixed_split_file(tmp_path) -> None:
 
     assert len(dataset) == 1
     assert dataset[0]["sample_id"] == "toy__scene_0000__0000"
+
+
+def test_stage1_dataset_rejects_unknown_split_schema(tmp_path) -> None:
+    """Unknown split schemas remain blocked instead of being read silently."""
+    source = _make_tiny_stage1_source(tmp_path)
+    items = build_stage1_index([source])
+    split_dir = tmp_path / "splits"
+    _write_json(
+        split_dir / "train.json",
+        {
+            "schema_version": "lc_bgplacenet_stage1_splits/v999",
+            "split": "train",
+            "items": [stage1_item_to_split_record(items[0])],
+        },
+    )
+
+    with pytest.raises(ValueError, match="Unsupported split schema_version"):
+        LCBGPlaceNetStage1Dataset([source], split="train", split_dir=split_dir)
 
 
 def test_write_stage1_splits_groups_scenes_and_balances_item_counts(tmp_path) -> None:
@@ -205,6 +229,7 @@ def test_write_stage1_splits_groups_scenes_and_balances_item_counts(tmp_path) ->
     scene_splits = {}
     for split_name in ("train", "valid", "test"):
         payload = json.loads((tmp_path / "splits" / f"{split_name}.json").read_text())
+        assert payload["schema_version"] == STAGE1_SPLIT_SCHEMA_VERSION
         for row in payload["items"]:
             scene_splits.setdefault(row["scene_id"], set()).add(split_name)
     assert all(len(splits) == 1 for splits in scene_splits.values())

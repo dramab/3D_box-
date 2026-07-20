@@ -30,9 +30,13 @@ from src.models.lc_bgplacenet.stage2 import (
     prepare_sparse_lookup_index,
     sparse_nearest_lookup,
 )
-from src.training.lc_bgplacenet_stage1 import Stage1DataSource
+from src.training.lc_bgplacenet_stage1 import (
+    STAGE1_SUPPORTED_SPLIT_SCHEMA_VERSIONS,
+    Stage1DataSource,
+)
 from src.training.lc_bgplacenet_stage2 import (
     LCBGPlaceNetStage2Dataset,
+    _read_split_records,
     _build_lr_scheduler,
     _format_stage2_log,
     _hungarian_matches,
@@ -53,6 +57,32 @@ def _write_json(path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2)
+
+
+@pytest.mark.parametrize("schema_version", sorted(STAGE1_SUPPORTED_SPLIT_SCHEMA_VERSIONS))
+def test_stage2_reads_supported_split_schemas(tmp_path, schema_version) -> None:
+    split_dir = tmp_path / "splits"
+    _write_json(
+        split_dir / "train.json",
+        {"schema_version": schema_version, "split": "train", "items": [{"item_id": "item_0"}]},
+    )
+
+    assert _read_split_records(split_dir, "train") == [{"item_id": "item_0"}]
+
+
+def test_stage2_rejects_unknown_split_schema(tmp_path) -> None:
+    split_dir = tmp_path / "splits"
+    _write_json(
+        split_dir / "train.json",
+        {
+            "schema_version": "lc_bgplacenet_stage1_splits/v999",
+            "split": "train",
+            "items": [],
+        },
+    )
+
+    with pytest.raises(ValueError, match="Unsupported split schema_version"):
+        _read_split_records(split_dir, "train")
 
 
 def test_stage2_terminal_log_only_contains_core_metrics() -> None:

@@ -21,6 +21,10 @@ canonical world 必须满足：
 world-Z = 支撑面法向 / 重力上方向
 ```
 
+Stage 2 复用 `data.split_dir` 指向的 Stage 1 划分文件，读取器兼容 v1 和 v2。v1 仅用于与
+旧 Stage 1 checkpoint 保持原始实验划分一致；新实验应使用按 `scene_id` 隔离的 v2，避免
+同一场景的不同帧跨越训练、验证和测试集。
+
 ## 固定模型规模
 
 ```text

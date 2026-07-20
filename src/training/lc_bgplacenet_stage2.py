@@ -40,8 +40,8 @@ from src.models.lc_bgplacenet.stage2 import (
     yaw_bin_angles,
 )
 from src.training.lc_bgplacenet_stage1 import (
-    STAGE1_SPLIT_SCHEMA_VERSION,
     STAGE1_SPLIT_NAME_SET,
+    STAGE1_SUPPORTED_SPLIT_SCHEMA_VERSIONS,
     Stage1DataSource,
     _append_jsonl,
     _find_object_record,
@@ -571,7 +571,7 @@ def _read_split_records(split_dir: str | Path, split: str) -> list[dict[str, Any
         raise FileNotFoundError(f"Split file not found: {path}")
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
-    if payload.get("schema_version") != STAGE1_SPLIT_SCHEMA_VERSION:
+    if payload.get("schema_version") not in STAGE1_SUPPORTED_SPLIT_SCHEMA_VERSIONS:
         raise ValueError(f"Unsupported split schema_version in {path}: {payload.get('schema_version')}")
     if payload.get("split") not in STAGE1_SPLIT_NAME_SET:
         raise ValueError(f"Invalid split declaration in {path}: {payload.get('split')}")

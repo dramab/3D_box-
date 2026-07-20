@@ -58,6 +58,10 @@ data/splits/scene_aligned/
 `--overwrite`。训练和推理默认读取 `configs/lc_bgplacenet_stage1.yaml` 中的
 `data.split_dir`，因此生成后不需要每次重新生成。
 
+读取器兼容 `lc_bgplacenet_stage1_splits/v1` 和 `v2`，生成器仍只输出当前的 v2。
+v1 按 `(source_name, sample_id)` 划分，仅用于复用旧 checkpoint 的原始实验划分；同一场景的
+不同帧可能跨越多个 split，因此需要无场景泄漏的训练与评估时应使用 v2。
+
 ## 运行
 
 小步验证：

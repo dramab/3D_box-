@@ -2,7 +2,7 @@ data:
   # 输入 active 点云的体素大小，单位为厘米；应与 point_clouds_voxel_1cm 保持一致。
   voxel_size_cm: 1.0
   # 固定 train/valid/test 划分文件目录；先运行 tools/generate_lc_bgplacenet_stage1_splits.py 生成。
-  split_dir: data/splits/scene_aligned
+  split_dir: data/splits/active_aligned
   # 生成固定 split 时，以 canonical scene 为不可拆分分组，按 instance 数量逼近该验证集比例。
   valid_fraction: 0.1
   # 生成固定 split 时，以 canonical scene 为不可拆分分组，按 instance 数量逼近该测试集比例。

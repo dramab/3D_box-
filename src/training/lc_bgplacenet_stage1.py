@@ -35,7 +35,11 @@ from src.annotation.free_bbox.io_utils import load_ply
 from src.models.lc_bgplacenet.stage1 import LCBGPlaceNetStage1, aabb_iou_3d
 
 
+# New split files use v2; readers retain v1 support for legacy checkpoints.
 STAGE1_SPLIT_SCHEMA_VERSION = "lc_bgplacenet_stage1_splits/v2"
+STAGE1_SUPPORTED_SPLIT_SCHEMA_VERSIONS = frozenset(
+    {"lc_bgplacenet_stage1_splits/v1", STAGE1_SPLIT_SCHEMA_VERSION}
+)
 STAGE1_SPLIT_NAMES = ("train", "valid", "test")
 STAGE1_SPLIT_NAME_SET = set(STAGE1_SPLIT_NAMES)
 
@@ -369,7 +373,7 @@ def _read_stage1_split_records(split_dir: str | Path, split: str) -> list[dict[s
         raise FileNotFoundError(f"Stage 1 split file not found: {path}")
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
-    if payload.get("schema_version") != STAGE1_SPLIT_SCHEMA_VERSION:
+    if payload.get("schema_version") not in STAGE1_SUPPORTED_SPLIT_SCHEMA_VERSIONS:
         raise ValueError(f"Unsupported split schema_version in {path}: {payload.get('schema_version')}")
     if payload.get("split") != split_name:
         raise ValueError(f"Split file {path} declares split={payload.get('split')}, expected {split_name}")
