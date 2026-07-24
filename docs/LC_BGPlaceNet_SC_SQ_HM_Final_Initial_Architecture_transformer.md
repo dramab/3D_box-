@@ -13,12 +13,12 @@ text_tokens ──> 4-layer Region Cross Encoder ──> top-8 P3 cells
                                                        │
                                       expand to covered P1 active voxels
                                                        │
-                                           FPS / padding → 32 queries
+                                           FPS / padding → 48 queries
                                                        │
 source feature + source size ────────────────> 4-layer SPACE decoder
 text tokens ───────────────────────────────────────────┘
                                                        │
-                                  32 raw boxes → pose NMS → at most 16 boxes
+                                  48 raw boxes → pose NMS → at most 16 boxes
 ```
 
 Source Grounding 同时输出 `source_box` 与 `source_feature`。Source Size 被直接复制为所有放置 Box 的尺寸，Stage 2 不预测尺寸 residual。
@@ -111,25 +111,29 @@ placement_logit_l = placement_head(h)
 GT yaw 是 12-bin multi-hot mask，不要求选择唯一 yaw。匈牙利代价为：
 
 ```text
-C = 2 C_cls + 5 C_center + 2 C_yaw-bin + C_corner
+C = 2 C_cls + 8 C_center + C_yaw-bin + C_corner
 ```
 
 角点代价对当前 GT 中全部有效 yaw 取最小值。训练损失为：
 
 ```text
-L = 2 L_region + 2 L_cls + 5 L_center + 2 L_yaw
-    + L_corner + L_source + 0.5 L_aux
+L = 500 L_region + L_cls + 5 L_center + 0.5 L_yaw
+    + 0.5 L_corner + 0.5 L_source + 0.1 L_aux
+
+L_source = 4 L_source-center + 2 L_source-size + 0.2 L_source-IoU
 ```
+
+前三层辅助监督的内部比例与匹配一致，采用 `2 L_cls + 8 L_center + L_yaw + L_corner`。
 
 Stage 1 不冻结，使用 0.1× 学习率并持续接受 Source Box 监督。Stage 2 使用监控 validation `task_success_rate` 的 `ReduceLROnPlateau(mode=max, factor=0.5, patience=3, threshold=0.001, threshold_mode=abs)`。恢复训练先加载模型、AdamW moments 和 scheduler 历史，再由当前配置学习率覆盖两个参数组并保持 `0.1:1`。CLIP 是否冻结由原配置决定。
 
 ## 8. 输出
 
 ```text
-raw_place_boxes   [B,32,7]
-raw_place_logits  [B,32]
-raw_yaw_logits    [B,32,12]
-query_valid_mask  [B,32]
+raw_place_boxes   [B,48,7]
+raw_place_logits  [B,48]
+raw_yaw_logits    [B,48,12]
+query_valid_mask  [B,48]
 
 place_boxes       [B,16,7]
 place_scores      [B,16]

@@ -961,7 +961,7 @@ def _hungarian_matches(
             target_size,
             batch["gt_yaw_masks"][batch_index, target_indices],
         )
-        cost = 2.0 * cls_cost + 5.0 * center_cost + 2.0 * yaw_cost + corner_cost
+        cost = 2.0 * cls_cost + 8.0 * center_cost + yaw_cost + corner_cost
         pending.append(
             (batch_index, query_indices, target_indices, tuple(cost.shape), cost.numel())
         )
@@ -1088,21 +1088,21 @@ def compute_stage2_loss(
     auxiliary = outputs["raw_place_logits"].sum() * 0.0
     for prediction in outputs["decoder_aux_outputs"]:
         aux_terms = _set_losses_for_predictions(prediction, matches, outputs, batch)
-        auxiliary = auxiliary + 2.0 * aux_terms[0] + 5.0 * aux_terms[1] + 2.0 * aux_terms[2] + aux_terms[3]
+        auxiliary = auxiliary + 2.0 * aux_terms[0] + 8.0 * aux_terms[1] + aux_terms[2] + aux_terms[3]
 
     source_cfg = loss_cfg["source"]
     source_loss, source_terms = source_box_loss(
         outputs["source_box"],
         batch["source_box_gt"],
-        lambda_center=float(source_cfg.get("lambda_center", 2.0)),
-        lambda_size=float(source_cfg.get("lambda_size", 1.5)),
+        lambda_center=float(source_cfg.get("lambda_center", 4.0)),
+        lambda_size=float(source_cfg.get("lambda_size", 2.0)),
         lambda_iou=float(source_cfg.get("lambda_iou", 0.2)),
     )
     total = (
         float(loss_cfg.get("lambda_region", 1.0)) * region_loss
         + float(loss_cfg.get("lambda_cls", 2.0)) * cls_loss
         + float(loss_cfg.get("lambda_center", 5.0)) * center_loss
-        + float(loss_cfg.get("lambda_yaw", 2.0)) * yaw_loss
+        + float(loss_cfg.get("lambda_yaw", 0.5)) * yaw_loss
         + float(loss_cfg.get("lambda_corner", 1.0)) * corner_loss
         + float(loss_cfg.get("lambda_src", 1.0)) * source_loss
         + float(loss_cfg.get("lambda_aux", 0.5)) * auxiliary

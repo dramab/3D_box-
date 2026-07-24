@@ -23,7 +23,7 @@ from src.models.lc_bgplacenet.stage1 import (
 )
 
 
-NUM_QUERIES = 32
+NUM_QUERIES = 48
 NUM_SAMPLES = 64
 NUM_YAW_BINS = 12
 MAX_OUTPUT_BOXES = 16

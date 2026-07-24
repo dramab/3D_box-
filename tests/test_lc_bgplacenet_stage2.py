@@ -242,7 +242,11 @@ def _make_tiny_stage2_source(tmp_path) -> Stage1DataSource:
     return Stage1DataSource("toy", dataset_dir, free_bbox_dir, labels_path)
 
 
-def test_dataset_loads_multi_yaw_targets_and_pads_to_32(tmp_path) -> None:
+def test_space_former_uses_48_queries() -> None:
+    assert NUM_QUERIES == 48
+
+
+def test_dataset_loads_multi_yaw_targets_and_pads_to_48(tmp_path) -> None:
     source = _make_tiny_stage2_source(tmp_path)
     items = build_stage2_index([source])
     assert len(items) == 1

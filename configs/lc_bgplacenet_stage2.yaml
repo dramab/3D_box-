@@ -58,14 +58,14 @@ model:
     dropout: 0.1
     # Text-Guided Region Cross Encoder 的 Cross Block 层数。
     region_cross_num_layers: 4
-    # P3 hard proposal 保留得分最高的 8 个区域，再展开为固定 32 个 Query。
+    # P3 hard proposal 保留得分最高的 8 个区域，再展开为固定 48 个 Query。
     num_region_cells: 8
 
 loss:
   lambda_region: 500.0
   lambda_cls: 1.0
-  lambda_center: 2.0
-  lambda_yaw: 1.0
+  lambda_center: 5.0
+  lambda_yaw: 0.5
   lambda_corner: 0.5
   lambda_src: 0.5
   lambda_aux: 0.1
@@ -73,15 +73,15 @@ loss:
     alpha: 0.25
     gamma: 2.0
   source:
-    lambda_center: 2.0
-    lambda_size: 1.5
+    lambda_center: 4.0
+    lambda_size: 2.0
     lambda_iou: 0.2
 
 validation:
   size_iou_threshold: 0.8
 
 training:
-  output_dir: outputs/lc_bgplacenet_stage2_space_former_aligned
+  output_dir: outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query
   # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
   stage1_pretrained_checkpoint:
   device: auto

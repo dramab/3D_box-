@@ -13,7 +13,7 @@ Stage 2 使用 `SPACE-Former`（Size-Prompted Affordance and Collision Explorer�
 - `support_masks/*.ply`：与输入点云共用 canonical voxel key 的 active support。
 - auto-label：自然语言指令及关系参照物。
 
-数据集按 canonical voxel key 严格关联输入点云、active support、方向过滤正点和 yaw set，不执行最近邻吸附或距离容错。24 个 yaw bin 通过 `mask[:12] OR mask[12:]` 合并为 12 个 180° 等价 bin。GT 中心超过 32 个时使用空间 FPS；不足时由 `gt_valid_mask` padding。
+数据集按 canonical voxel key 严格关联输入点云、active support、方向过滤正点和 yaw set，不执行最近邻吸附或距离容错。24 个 yaw bin 通过 `mask[:12] OR mask[12:]` 合并为 12 个 180° 等价 bin。GT 中心超过 48 个时使用空间 FPS；不足时由 `gt_valid_mask` padding。
 
 canonical world 必须满足：
 
@@ -31,14 +31,14 @@ Stage 2 复用 `data.split_dir` 指向的 Stage 1 划分文件，读取器兼容
 P1/P2/P3 stride  = 1/2/4
 P3 cell          = 4 cm × 4 cm = 16 cm²
 coarse top cells = 8（约 128 cm²，不要求连续）
-queries          = 32
+queries          = 48
 samples/query    = 64 × 3 scales × 4 layers
 feature_dim      = 256
 yaw_bins         = 12
 max output       = 16
 ```
 
-P3 粗区域预测使用 P3 feature 和完整 `text_tokens`。每个有效 token 先查询 P3 memory，再与各 P3 cell 计算 compatibility，并通过带 attention mask 的 log-mean-exp 聚合，使方向词和对象词的强匹配能够主导区域分数。Cross Block 层数由 `model.space_former.region_cross_num_layers` 控制，当前为 4。Region target 由 `direction_filtered_heatmaps` 正点生成三维高斯分布，并在由 P1 active support 聚合得到的 P3 support 外置零；标准差为 `data.heatmap_sigma_voxels × data.voxel_size_cm`。`space_former.num_region_cells` 控制 hard top-K，当前 top-8 P3 cell 展开到其覆盖的 P1 active voxel 后，最多 FPS 采样 32 个 Anchor；support 只约束训练标签，不作为推理输入。候选不足时不扩区，padding Query 由 `query_valid_mask` 屏蔽。
+P3 粗区域预测使用 P3 feature 和完整 `text_tokens`。每个有效 token 先查询 P3 memory，再与各 P3 cell 计算 compatibility，并通过带 attention mask 的 log-mean-exp 聚合，使方向词和对象词的强匹配能够主导区域分数。Cross Block 层数由 `model.space_former.region_cross_num_layers` 控制，当前为 4。Region target 由 `direction_filtered_heatmaps` 正点生成三维高斯分布，并在由 P1 active support 聚合得到的 P3 support 外置零；标准差为 `data.heatmap_sigma_voxels × data.voxel_size_cm`。`space_former.num_region_cells` 控制 hard top-K，当前 top-8 P3 cell 展开到其覆盖的 P1 active voxel 后，最多 FPS 采样 48 个 Anchor；support 只约束训练标签，不作为推理输入。候选不足时不扩区，padding Query 由 `query_valid_mask` 屏蔽。
 
 第 0 个 Decoder 层使用 64 点外接圆柱模板；后 3 层使用上一层 yaw 构建 64 点定向 Box Surface。P1/P2/P3 将采样点量化到同格 sparse voxel key 后执行精确 hash lookup。未命中的零特征 token 不会被 Attention 删除，其 `sample_valid_mask=0` 仍携带“踩空/净空”含义。
 
@@ -47,13 +47,15 @@ P3 粗区域预测使用 P3 feature 和完整 `text_tokens`。每个有效 token
 总损失为：
 
 ```text
-L = 2 L_region + 2 L_cls + 5 L_center + 2 L_yaw
-    + L_corner + L_source + 0.5 L_aux
+L = 500 L_region + L_cls + 5 L_center + 0.5 L_yaw
+    + 0.5 L_corner + 0.5 L_source + 0.1 L_aux
 
-L_source = 2 L_source-center + 1.5 L_source-size + 0.2 L_source-IoU
+L_source = 4 L_source-center + 2 L_source-size + 0.2 L_source-IoU
 ```
 
-匹配代价为 `2 C_cls + 5 C_center + 2 C_yaw-bin + C_corner`。Yaw 使用 12 维 multi-hot `BCEWithLogits`，角点项在 GT 的全部有效 yaw 中取最小值。
+所有放置框直接复用 Source Size，因此独立的尺寸监督位于 `L_source-size`；当前有效优先级为放置中心、Source 中心、Source 尺寸、Yaw。
+
+匹配代价为 `2 C_cls + 8 C_center + C_yaw-bin + C_corner`。前三层辅助监督采用相同的 `2:8:1:1` 内部比例，并由总损失中的 `0.1 L_aux` 统一缩放。Yaw 使用 12 维 multi-hot `BCEWithLogits`，角点项在 GT 的全部有效 yaw 中取最小值。
 
 Stage 1 参数组使用 `training.lr × 0.1`，SPACE-Former 使用完整 `training.lr`。`ReduceLROnPlateau(mode=max)` 监控 validation `task_success_rate`，绝对提升不足 `0.001` 连续停滞超过 3 个 epoch 后将两个参数组学习率同时乘以 `0.5`。最佳 checkpoint 仅按 validation 的 top-1 `task_success_rate` 保存，不设置 Source IoU 门槛。该指标与推理最终采用的位姿一致，成功条件为尺寸 IoU ≥ 0.8、满足文本空间方向关系且与场景已有物体无碰撞。
 
