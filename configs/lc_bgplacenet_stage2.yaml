@@ -2,7 +2,7 @@ data:
   # 输入 active 点云的体素大小，单位为厘米；应与 point_clouds_voxel_1cm 保持一致。
   voxel_size_cm: 1.0
   # direction-filtered 正点高斯监督的标准差，单位为输入 voxel 数。
-  heatmap_sigma_voxels: 2.0
+  heatmap_sigma_voxels: 8.0
   # 复用 Stage 1 固定 train/valid/test 划分文件。
   split_dir: data/splits/active_aligned
   valid_fraction: 0.1
@@ -62,6 +62,8 @@ model:
     num_region_cells: 8
 
 loss:
+  # Source Size 归一化中心距离超过该代价时，Hungarian 可将 Query 分配给背景。
+  background_match_cost: 0.25
   lambda_region: 500.0
   lambda_cls: 1.0
   lambda_center: 5.0
@@ -81,7 +83,7 @@ validation:
   size_iou_threshold: 0.8
 
 training:
-  output_dir: outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query
+  output_dir: outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8
   # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
   stage1_pretrained_checkpoint:
   device: auto

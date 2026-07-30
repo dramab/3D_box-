@@ -246,16 +246,30 @@ def test_space_former_uses_48_queries() -> None:
     assert NUM_QUERIES == 48
 
 
-def test_dataset_loads_multi_yaw_targets_and_pads_to_48(tmp_path) -> None:
+def test_collate_keeps_all_targets_and_pads_only_to_batch_maximum(tmp_path) -> None:
     source = _make_tiny_stage2_source(tmp_path)
     items = build_stage2_index([source])
     assert len(items) == 1
     assert items[0].yaw_set_npz.exists()
     dataset = LCBGPlaceNetStage2Dataset([source], split="train", val_fraction=0.0)
-    batch = stage2_collate([dataset[0]], voxel_size_cm=1.0)
-    assert batch["gt_bottom_centers"].shape == (1, NUM_QUERIES, 3)
-    assert batch["gt_yaw_masks"].shape == (1, NUM_QUERIES, NUM_YAW_BINS)
-    assert batch["gt_valid_mask"].sum().item() == 1
+    single_target = dataset[0]
+    many_targets = dict(single_target)
+    target_count = NUM_QUERIES + 5
+    many_targets["gt_bottom_centers"] = np.repeat(
+        single_target["gt_bottom_centers"], target_count, axis=0
+    )
+    many_targets["gt_yaw_masks"] = np.repeat(
+        single_target["gt_yaw_masks"], target_count, axis=0
+    )
+    many_targets["gt_affordance_quality"] = np.repeat(
+        single_target["gt_affordance_quality"], target_count, axis=0
+    )
+
+    batch = stage2_collate([single_target, many_targets], voxel_size_cm=1.0)
+
+    assert batch["gt_bottom_centers"].shape == (2, target_count, 3)
+    assert batch["gt_yaw_masks"].shape == (2, target_count, NUM_YAW_BINS)
+    assert batch["gt_valid_mask"].sum(dim=1).tolist() == [1, target_count]
     assert batch["gt_yaw_masks"][0, 0, 0]
 
 
@@ -303,6 +317,29 @@ def test_target_alignment_uses_canonical_voxel_keys(tmp_path) -> None:
 
     assert targets["gt_bottom_centers"].shape == (2, 3)
     assert targets["gt_yaw_masks"].sum() == 2
+
+
+def test_target_builder_keeps_more_than_48_direction_positive_centers(tmp_path) -> None:
+    target_count = NUM_QUERIES + 5
+    yaw_set_path = tmp_path / "yaw_set.npz"
+    centers = np.stack(
+        [np.arange(target_count), np.zeros(target_count), np.zeros(target_count)], axis=1
+    ).astype(np.float32)
+    yaw_mask = np.zeros((target_count, 24), dtype=bool)
+    yaw_mask[:, 0] = True
+    save_center_yaw_set_npz(
+        yaw_set_path,
+        bottom_center_voxels=centers.astype(np.int32),
+        bottom_center_world=centers,
+        valid_yaw_mask=yaw_mask,
+        yaw_angles_rad=np.arange(24, dtype=np.float32) * (2 * math.pi / 24),
+        heat_counts=np.ones(target_count, dtype=np.int32),
+    )
+
+    targets = build_space_former_targets(yaw_set_path, centers)
+
+    assert targets["gt_bottom_centers"].shape == (target_count, 3)
+    assert targets["gt_yaw_masks"].shape == (target_count, NUM_YAW_BINS)
 
 
 def test_physical_templates_have_exactly_64_points_and_two_types() -> None:
@@ -636,6 +673,7 @@ def test_space_former_loss_backpropagates_to_source_prediction() -> None:
     cfg = {
         "data": {"voxel_size_cm": 1.0},
         "loss": {
+            "background_match_cost": 0.25,
             "lambda_region": 1.0, "lambda_cls": 2.0, "lambda_center": 5.0,
             "lambda_yaw": 2.0, "lambda_corner": 1.0, "lambda_src": 1.0, "lambda_aux": 0.5,
             "focal": {"alpha": 0.25, "gamma": 2.0},
@@ -644,6 +682,8 @@ def test_space_former_loss_backpropagates_to_source_prediction() -> None:
     }
     losses = compute_stage2_loss(outputs, batch, cfg)
     losses["loss"].backward()
+    assert losses["matched_query_count"].item() == 1
+    assert losses["background_query_count"].item() == 1
     assert source_box.grad is not None
     assert torch.isfinite(source_box.grad).all()
 
@@ -677,10 +717,71 @@ def test_batched_hungarian_preserves_expected_assignment_indices() -> None:
         "gt_yaw_masks": yaw_masks,
         "source_box_gt": outputs["source_box"].clone(),
     }
-    matches = _hungarian_matches(outputs, batch)
+    matches = _hungarian_matches(outputs, batch, background_match_cost=0.25)
     assert matches[0][0].tolist() == [0, 1]
     assert matches[0][1].tolist() == [0, 1]
     assert matches[1][0].numel() == matches[1][1].numel() == 0
+
+
+def test_hungarian_matches_only_by_gt_normalized_center() -> None:
+    outputs = {
+        "query_valid_mask": torch.tensor([[True, True]]),
+        "pred_bottom_centers": torch.tensor([[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]]]),
+    }
+    batch = {
+        "batch_size": 1,
+        "gt_valid_mask": torch.tensor([[True, True]]),
+        "gt_bottom_centers": torch.tensor([[[10.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]),
+        "source_box_gt": torch.tensor([[0.0, 0.0, 1.0, 2.0, 4.0, 2.0]]),
+    }
+
+    matches = _hungarian_matches(outputs, batch, background_match_cost=0.25)
+
+    assert matches[0][0].tolist() == [0, 1]
+    assert matches[0][1].tolist() == [1, 0]
+
+
+def test_hungarian_uses_background_for_query_far_from_all_positive_centers() -> None:
+    outputs = {
+        "query_valid_mask": torch.tensor([[True, True]]),
+        "pred_bottom_centers": torch.tensor([[[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]]]),
+    }
+    batch = {
+        "batch_size": 1,
+        "gt_valid_mask": torch.tensor([[True]]),
+        "gt_bottom_centers": torch.tensor([[[0.0, 0.0, 0.0]]]),
+        "source_box_gt": torch.tensor([[0.0, 0.0, 1.0, 2.0, 2.0, 2.0]]),
+    }
+
+    matches = _hungarian_matches(outputs, batch, background_match_cost=0.25)
+
+    assert matches[0][0].tolist() == [0]
+    assert matches[0][1].tolist() == [0]
+
+
+def test_all_background_loss_keeps_center_and_yaw_outputs_in_gradient_graph() -> None:
+    pred_logits = torch.zeros(1, 2, requires_grad=True)
+    pred_centers = torch.zeros(1, 2, 3, requires_grad=True)
+    pred_yaw_logits = torch.zeros(1, 2, NUM_YAW_BINS, requires_grad=True)
+    prediction = {
+        "pred_logits": pred_logits,
+        "pred_bottom_centers": pred_centers,
+        "pred_yaw_logits": pred_yaw_logits,
+    }
+    empty_indices = torch.empty(0, dtype=torch.long)
+
+    losses = stage2_training._set_losses_for_predictions(
+        prediction,
+        matches=[(empty_indices, empty_indices)],
+        outputs={"query_valid_mask": torch.tensor([[True, True]])},
+        batch={},
+    )
+    sum(losses).backward()
+
+    assert pred_centers.grad is not None
+    assert pred_yaw_logits.grad is not None
+    assert torch.count_nonzero(pred_centers.grad).item() == 0
+    assert torch.count_nonzero(pred_yaw_logits.grad).item() == 0
 
 
 def test_resume_lr_override_preserves_adamw_moments_and_plateau_halves_lr() -> None:

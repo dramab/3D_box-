@@ -108,13 +108,14 @@ placement_logit_l = placement_head(h)
 
 ## 7. 匹配与损失
 
-GT yaw 是 12-bin multi-hot mask，不要求选择唯一 yaw。匈牙利代价为：
+GT 保留全部 direction-filtered 合法中心，不执行 FPS 截断；GT yaw 是 12-bin multi-hot mask，不要求选择唯一 yaw。Hungarian 在全部真实中心和与有效 Query 等量的背景虚拟目标之间建立一对一关系：
 
 ```text
-C = 2 C_cls + 8 C_center + C_yaw-bin + C_corner
+C_match(i,j) = mean(abs(pred_bottom_center_i - gt_bottom_center_j) / gt_source_size)
+C_background = loss.background_match_cost = 0.25
 ```
 
-角点代价对当前 GT 中全部有效 yaw 取最小值。训练损失为：
+分类、Yaw 和角点不参与匹配，避免尚未收敛的属性预测改变空间目标。匹配真实中心的 Query 接受分类、中心、Yaw 和角点监督，其中角点损失对当前 GT 中全部有效 yaw 取最小值；匹配背景的 Query 只接受 placement score 为 0 的分类监督。训练损失为：
 
 ```text
 L = 500 L_region + L_cls + 5 L_center + 0.5 L_yaw

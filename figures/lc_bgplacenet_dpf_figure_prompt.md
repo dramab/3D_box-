@@ -22,7 +22,7 @@ A 类 Method Paper。图示结构选择：两阶段总览 + SPACE-Former 迭代�
 8. `Semantic Routing`：Query 对 CLIP text tokens 做 Cross-Attention，只输出 semantic feature。
 9. `Factorized Fusion`：门控融合 geometry/semantic feature；融合后的 feature 统一送入 center residual、12-bin yaw 和 placement score 三个预测头。
 10. 集合输出：32 个 raw boxes 经 score 排序与 pose NMS，输出最多 16 个 Box；所有 Box Size 严格复制 Source Size。
-11. 训练虚线支路：direction-filtered positive centers 映射到 P3 并 `3×3×1` 膨胀；24-bin yaw mask 合并为 12-bin multi-hot；Hungarian matching 代价为 `2 cls + 5 center + 2 yaw-bin + corner`。
+11. 训练虚线支路：全部 direction-filtered positive centers 生成 P3 高斯 region target，24-bin yaw mask 合并为 12-bin multi-hot；Query 与全部真实中心及等量背景虚拟目标进行一对一 Hungarian，真实代价为 Source Size 归一化中心距离，背景代价为 `0.25`。
 
 视觉要求：
 

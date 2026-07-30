@@ -431,28 +431,12 @@ def _row_membership(rows: np.ndarray, candidates: np.ndarray) -> np.ndarray:
     return np.isin(row_keys, candidate_keys)
 
 
-def _fps_numpy(points: np.ndarray, count: int, seed_index: int) -> np.ndarray:
-    """Deterministic NumPy FPS used to bound one GT center set."""
-    count = min(int(count), len(points))
-    if count <= 0:
-        return np.empty((0,), dtype=np.int64)
-    selected = np.empty((count,), dtype=np.int64)
-    selected[0] = int(seed_index)
-    min_distance = np.full((len(points),), np.inf, dtype=np.float64)
-    for output_index in range(1, count):
-        distance = np.square(points - points[selected[output_index - 1]]).sum(axis=1)
-        min_distance = np.minimum(min_distance, distance)
-        selected[output_index] = int(np.argmax(min_distance))
-    return selected
-
-
 def build_space_former_targets(
     yaw_set_path: str | Path,
     direction_positive_points: np.ndarray,
     voxel_size_cm: float = 1.0,
-    max_targets: int = NUM_QUERIES,
 ) -> dict[str, np.ndarray]:
-    """按 canonical voxel key 筛选方向有效中心并保留全部合法 yaw。"""
+    """按 canonical voxel key 保留全部方向有效中心及其合法 yaw。"""
     with np.load(yaw_set_path) as yaw_set:
         centers = np.asarray(yaw_set["bottom_center_world"], dtype=np.float32)
         mask24 = np.asarray(yaw_set["valid_yaw_mask"], dtype=bool)
@@ -478,11 +462,10 @@ def build_space_former_targets(
         raise ValueError(f"No direction-valid center/yaw targets remain in {yaw_set_path}")
 
     quality = 0.5 + 0.5 * mask12.sum(axis=1).astype(np.float32) / float(NUM_YAW_BINS)
-    selected = _fps_numpy(centers.astype(np.float64), max_targets, int(np.argmax(quality)))
     return {
-        "gt_bottom_centers": centers[selected].astype(np.float32),
-        "gt_yaw_masks": mask12[selected].astype(bool),
-        "gt_affordance_quality": quality[selected].astype(np.float32),
+        "gt_bottom_centers": centers.astype(np.float32),
+        "gt_yaw_masks": mask12.astype(bool),
+        "gt_affordance_quality": quality.astype(np.float32),
     }
 
 
@@ -602,6 +585,7 @@ def select_stage2_split_items(
 
 def stage2_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> dict[str, Any]:
     """Collate Stage 2 active voxel samples into one sparse-conv batch."""
+    max_target_count = max(len(item["gt_bottom_centers"]) for item in batch)
     features = []
     sparse_coords = []
     world_coords = []
@@ -675,11 +659,11 @@ def stage2_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> d
         target_centers = np.asarray(item["gt_bottom_centers"], dtype=np.float32)
         target_yaw = np.asarray(item["gt_yaw_masks"], dtype=bool)
         target_quality = np.asarray(item["gt_affordance_quality"], dtype=np.float32)
-        target_count = min(len(target_centers), NUM_QUERIES)
-        centers_pad = np.zeros((NUM_QUERIES, 3), dtype=np.float32)
-        yaw_pad = np.zeros((NUM_QUERIES, NUM_YAW_BINS), dtype=bool)
-        quality_pad = np.zeros((NUM_QUERIES,), dtype=np.float32)
-        valid_pad = np.zeros((NUM_QUERIES,), dtype=bool)
+        target_count = len(target_centers)
+        centers_pad = np.zeros((max_target_count, 3), dtype=np.float32)
+        yaw_pad = np.zeros((max_target_count, NUM_YAW_BINS), dtype=bool)
+        quality_pad = np.zeros((max_target_count,), dtype=np.float32)
+        valid_pad = np.zeros((max_target_count,), dtype=bool)
         centers_pad[:target_count] = target_centers[:target_count]
         yaw_pad[:target_count] = target_yaw[:target_count]
         quality_pad[:target_count] = target_quality[:target_count]
@@ -882,46 +866,14 @@ def _minimum_valid_corner_loss(
     return (chamfer.amin(dim=-1) / diagonal).mean()
 
 
-@torch.no_grad()
-def _pairwise_minimum_corner_cost(
-    pred_centers: torch.Tensor,
-    pred_sizes: torch.Tensor,
-    pred_yaw_logits: torch.Tensor,
-    target_centers: torch.Tensor,
-    target_sizes: torch.Tensor,
-    target_yaw_masks: torch.Tensor,
-) -> torch.Tensor:
-    """Compute pairwise minimum valid-yaw corner cost for matching."""
-    pred_corners = _box_corners_from_rotation(
-        pred_centers,
-        pred_sizes,
-        _yaw_rotations_from_logits(pred_yaw_logits),
-    )
-    angles = yaw_bin_angles(pred_centers.device, pred_centers.dtype)
-    cosine, sine = torch.cos(angles), torch.sin(angles)
-    zeros, ones = torch.zeros_like(angles), torch.ones_like(angles)
-    rotations = torch.stack(
-        [cosine, -sine, zeros, sine, cosine, zeros, zeros, zeros, ones], dim=-1
-    ).reshape(NUM_YAW_BINS, 3, 3)
-    target_corners = _box_corners_from_rotation(
-        target_centers[:, None, :].expand(-1, NUM_YAW_BINS, -1),
-        target_sizes[:, None, :].expand(-1, NUM_YAW_BINS, -1),
-        rotations[None].expand(len(target_centers), -1, -1, -1),
-    )
-    distance = torch.abs(
-        pred_corners[:, None, None, :, None, :] - target_corners[None, :, :, None, :, :]
-    ).sum(dim=-1)
-    chamfer = distance.amin(dim=-1).mean(dim=-1) + distance.amin(dim=-2).mean(dim=-1)
-    chamfer = chamfer.masked_fill(~target_yaw_masks[None], float("inf"))
-    diagonal = torch.linalg.vector_norm(target_sizes, dim=-1).clamp_min(1e-4)
-    return chamfer.amin(dim=-1) / diagonal[None, :]
-
-
 def _hungarian_matches(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
+    background_match_cost: float,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Match queries to GT sets with one device-to-host cost transfer."""
+    """Match queries one-to-one with all GT centers or fixed-cost background targets."""
+    if background_match_cost <= 0.0:
+        raise ValueError("background_match_cost must be positive")
     batch_size = int(batch["batch_size"])
     matches: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * batch_size
     pending = []
@@ -932,48 +884,39 @@ def _hungarian_matches(
         if len(query_indices) == 0 or len(target_indices) == 0:
             matches[batch_index] = (query_indices[:0], target_indices[:0])
             continue
-        logits = outputs["raw_place_logits"][batch_index, query_indices]
-        quality = batch["gt_affordance_quality"][batch_index, target_indices]
-        cls_cost = F.binary_cross_entropy_with_logits(
-            logits[:, None].expand(-1, len(target_indices)),
-            quality[None, :].expand(len(query_indices), -1),
-            reduction="none",
-        )
-        source_size = outputs["source_box"][batch_index, 3:6].detach().clamp_min(1e-4)
-        center_cost = torch.abs(
+        # 匹配只建立空间对应关系，分类、Yaw 和角点属性在匹配后单独监督。
+        target_size = batch["source_box_gt"][batch_index, 3:6].clamp_min(1e-4)
+        cost = torch.abs(
             outputs["pred_bottom_centers"][batch_index, query_indices, None, :]
             - batch["gt_bottom_centers"][batch_index, None, target_indices, :]
-        ).div(source_size).mean(dim=-1)
-        pred_yaw = outputs["raw_yaw_logits"][batch_index, query_indices]
-        target_yaw = batch["gt_yaw_masks"][batch_index, target_indices].to(pred_yaw.dtype)
-        yaw_cost = F.binary_cross_entropy_with_logits(
-            pred_yaw[:, None, :].expand(-1, len(target_indices), -1),
-            target_yaw[None, :, :].expand(len(query_indices), -1, -1),
-            reduction="none",
-        ).mean(dim=-1)
-        pred_size = outputs["source_box"][batch_index, 3:6][None].expand(len(query_indices), -1)
-        target_size = batch["source_box_gt"][batch_index, 3:6][None].expand(len(target_indices), -1)
-        corner_cost = _pairwise_minimum_corner_cost(
-            outputs["pred_bottom_centers"][batch_index, query_indices],
-            pred_size,
-            pred_yaw,
-            batch["gt_bottom_centers"][batch_index, target_indices],
-            target_size,
-            batch["gt_yaw_masks"][batch_index, target_indices],
+        ).div(target_size).mean(dim=-1)
+        # 每个有效 Query 配置一个独立背景列，使远离合法区域的预测可以不匹配真实正点。
+        background_cost = cost.new_full(
+            (len(query_indices), len(query_indices)), float(background_match_cost)
         )
-        cost = 2.0 * cls_cost + 8.0 * center_cost + yaw_cost + corner_cost
+        cost = torch.cat([cost, background_cost], dim=1)
         pending.append(
-            (batch_index, query_indices, target_indices, tuple(cost.shape), cost.numel())
+            (
+                batch_index,
+                query_indices,
+                target_indices,
+                len(target_indices),
+                tuple(cost.shape),
+                cost.numel(),
+            )
         )
         flat_costs.append(cost.reshape(-1))
 
     if flat_costs:
         costs_cpu = torch.cat(flat_costs).detach().float().cpu().numpy()
         offset = 0
-        for batch_index, query_indices, target_indices, shape, count in pending:
+        for batch_index, query_indices, target_indices, target_count, shape, count in pending:
             cost_matrix = costs_cpu[offset : offset + count].reshape(shape)
             offset += count
             pred_rows, target_rows = linear_sum_assignment(cost_matrix)
+            real_match = target_rows < target_count
+            pred_rows = pred_rows[real_match]
+            target_rows = target_rows[real_match]
             matches[batch_index] = (
                 query_indices[torch.as_tensor(pred_rows, device=query_indices.device)],
                 target_indices[torch.as_tensor(target_rows, device=target_indices.device)],
@@ -1009,7 +952,12 @@ def _set_losses_for_predictions(
         prediction["pred_logits"][valid_queries], score_target[valid_queries]
     )
     if not pred_centers:
-        zero = prediction["pred_logits"].sum() * 0.0
+        # 全背景 batch 没有回归目标，但仍需让回归头进入计算图以完成 DDP 梯度归约。
+        zero = (
+            prediction["pred_logits"].sum()
+            + prediction["pred_bottom_centers"].sum()
+            + prediction["pred_yaw_logits"].sum()
+        ) * 0.0
         return cls_loss, zero, zero, zero
     pred_center = torch.cat(pred_centers)
     target_center = torch.cat(target_centers)
@@ -1076,7 +1024,15 @@ def compute_stage2_loss(
             int(batch["batch_size"]),
             int(space_cfg.get("num_region_cells", 8)),
         )
-    matches = _hungarian_matches(outputs, batch)
+    matches = _hungarian_matches(
+        outputs,
+        batch,
+        background_match_cost=float(loss_cfg["background_match_cost"]),
+    )
+    matched_query_count = outputs["raw_place_logits"].new_tensor(
+        sum(len(query_indices) for query_indices, _ in matches)
+    )
+    valid_query_count = outputs["query_valid_mask"].sum()
     final_prediction = {
         "pred_bottom_centers": outputs["pred_bottom_centers"],
         "pred_yaw_logits": outputs["raw_yaw_logits"],
@@ -1119,7 +1075,9 @@ def compute_stage2_loss(
         "region_target_mass": region_target.sum().detach(),
         "region_selected_cell_count": outputs["region_selected_cell_count"].sum().detach(),
         "expanded_p1_candidate_count": outputs["expanded_p1_candidate_count"].sum().detach(),
-        "valid_query_count": outputs["query_valid_mask"].sum().detach(),
+        "valid_query_count": valid_query_count.detach(),
+        "matched_query_count": matched_query_count.detach(),
+        "background_query_count": (valid_query_count - matched_query_count).detach(),
         "padded_query_count": (~outputs["query_valid_mask"]).sum().detach(),
     }
     if p3_gt_point_coverage is not None:
@@ -1623,7 +1581,14 @@ def evaluate_stage2(
         for key, value in metric_sums.items():
             totals[key] += value
         for key, value in losses.items():
-            if key in {"valid_query_count", "padded_query_count", "region_selected_cell_count", "expanded_p1_candidate_count"} or (
+            if key in {
+                "valid_query_count",
+                "matched_query_count",
+                "background_query_count",
+                "padded_query_count",
+                "region_selected_cell_count",
+                "expanded_p1_candidate_count",
+            } or (
                 key.startswith("layer") and key.endswith("_count")
             ):
                 validation_log_sums[key] = validation_log_sums.get(key, 0.0) + float(value.detach().cpu())
@@ -1669,6 +1634,8 @@ def evaluate_stage2(
         elif key.endswith("_bottom_active_count") or key.endswith("_nonbottom_active_count"):
             denominator_key = key.replace("_active_count", "_sample_count")
         elif key.endswith("_all_zero_sample_query_count"):
+            denominator_key = "valid_query_count"
+        elif key in {"matched_query_count", "background_query_count"}:
             denominator_key = "valid_query_count"
         if denominator_key is not None:
             denominator = max(validation_log_sums.get(denominator_key, 0.0), 1.0)
