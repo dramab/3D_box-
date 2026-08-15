@@ -118,7 +118,20 @@ python tools/infer_lc_bgplacenet_stage2.py \
   --split valid --max-samples 20
 ```
 
-`predictions.json` 中 `place_box` 保留 top-1 兼容字段，`placements` 保存最多 16 个 `{box, score, yaw_bin}`。`pred_heatmaps/*.ply` 现在可视化 P3 粗区域概率，而非旧版 dense placement heatmap。
+`predictions.json` 中 `place_box` 保留 top-1 兼容字段，`placements` 保存最多 16 个 `{box, score, yaw_bin}`。`pred_heatmaps/*.ply` 可视化 P3 粗区域概率，而非旧版 dense placement heatmap。
+
+推理还会在 `decoder_stages/` 中保存 SPACE-Former 四层 Decoder 的候选框投影图，并在每条 prediction 的新增 `decoder_stages` 字段记录各层的候选框、分数、yaw bin 和图片路径。前三层使用与最终推理相同的 Pose NMS；第四层直接复用原有最终后处理结果，因此顶层 `place_box`、`placements` 以及 benchmark 的检测输入不变。
+
+生成四阶段静态可视化网站：
+
+```bash
+python tools/export_lc_bgplacenet_stage2_inference_web.py \
+  --config configs/lc_bgplacenet_stage2.yaml \
+  --input-dir outputs/lc_bgplacenet_stage2_space_former_aligned/inference_stage2_valid \
+  --split valid
+```
+
+网页输出为 `<input-dir>/web_vis/index.html`，默认分页并按需渲染样本，避免一次性加载全量 decoder PNG。页面只额外生成 P3 俯视 heatmap 到 `web_vis/assets/`，Decoder 1～4 和最终 top-1 图片仍引用推理目录中的原始文件，不复制大图。点击任一阶段后可用左右方向键切换。最终 top-1 图和 P3 粗区域 heatmap 位于每条样本的折叠诊断区域。
 
 ## 测试
 

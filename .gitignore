@@ -6,3 +6,8 @@ outputs/
 .pytest_cache/
 qianwen_outputs/
 outputs_new/
+hf_cache/
+checkpoints/
+cache/
+external/
+*.tar.gz

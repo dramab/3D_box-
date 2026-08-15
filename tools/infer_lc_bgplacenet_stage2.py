@@ -35,7 +35,11 @@ os.environ.setdefault("MPLCONFIGDIR", os.fspath(PROJECT_ROOT / "outputs" / ".mat
 
 from src.annotation.free_bbox.io_utils import load_ply, save_ply
 from src.datasets.canonical import ObjectInfo, load_canonical_scene
-from src.models.lc_bgplacenet.stage2 import LCBGPlaceNetDensePlacement
+from src.models.lc_bgplacenet.stage2 import (
+    LCBGPlaceNetDensePlacement,
+    boxes_from_bottom_centers,
+    pose_nms,
+)
 from src.training.lc_bgplacenet_stage2 import (
     Stage2IndexItem,
     _quantize_world_points,
@@ -52,6 +56,7 @@ from src.visualization.bbox_projection import BOX_EDGES, project_world
 PRED_SOURCE_COLOR = (230, 57, 70)
 PRED_PLACE_COLOR = (37, 99, 235)
 GT_PLACE_COLOR = (29, 128, 91)
+DECODER_CANDIDATE_COLOR = (96, 165, 250)
 PRED_HEATMAP_COLORS = np.array(
     [
         [37, 99, 235],
@@ -368,6 +373,108 @@ def export_visualization(
     image.save(output_path)
 
 
+def build_decoder_stage_predictions(outputs: dict[str, torch.Tensor]) -> list[dict[str, torch.Tensor]]:
+    """Postprocess all four decoder layers without changing the final prediction path."""
+    query_valid_mask = outputs["query_valid_mask"]
+    source_size = outputs["source_box"][:, 3:6].clamp_min(1e-4)
+    stages = []
+    for prediction in outputs["decoder_aux_outputs"]:
+        raw_boxes = boxes_from_bottom_centers(
+            prediction["pred_bottom_centers"], source_size, prediction["pred_yaw_indices"]
+        )
+        stages.append(
+            pose_nms(
+                raw_boxes,
+                prediction["pred_logits"],
+                prediction["pred_yaw_logits"],
+                query_valid_mask,
+            )
+        )
+
+    # 第四层直接复用模型最终后处理结果，确保 benchmark 的输入完全不变。
+    stages.append(
+        {
+            "place_boxes": outputs["place_boxes"],
+            "place_scores": outputs["place_scores"],
+            "place_yaw_bins": outputs["place_yaw_bins"],
+            "place_valid_mask": outputs["place_valid_mask"],
+            "place_box": outputs["place_box"],
+        }
+    )
+    return stages
+
+
+def export_decoder_stage_visualizations(
+    item: Stage2IndexItem,
+    source_box: np.ndarray,
+    decoder_stages: list[dict[str, np.ndarray]],
+    output_paths: list[Path],
+    line_width: int,
+    draw_gt: bool,
+) -> None:
+    """Export four RGB panels showing each decoder layer's retained candidates."""
+    sample_path = item.dataset_dir / "samples" / f"{item.sample_id}.json"
+    scene = load_canonical_scene(sample_path, dataset_root=item.dataset_dir)
+    obj = _find_scene_object(scene, item.object_id)
+    source_corners = source_box_to_oriented_corners(source_box, np.asarray(obj.pose_world))
+
+    for stage_index, (stage, output_path) in enumerate(zip(decoder_stages, output_paths), start=1):
+        image = Image.fromarray(scene.rgb).convert("RGB")
+        draw = ImageDraw.Draw(image)
+        draw_world_corners(draw, source_corners, scene, PRED_SOURCE_COLOR, line_width, "pred source")
+        if draw_gt:
+            draw_world_corners(
+                draw,
+                place_box_to_corners(item.place_box_gt),
+                scene,
+                GT_PLACE_COLOR,
+                line_width,
+                "gt place",
+            )
+
+        valid_indices = np.flatnonzero(stage["place_valid_mask"])
+        # 低分候选先绘制，最高分候选最后覆盖，保持收敛主路径清晰可见。
+        for rank, candidate_index in reversed(list(enumerate(valid_indices, start=1))):
+            is_best = rank == 1
+            color = PRED_PLACE_COLOR if is_best else DECODER_CANDIDATE_COLOR
+            width = line_width + 1 if is_best else max(1, line_width - 1)
+            score = float(stage["place_scores"][candidate_index])
+            label = f"D{stage_index} best {score:.3f}" if is_best else ""
+            draw_world_corners(
+                draw,
+                place_box_to_corners(stage["place_boxes"][candidate_index]),
+                scene,
+                color,
+                width,
+                label,
+            )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(output_path)
+
+
+def decoder_stage_to_record(
+    stage_index: int,
+    stage: dict[str, np.ndarray],
+    visualization_path: Path,
+) -> dict[str, Any]:
+    """Serialize one postprocessed decoder layer for JSON and the web viewer."""
+    valid_indices = np.flatnonzero(stage["place_valid_mask"])
+    placements = [
+        {
+            "box": stage["place_boxes"][index].tolist(),
+            "score": float(stage["place_scores"][index]),
+            "yaw_bin": int(stage["place_yaw_bins"][index]),
+        }
+        for index in valid_indices
+    ]
+    return {
+        "stage": int(stage_index),
+        "best_place_score": float(stage["place_scores"][0]),
+        "placements": placements,
+        "visualization_png": os.fspath(visualization_path),
+    }
+
+
 def colorize_predicted_heatmap(scores: np.ndarray) -> np.ndarray:
     """Color predicted placement probabilities with per-sample contrast stretching."""
     values = np.asarray(scores, dtype=np.float32).clip(0.0, 1.0)
@@ -416,6 +523,7 @@ def main() -> None:
     split_name = "valid" if args.split == "val" else args.split
     output_dir = args.output_dir or Path(cfg["training"]["output_dir"]) / f"inference_stage2_{split_name}"
     heatmap_dir = output_dir / "pred_heatmaps"
+    decoder_stage_dir = output_dir / "decoder_stages"
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
 
@@ -433,11 +541,19 @@ def main() -> None:
             region_scores = torch.sigmoid(outputs["region_logits"]).detach().cpu().numpy()
             region_points = outputs["region_world_coords"].detach().cpu().numpy()
             region_batch_indices = outputs["region_batch_indices"].detach().cpu().numpy()
+            decoder_stages = [
+                {key: value.detach().cpu().numpy() for key, value in stage.items()}
+                for stage in build_decoder_stage_predictions(outputs)
+            ]
 
             for row_idx, item in enumerate(raw_items):
                 stem = f"{item.item_id}__{item.sample_id}__{item.object_id}__cluster_{item.cluster_id:03d}"
                 vis_path = output_dir / f"{stem}.png"
                 pred_heatmap_path = heatmap_dir / f"{stem}__pred_heatmap.ply"
+                decoder_stage_paths = [
+                    decoder_stage_dir / f"{stem}__decoder_{stage_index}.png"
+                    for stage_index in range(1, 5)
+                ]
                 row_mask = region_batch_indices == row_idx
                 save_predicted_heatmap_ply(
                     pred_heatmap_path,
@@ -449,6 +565,18 @@ def main() -> None:
                     source_boxes[row_idx],
                     place_boxes[row_idx],
                     vis_path,
+                    line_width=int(args.line_width),
+                    draw_gt=not args.no_gt,
+                )
+                row_decoder_stages = [
+                    {key: value[row_idx] for key, value in stage.items()}
+                    for stage in decoder_stages
+                ]
+                export_decoder_stage_visualizations(
+                    item,
+                    source_boxes[row_idx],
+                    row_decoder_stages,
+                    decoder_stage_paths,
                     line_width=int(args.line_width),
                     draw_gt=not args.no_gt,
                 )
@@ -476,6 +604,12 @@ def main() -> None:
                         "best_place_score": float(placement_scores[row_idx, 0]),
                         "visualization_png": os.fspath(vis_path),
                         "pred_heatmap_ply": os.fspath(pred_heatmap_path),
+                        "decoder_stages": [
+                            decoder_stage_to_record(stage_index, stage, stage_path)
+                            for stage_index, (stage, stage_path) in enumerate(
+                                zip(row_decoder_stages, decoder_stage_paths), start=1
+                            )
+                        ],
                     }
                 )
 
