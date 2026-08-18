@@ -2,7 +2,13 @@
 .codex/
 data/
 __pycache__/
-outputs/
+outputs/*
+!outputs/enrich_labels_safe_common.py
+!outputs/enrich_dopose_full.py
+!outputs/enrich_hope_full.py
+!outputs/enrich_housecat_full.py
+!outputs/enrich_omni_full.py
+!outputs/enrich_ycbv_full.py
 .pytest_cache/
 qianwen_outputs/
 outputs_new/

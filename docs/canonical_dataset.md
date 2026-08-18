@@ -149,3 +149,16 @@ data/canonical/hope/rgb_bbox_vis/
 ```
 
 > Omni6DPose 转换会在转换每帧时自动生成同名投影图到输出目录的 `rgb_bbox_vis/`，无需再单独运行此工具；被跳过的帧（pose 与 mask 横向偏差超阈值等）不会生成。
+
+## 稀疏体素论文图
+
+将 1 cm 稀疏体素点云按样本的真实相机参数投影到 RGB 像素平面，可得到与 RGB 观察方向严格一致、无三维网格和坐标轴的论文插图：
+
+```bash
+python tools/export_canonical_sparse_voxel_vis.py \
+    --dataset-dir data/hope \
+    --sample-id hope__scene_0000__0005 \
+    --output-dir outputs/visualizations
+```
+
+工具会同时输出两组 PNG 预览和矢量 PDF：`*_sparse_voxels` 与 RGB 像素级对齐；`*_sparse_voxels_oblique_3d` 保留真实相机的水平观察方位，将 world-Z 校正为画面竖直方向，并以固定斜俯视透视突出桌面和物体的三维结构。像素对齐图的点面积由 `--point-size` 控制，默认值为 `24 pt^2`；斜俯视图由 `--oblique-point-size` 控制，默认值为 `36 pt^2`。

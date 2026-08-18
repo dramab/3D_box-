@@ -98,39 +98,29 @@ def _candidate_distance_cm(target_corners: np.ndarray, ref_corners: np.ndarray) 
 
 
 def build_direction_metadata_item(item: Any, mapping_data: dict[str, str]) -> dict[str, Any]:
-    """Build one metadata row by parsing the instruction and resolving its reference object."""
-    target_relation, reference_name = parse_target_direction(item.instruction)
+    """Build one metadata row from structured placement relation metadata."""
+    target_relation = str(item.target_relation)
     scene_context = load_direction_scene_context(item)
     target_corners = place_box_to_corners(item.place_box_gt)
-    reference_key = _normalize_name(reference_name)
-    candidates = []
+    ref_obj = scene_context["object_by_id"].get(str(item.reference_object_id))
+    if ref_obj is None:
+        raise ValueError(f"Reference object {item.reference_object_id} not found for {item.item_id}")
 
-    for ref_obj in scene_context["object_by_id"].values():
-        ref_names = {
-            _normalize_name(_display_name(ref_obj, mapping_data)),
-            _normalize_name(ref_obj.class_name),
-        }
-        if reference_key not in ref_names:
-            continue
-        ref_corners = object_corners_world(ref_obj)
-        relation = describe_spatial_relation(
-            target_corners,
-            ref_corners,
-            scene_context["camera"].E_w2c,
-            scene_context["camera"].K,
-        )
-        if relation != target_relation:
-            continue
-        candidates.append((_candidate_distance_cm(target_corners, ref_corners), ref_obj))
-
-    if not candidates:
+    ref_corners = object_corners_world(ref_obj)
+    relation = describe_spatial_relation(
+        target_corners,
+        ref_corners,
+        scene_context["camera"].E_w2c,
+        scene_context["camera"].K,
+    )
+    if relation != target_relation:
         raise ValueError(
-            f"Cannot resolve target reference for {item.item_id}: "
-            f"relation={target_relation!r}, reference_name={reference_name!r}"
+            f"Structured placement relation mismatch for {item.item_id}: "
+            f"expected={target_relation!r}, actual={relation!r}, reference_object_id={item.reference_object_id!r}"
         )
 
-    candidates.sort(key=lambda pair: pair[0])
-    distance_cm, ref_obj = candidates[0]
+    reference_name = _display_name(ref_obj, mapping_data)
+    distance_cm = _candidate_distance_cm(target_corners, ref_corners)
     return {
         "item_id": item.item_id,
         "source_name": item.source_name,
@@ -143,7 +133,7 @@ def build_direction_metadata_item(item: Any, mapping_data: dict[str, str]) -> di
         "reference_class_name": str(ref_obj.class_name),
         "reference_name": reference_name,
         "reference_distance_cm": float(distance_cm),
-        "reference_candidate_count": int(len(candidates)),
+        "reference_candidate_count": 1,
     }
 
 
