@@ -44,7 +44,7 @@ from src.datasets.canonical import load_sample_record
 
 DEFAULT_CONFIG = PROJECT_ROOT / "configs/lc_bgplacenet_stage2.yaml"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "baselines/robobrain2_5/hf_cache/RoboBrain2.5-8B-NV"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs/robobrain2_5_zero_shot_test_official_prompt_gt"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs/robobrain2_5_front_behind_swapped"
 
 
 OFFICIAL_POINTING_SUFFIX = (
@@ -52,14 +52,37 @@ OFFICIAL_POINTING_SUFFIX = (
     "i.e. [(x, y)], where the tuple contains the x and y coordinates of a point satisfying the conditions above."
 )
 
+FRONT_BEHIND_RELATION_SWAPS = (
+    ("in front of ", "behind "),
+    ("behind ", "in front of "),
+    ("the front left of ", "the back left of "),
+    ("the back left of ", "the front left of "),
+    ("the front right of ", "the back right of "),
+    ("the back right of ", "the front right of "),
+)
+
+
+def swap_front_behind_relation(destination_clause: str) -> str:
+    """Swap the benchmark's front/back direction while preserving the reference object."""
+    for source_prefix, target_prefix in FRONT_BEHIND_RELATION_SWAPS:
+        if destination_clause.startswith(source_prefix):
+            return target_prefix + destination_clause[len(source_prefix) :]
+    return destination_clause
+
 
 def pointing_prompt_from_instruction(instruction: str) -> str:
-    """Rewrite our move template as RoboBrain's official vacant-space referring prompt."""
+    """Rewrite a move label and align its front/back direction with RoboBrain."""
     text = str(instruction).strip().rstrip(".")
     source_clause, separator, destination_clause = text.rpartition(" to ")
     if not separator or not source_clause.startswith("Move ") or not destination_clause:
         raise ValueError(f"Expected a templated move instruction, got: {instruction!r}")
+    destination_clause = swap_front_behind_relation(destination_clause)
     return f"Identify spot within the vacant space that's {destination_clause}."
+
+
+def model_prompt_from_instruction(instruction: str) -> str:
+    """Return the exact prompt passed to the model, including the official suffix."""
+    return pointing_prompt_from_instruction(instruction) + OFFICIAL_POINTING_SUFFIX
 
 
 
@@ -178,9 +201,8 @@ class RoboBrainPointModel:
         self.max_new_tokens = int(max_new_tokens)
         self.input_device = next(self.model.parameters()).device
 
-    def predict(self, instruction: str, rgb_path: Path) -> str:
-        text = pointing_prompt_from_instruction(instruction) + OFFICIAL_POINTING_SUFFIX
-        messages = [{"role": "user", "content": [{"type": "image", "image": f"file://{rgb_path}"}, {"type": "text", "text": text}]}]
+    def predict(self, model_prompt: str, rgb_path: Path) -> str:
+        messages = [{"role": "user", "content": [{"type": "image", "image": f"file://{rgb_path}"}, {"type": "text", "text": model_prompt}]}]
         chat = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = self.process_vision_info(messages)
         inputs = self.processor(text=[chat], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
@@ -192,7 +214,8 @@ class RoboBrainPointModel:
 
 
 def output_record(
-    item: dict[str, Any], scene: dict[str, Any], ground_truth: dict[str, Any], answer: str, output_dir: Path
+    item: dict[str, Any], scene: dict[str, Any], ground_truth: dict[str, Any], model_prompt: str,
+    answer: str, output_dir: Path
 ) -> dict[str, Any]:
     point, status = parse_point_answer(answer)
     pixel: tuple[int, int] | None = None
@@ -229,6 +252,7 @@ def output_record(
         "object_id": str(item["object_id"]),
         "cluster_id": int(cluster_id) if cluster_id is not None else None,
         "instruction": str(item["instruction"]),
+        "model_prompt": model_prompt,
         "raw_answer": answer, "normalized_point": list(point) if point is not None else None,
         "pixel": list(pixel) if pixel is not None else None, "world_point_cm": world_point.tolist() if world_point is not None else None,
         "render_box_world": candidate_box, "status": status, "visualization_path": str(visual_rel),
@@ -276,12 +300,13 @@ def main() -> None:
         dataset_dir = source["dataset_dir"]
         scene = load_scene(str(dataset_dir), str(item["sample_id"]))
         ground_truth = load_ground_truth_placement(item, source)
+        model_prompt = model_prompt_from_instruction(str(item["instruction"]))
         try:
-            answer = model.predict(str(item["instruction"]), Path(scene["rgb_path"]))
-            row = output_record(item, scene, ground_truth, answer, output_dir)
+            answer = model.predict(model_prompt, Path(scene["rgb_path"]))
+            row = output_record(item, scene, ground_truth, model_prompt, answer, output_dir)
         except Exception as error:
             answer = f"INFERENCE_ERROR: {type(error).__name__}: {error}"
-            row = output_record(item, scene, ground_truth, answer, output_dir)
+            row = output_record(item, scene, ground_truth, model_prompt, answer, output_dir)
             row["status"] = "inference_failed"
         write_jsonl(predictions_path, row)
         print(f"[{index}/{len(items)}] {item_id}: {row['status']}", flush=True)

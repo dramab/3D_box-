@@ -3,16 +3,86 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 from PIL import Image
 
 import tools.infer_lc_bgplacenet_stage2 as inference
+import tools.render_lc_bgplacenet_stage2_point_mask as point_mask_vis
 from src.annotation.free_bbox.io_utils import save_ply
 from src.models.lc_bgplacenet.stage2 import NUM_YAW_BINS
 from tools.benchmark_lc_bgplacenet_stage2 import load_predictions
 from tools.export_lc_bgplacenet_stage2_inference_web import collect_rows, write_html
+
+
+def test_continuous_mask_maps_all_scores_and_preserves_zero_response_color() -> None:
+    scene_points = np.asarray([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [20.0, 0.0, 0.0]])
+    heatmap_points = np.asarray([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
+    heatmap_scores = np.asarray([0.2, 0.8], dtype=np.float32)
+    colors = np.asarray([[100, 120, 140], [40, 60, 80], [10, 20, 30]], dtype=np.uint8)
+
+    point_scores = point_mask_vis.map_continuous_scores(
+        scene_points, heatmap_points, heatmap_scores, p3_stride_cm=4.0
+    )
+    blended = point_mask_vis.blend_continuous_mask(colors, point_scores)
+    point_sizes = point_mask_vis.continuous_mask_point_sizes(point_scores)
+
+    np.testing.assert_allclose(point_scores, [0.2, 0.8, 0.0])
+    np.testing.assert_allclose(blended[2], colors[2] / 255.0)
+    assert blended[1, 0] > colors[1, 0] / 255.0
+    assert point_sizes[1] > point_sizes[0] > point_sizes[2]
+    assert point_sizes[2] == point_mask_vis.LOCAL_POINT_SIZE
+
+
+def test_local_crop_keeps_semantic_core_and_removes_unrelated_points() -> None:
+    points = np.asarray([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [20.0, 0.0, 0.0]])
+    scores = np.asarray([0.0, 0.8, 0.0], dtype=np.float32)
+    source_corners = np.asarray([[0.0, 0.0, 0.0]])
+    prediction_corners = np.asarray([[2.0, 0.0, 0.0]])
+
+    keep = point_mask_vis.local_crop_mask(
+        points, scores, source_corners, prediction_corners
+    )
+
+    assert keep.tolist() == [True, True, False]
+
+
+def test_prediction_only_item_uses_canonical_source_metadata(tmp_path, monkeypatch) -> None:
+    dataset_dir = tmp_path / "hope"
+    sample_dir = dataset_dir / "samples"
+    sample_dir.mkdir(parents=True)
+    sample_id = "hope__scene_0000__0005"
+    sample_record = {
+        "rgb_path": "rgb/sample.jpg",
+        "voxel_point_cloud_path": "point_clouds_voxel_1cm/sample.ply",
+        "camera": {
+            "fx": 100.0,
+            "fy": 101.0,
+            "cx": 50.0,
+            "cy": 40.0,
+            "E_c2w": np.eye(4).tolist(),
+        },
+        "objects": [
+            {
+                "obj_id": "obj_3",
+                "bbox3d_canonical": [-1.0, -2.0, -3.0, 1.0, 2.0, 3.0],
+                "pose_world": np.eye(4).tolist(),
+            }
+        ],
+    }
+    (sample_dir / f"{sample_id}.json").write_text(json.dumps(sample_record), encoding="utf-8")
+    source = SimpleNamespace(name="hope", dataset_dir=dataset_dir, free_bbox_dir=tmp_path / "free_bbox")
+    monkeypatch.setattr(inference, "build_sources_from_config", lambda _cfg: [source])
+
+    item = inference.build_prediction_only_item({}, sample_id, "obj_3", "Place the object behind the can.")
+
+    assert item.sample_id == sample_id
+    assert item.object_id == "obj_3"
+    assert item.instruction == "Place the object behind the can."
+    assert item.source_box_gt.tolist() == [0.0, 0.0, 0.0, 2.0, 4.0, 6.0]
+    assert item.place_box_gt.shape == (7,)
 
 
 def _decoder_prediction(center_offset: float) -> dict[str, torch.Tensor]:

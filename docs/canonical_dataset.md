@@ -162,3 +162,15 @@ python tools/export_canonical_sparse_voxel_vis.py \
 ```
 
 工具会同时输出两组 PNG 预览和矢量 PDF：`*_sparse_voxels` 与 RGB 像素级对齐；`*_sparse_voxels_oblique_3d` 保留真实相机的水平观察方位，将 world-Z 校正为画面竖直方向，并以固定斜俯视透视突出桌面和物体的三维结构。像素对齐图的点面积由 `--point-size` 控制，默认值为 `24 pt^2`；斜俯视图由 `--oblique-point-size` 控制，默认值为 `36 pt^2`。
+
+如需使用固定 50000 点的初始点云绘制更细粒度的同类图片，增加 `--point-source raw`：
+
+```bash
+python tools/export_canonical_sparse_voxel_vis.py \
+    --dataset-dir data/hope \
+    --sample-id hope__scene_0000__0005 \
+    --output-dir outputs/visualizations \
+    --point-source raw
+```
+
+初始点云模式输出 `*_raw_points` 和 `*_raw_points_oblique_3d`，不会覆盖稀疏体素图；两种图的默认点面积分别为 `2.5 pt^2` 和 `1.8 pt^2`，仍可用 `--point-size` 与 `--oblique-point-size` 覆盖。斜俯视图使用固定的弱透视相机、关闭深度着色，并以统一视角展示不同样本，避免远处颜色发灰和强透视造成的比例畸变。

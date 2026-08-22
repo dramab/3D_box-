@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""Render a camera-aligned Introduction comparison for one placement case.
+"""Render camera-aligned Introduction comparisons for selected placement cases.
 
 The RoboBrain 3D candidate is visualization-only: it is reconstructed from
 the predicted 2D point using the source object's observed geometry.
 
 使用示例:
-    python tools/render_intro_collision_comparison.py
+    python tools/render_intro_collision_comparison.py --all-suitable
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -33,10 +34,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Polygon
 
 from baselines.robobrain2_5.run_zero_shot_test import (
-    DEFAULT_CONFIG,
     load_scene,
     load_sources,
-    load_test_items,
 )
 from baselines.robobrain2_5.zero_shot_visualization import (
     BOX_EDGES,
@@ -47,16 +46,21 @@ from baselines.robobrain2_5.zero_shot_visualization import (
     transform_points,
     upright_box_corners,
 )
+from src.annotation.auto_label import camera_image_axes_world_xy
 from src.training.lc_bgplacenet_stage2 import build_collision_context, compute_collision_metrics
 
 
-DEFAULT_ITEM_ID = "omni__label_041919__0e79bec87e9a05d1"
-DEFAULT_ROBOBRAIN_RESULTS = PROJECT_ROOT / "outputs/robobrain2_5_zero_shot_test_official_prompt_gt/predictions.jsonl"
+DEFAULT_CONFIG = PROJECT_ROOT / "configs/lc_bgplacenet_stage2_enriched.yaml"
+DEFAULT_ROBOBRAIN_RESULTS = PROJECT_ROOT / "outputs/robobrain2_5_front_behind_swapped/predictions.jsonl"
 DEFAULT_OURS_RESULTS = PROJECT_ROOT / (
-    "outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8/"
-    "inference_stage2_test_multi_stage/predictions.json"
+    "outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8_enriched/"
+    "inference_stage2_test/predictions.json"
 )
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs/introduction_collision_comparison"
+DEFAULT_OURS_METRICS = PROJECT_ROOT / (
+    "outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8_enriched/"
+    "benchmark_stage2_test/per_sample_metrics.jsonl"
+)
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs/introduction_collision_comparison_front_behind_swapped"
 
 SOURCE_COLOR = "#0891B2"
 ROBOBRAIN_COLOR = "#DC2626"
@@ -78,11 +82,15 @@ BOX_FACES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render the Introduction collision comparison figure.")
-    parser.add_argument("--item-id", default=DEFAULT_ITEM_ID)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--all-suitable", action="store_true")
+    mode.add_argument("--item-id", help="Render one selected item using its full ID or stable label key.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--robobrain-results", type=Path, default=DEFAULT_ROBOBRAIN_RESULTS)
     parser.add_argument("--ours-results", type=Path, default=DEFAULT_OURS_RESULTS)
+    parser.add_argument("--ours-metrics", type=Path, default=DEFAULT_OURS_METRICS)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--overwrite", action="store_true", help="Regenerate complete existing sample folders.")
     return parser.parse_args()
 
 
@@ -90,22 +98,22 @@ def resolve_path(path: Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def load_jsonl_record(path: Path, item_id: str) -> dict[str, Any]:
+def load_jsonl_rows(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            row = json.loads(line)
-            if str(row["item_id"]) == item_id:
-                return row
-    raise KeyError(f"Item {item_id!r} not found in {path}")
+        return [json.loads(line) for line in handle if line.strip()]
 
 
-def load_json_record(path: Path, item_id: str) -> dict[str, Any]:
+def load_json_rows(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as handle:
-        rows = json.load(handle)
-    try:
-        return next(row for row in rows if str(row["item_id"]) == item_id)
-    except StopIteration as error:
-        raise KeyError(f"Item {item_id!r} not found in {path}") from error
+        return json.load(handle)
+
+
+def stable_item_key(item_id: str) -> str:
+    """Remove the content-derived hash while retaining source and label index."""
+    key, separator, _ = str(item_id).rpartition("__")
+    if not separator:
+        raise ValueError(f"Item ID has no hash suffix: {item_id}")
+    return key
 
 
 def box_to_corners(box: list[float] | np.ndarray) -> np.ndarray:
@@ -118,24 +126,17 @@ def object_corners(obj: dict[str, Any]) -> np.ndarray:
 
 
 def camera_aligned_basis(camera: Camera) -> tuple[np.ndarray, np.ndarray]:
-    """Return horizontal right/forward axes matching the RGB camera view."""
-    # 切片会返回相机外参的视图；必须复制，避免归一化时破坏后续 RGB 投影。
-    forward = np.asarray(camera.e_c2w[:2, 2], dtype=np.float64).copy()
-    norm = float(np.linalg.norm(forward))
-    if norm < 1e-8:
-        raise ValueError("Camera optical axis has no stable horizontal projection")
-    forward /= norm
-    right = np.array([forward[1], -forward[0]], dtype=np.float64)
-    camera_right = np.asarray(camera.e_c2w[:2, 0], dtype=np.float64)
-    if float(right @ camera_right) < 0.0:
-        right *= -1.0
-    return right, forward
+    """Return the same image-right/image-up world-XY axes used by annotation."""
+    axes = camera_image_axes_world_xy(camera.e_w2c)
+    if axes is None:
+        raise ValueError("Camera image X axis has no stable horizontal projection")
+    return axes
 
 
 def align_xy(points_xy: np.ndarray, camera: Camera) -> np.ndarray:
-    right, forward = camera_aligned_basis(camera)
+    right, image_up = camera_aligned_basis(camera)
     points = np.asarray(points_xy, dtype=np.float64)
-    return np.column_stack((points @ right, points @ forward))
+    return np.column_stack((points @ right, points @ image_up))
 
 
 def draw_rgb_box(
@@ -143,7 +144,7 @@ def draw_rgb_box(
     corners: np.ndarray,
     camera: Camera,
     color: str,
-    label: str,
+    label: str | None,
     *,
     alpha: float,
     linestyle: str = "-",
@@ -159,12 +160,12 @@ def draw_rgb_box(
                 uv[[start, end], 0],
                 uv[[start, end], 1],
                 color=color,
-                linewidth=1.8,
+                linewidth=1.4,
                 linestyle=linestyle,
                 solid_capstyle="round",
             )
     visible = depth > 0.0
-    if np.any(visible):
+    if label and np.any(visible):
         visible_uv = uv[visible]
         box_center = visible_uv.mean(axis=0)
         label_xy = visible_uv.min(axis=0) + np.array([4.0, 4.0])
@@ -229,7 +230,7 @@ def add_card_background(ax: plt.Axes) -> None:
 
 def draw_camera_orientation(ax: plt.Axes) -> None:
     ax.annotate(
-        "Camera forward",
+        "Image up / Front",
         xy=(0.50, 0.17),
         xytext=(0.50, 0.045),
         xycoords="axes fraction",
@@ -249,7 +250,8 @@ def draw_topdown(
     source_id: str,
     candidate_corners: np.ndarray,
     candidate_color: str,
-    reference_ids: set[str],
+    highlighted_ids: set[str],
+    object_labels: dict[str, str],
     colliding_ids: set[str],
     limits: tuple[float, float, float, float],
     status: str,
@@ -265,13 +267,21 @@ def draw_topdown(
     for obj_id, polygon in polygons.items():
         if obj_id == source_id:
             continue
-        is_reference = obj_id in reference_ids
-        facecolor = "#F8FAFC" if is_reference else SCENE_FILL
-        edgecolor = REFERENCE_COLOR if is_reference else SCENE_EDGE
+        is_highlighted = obj_id in highlighted_ids
+        facecolor = "#F8FAFC" if is_highlighted else SCENE_FILL
+        edgecolor = REFERENCE_COLOR if is_highlighted else SCENE_EDGE
         ax.add_patch(Polygon(polygon, closed=True, facecolor=facecolor, edgecolor=edgecolor, linewidth=1.0))
-        if is_reference:
+        if is_highlighted:
             center = polygon.mean(axis=0)
-            ax.text(*center, "Pie", ha="center", va="center", fontsize=8, color=REFERENCE_COLOR, fontweight="bold")
+            ax.text(
+                *center,
+                object_labels[obj_id],
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=REFERENCE_COLOR,
+                fontweight="bold",
+            )
 
     ax.add_patch(
         Polygon(
@@ -279,7 +289,7 @@ def draw_topdown(
             closed=True,
             facecolor=SOURCE_COLOR,
             edgecolor=SOURCE_COLOR,
-            linewidth=1.7,
+            linewidth=1.4,
             linestyle=(0, (4, 2)),
             alpha=0.16,
         )
@@ -289,8 +299,8 @@ def draw_topdown(
         closed=True,
         facecolor=candidate_color,
         edgecolor=candidate_color,
-        linewidth=2.2,
-        alpha=0.28,
+        linewidth=1.6,
+        alpha=0.10,
     )
     ax.add_patch(candidate_patch)
 
@@ -383,7 +393,7 @@ def create_panel() -> tuple[plt.Figure, plt.Axes]:
     return figure, axis
 
 
-def save_panel(figure: plt.Figure, output_dir: Path, stem: str) -> dict[str, str]:
+def save_figure(figure: plt.Figure, output_dir: Path, stem: str) -> dict[str, str]:
     png_path = output_dir / f"{stem}.png"
     pdf_path = output_dir / f"{stem}.pdf"
     figure.savefig(png_path, dpi=300, facecolor="white")
@@ -392,120 +402,340 @@ def save_panel(figure: plt.Figure, output_dir: Path, stem: str) -> dict[str, str
     return {"png": os.fspath(png_path), "pdf": os.fspath(pdf_path)}
 
 
-def render_figure(
-    item: dict[str, Any],
+def object_display_name(obj: dict[str, Any]) -> str:
+    name = str(obj.get("class_name") or obj.get("obj_id", "Object"))
+    return name.replace("_", " ").strip().title()
+
+
+def draw_case_axes(
+    axes: dict[str, plt.Axes],
     scene: dict[str, Any],
-    source: dict[str, Path],
-    robobrain: dict[str, Any],
+    source_id: str,
+    collision_ids: set[str],
+    object_labels: dict[str, str],
+    source_corners: np.ndarray,
+    robobrain_corners: np.ndarray,
+    ours_corners: np.ndarray,
+    limits: tuple[float, float, float, float],
+) -> None:
+    highlighted_objects = [obj for obj in scene["objects"] if str(obj["obj_id"]) in collision_ids]
+    rgb_specs = (
+        ("robobrain_rgb", "RoboBrain2.5", ROBOBRAIN_COLOR, robobrain_corners),
+        ("ours_rgb", "Ours", OURS_COLOR, ours_corners),
+    )
+    for panel_name, title, color, candidate_corners in rgb_specs:
+        if panel_name not in axes:
+            continue
+        axis = axes[panel_name]
+        configure_rgb_axis(axis, scene["rgb"], title, color)
+        draw_rgb_box(axis, source_corners, scene["camera"], SOURCE_COLOR, None, alpha=0.07, linestyle="--")
+        for obj in highlighted_objects:
+            obj_id = str(obj["obj_id"])
+            draw_rgb_box(
+                axis,
+                object_corners(obj),
+                scene["camera"],
+                REFERENCE_COLOR,
+                None,
+                alpha=0.05,
+            )
+        draw_rgb_box(axis, candidate_corners, scene["camera"], color, None, alpha=0.10)
+        if panel_name == "robobrain_rgb":
+            draw_status_chip(axis, "×  Collision", ROBOBRAIN_COLOR)
+        else:
+            draw_status_chip(axis, "✓  Collision-free", "#15803D")
+
+    topdown_specs = (
+        (
+            "robobrain_topdown",
+            robobrain_corners,
+            ROBOBRAIN_COLOR,
+            collision_ids,
+            "× Collision overlap",
+        ),
+        ("ours_topdown", ours_corners, OURS_COLOR, set(), "✓ Free placement region"),
+    )
+    for panel_name, candidate_corners, color, colliding_ids, status in topdown_specs:
+        if panel_name not in axes:
+            continue
+        draw_topdown(
+            axes[panel_name],
+            scene["objects"],
+            scene["camera"],
+            source_id,
+            candidate_corners,
+            color,
+            collision_ids,
+            object_labels,
+            colliding_ids,
+            limits,
+            status,
+        )
+
+
+def create_comparison_figure(instruction: str) -> tuple[plt.Figure, dict[str, plt.Axes]]:
+    figure = plt.figure(figsize=(7.16, 5.0), facecolor="white")
+    grid = figure.add_gridspec(
+        2,
+        2,
+        left=0.035,
+        right=0.985,
+        bottom=0.045,
+        top=0.80,
+        wspace=0.07,
+        hspace=0.10,
+        height_ratios=(1.0, 0.92),
+    )
+    axes = {
+        "robobrain_rgb": figure.add_subplot(grid[0, 0]),
+        "ours_rgb": figure.add_subplot(grid[0, 1]),
+        "robobrain_topdown": figure.add_subplot(grid[1, 0]),
+        "ours_topdown": figure.add_subplot(grid[1, 1]),
+    }
+    figure.text(
+        0.5,
+        0.955,
+        textwrap.fill(instruction, width=92),
+        ha="center",
+        va="top",
+        fontsize=8.8,
+        fontweight="semibold",
+        color="#0F172A",
+    )
+    figure.text(
+        0.5,
+        0.895,
+        "Camera-aligned top view: image right = map right, image up / front = map up",
+        ha="center",
+        va="top",
+        fontsize=8.0,
+        color="#64748B",
+    )
+    return figure, axes
+
+
+def render_case(
     ours: dict[str, Any],
+    scene: dict[str, Any],
+    robobrain: dict[str, Any],
+    collision_ids: set[str],
     output_dir: Path,
 ) -> dict[str, Any]:
-    source_id = str(item["object_id"])
+    source_id = str(ours["object_id"])
     source_obj = next(obj for obj in scene["objects"] if str(obj["obj_id"]) == source_id)
     source_corners = object_corners(source_obj)
     robobrain_corners = box_to_corners(robobrain["render_box_world"])
     ours_corners = box_to_corners(ours["place_box"])
-
-    placement_path = source["free_bbox_dir"] / "placements" / f"{item['sample_id']}__placements.json"
-    with placement_path.open("r", encoding="utf-8") as handle:
-        placement_payload = json.load(handle)
-    robobrain_collision = compute_collision_metrics(
-        np.asarray(robobrain["render_box_world"]),
-        build_collision_context(placement_payload.get("objects", [])),
-    )
-    ours_collision = compute_collision_metrics(
-        np.asarray(ours["place_box"]),
-        build_collision_context(placement_payload.get("objects", [])),
-    )
-    if not robobrain_collision["collision"] or ours_collision["collision"]:
-        raise ValueError("Selected case no longer satisfies the collision-vs-free comparison")
-
-    collision_ids = set(robobrain_collision["collision_object_ids"])
-    reference_objects = [obj for obj in scene["objects"] if str(obj["obj_id"]) in collision_ids]
+    object_labels = {
+        str(obj["obj_id"]): object_display_name(obj)
+        for obj in scene["objects"]
+        if str(obj["obj_id"]) in collision_ids
+    }
+    if set(object_labels) != collision_ids:
+        missing = sorted(collision_ids - set(object_labels))
+        raise KeyError(f"Collision objects missing from scene {ours['sample_id']}: {missing}")
     limits = shared_topdown_limits(scene["objects"], scene["camera"], [robobrain_corners, ours_corners])
 
     plt.rcParams.update({"font.family": "DejaVu Sans", "pdf.fonttype": 42, "svg.fonttype": "none"})
-    rb_rgb_figure, rb_rgb_ax = create_panel()
-    rb_top_figure, rb_top_ax = create_panel()
-    ours_rgb_figure, ours_rgb_ax = create_panel()
-    ours_top_figure, ours_top_ax = create_panel()
-
-    configure_rgb_axis(rb_rgb_ax, scene["rgb"], "RoboBrain2.5", ROBOBRAIN_COLOR)
-    configure_rgb_axis(ours_rgb_ax, scene["rgb"], "Ours", OURS_COLOR)
-    for ax in (rb_rgb_ax, ours_rgb_ax):
-        draw_rgb_box(ax, source_corners, scene["camera"], SOURCE_COLOR, "Source", alpha=0.07, linestyle="--")
-        for obj in reference_objects:
-            draw_rgb_box(ax, object_corners(obj), scene["camera"], REFERENCE_COLOR, "Pie", alpha=0.05)
-
-    draw_rgb_box(rb_rgb_ax, robobrain_corners, scene["camera"], ROBOBRAIN_COLOR, "Prediction", alpha=0.18)
-    draw_rgb_box(ours_rgb_ax, ours_corners, scene["camera"], OURS_COLOR, "Prediction", alpha=0.18)
-    draw_status_chip(rb_rgb_ax, "×  Collision", ROBOBRAIN_COLOR)
-    draw_status_chip(ours_rgb_ax, "✓  Collision-free", "#15803D")
-
-    draw_topdown(
-        rb_top_ax,
-        scene["objects"],
-        scene["camera"],
-        source_id,
-        robobrain_corners,
-        ROBOBRAIN_COLOR,
-        collision_ids,
-        collision_ids,
-        limits,
-        "× Overlap with Pie",
-    )
-    draw_topdown(
-        ours_top_ax,
-        scene["objects"],
-        scene["camera"],
-        source_id,
-        ours_corners,
-        OURS_COLOR,
-        collision_ids,
-        set(),
-        limits,
-        "✓ Free placement region",
-    )
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    prefix = f"{item['item_id']}__intro_collision"
-    panels = {
-        "robobrain_rgb": save_panel(rb_rgb_figure, output_dir, f"{prefix}__robobrain_rgb"),
-        "robobrain_topdown": save_panel(rb_top_figure, output_dir, f"{prefix}__robobrain_topdown"),
-        "ours_rgb": save_panel(ours_rgb_figure, output_dir, f"{prefix}__ours_rgb"),
-        "ours_topdown": save_panel(ours_top_figure, output_dir, f"{prefix}__ours_topdown"),
-    }
+    panels = {}
+    for panel_name in ("robobrain_rgb", "robobrain_topdown", "ours_rgb", "ours_topdown"):
+        figure, axis = create_panel()
+        draw_case_axes(
+            {panel_name: axis},
+            scene,
+            source_id,
+            collision_ids,
+            object_labels,
+            source_corners,
+            robobrain_corners,
+            ours_corners,
+            limits,
+        )
+        panels[panel_name] = save_figure(figure, output_dir, panel_name)
+
+    comparison_figure, comparison_axes = create_comparison_figure(str(ours["instruction"]))
+    draw_case_axes(
+        comparison_axes,
+        scene,
+        source_id,
+        collision_ids,
+        object_labels,
+        source_corners,
+        robobrain_corners,
+        ours_corners,
+        limits,
+    )
+    comparison = save_figure(comparison_figure, output_dir, "comparison")
 
     metadata = {
-        "item_id": item["item_id"],
-        "instruction": str(item["instruction"]),
+        "item_id": ours["item_id"],
+        "stable_item_key": stable_item_key(str(ours["item_id"])),
+        "instruction": str(ours["instruction"]),
         "robobrain_collision_object_ids": sorted(collision_ids),
+        "robobrain_collision_object_names": [object_labels[obj_id] for obj_id in sorted(collision_ids)],
         "ours_collision": False,
         "robobrain_box_is_visualization_only": True,
         "robobrain_box_derivation": "2D point + observed source dimensions and yaw",
-        "camera_alignment": "camera forward maps up; camera right maps right",
+        "camera_alignment": "image up/front maps up; image right maps right",
         "panels": panels,
+        "comparison": comparison,
     }
     return metadata
+
+
+def load_collision_context(source: dict[str, Path], sample_id: str) -> dict[str, Any]:
+    placement_path = source["free_bbox_dir"] / "placements" / f"{sample_id}__placements.json"
+    with placement_path.open("r", encoding="utf-8") as handle:
+        return build_collision_context(json.load(handle).get("objects", []))
+
+
+def select_suitable_cases(
+    ours_rows: list[dict[str, Any]],
+    robobrain_rows: list[dict[str, Any]],
+    metrics_rows: list[dict[str, Any]],
+    sources: dict[str, dict[str, Path]],
+) -> list[dict[str, Any]]:
+    """Select task-successful predictions where RoboBrain hits another scene object."""
+    robobrain_by_key = {stable_item_key(str(row["item_id"])): row for row in robobrain_rows}
+    metrics_by_id = {str(row["item_id"]): row for row in metrics_rows}
+    if len(robobrain_by_key) != len(robobrain_rows):
+        raise ValueError("RoboBrain results contain duplicate stable label keys")
+    if len(metrics_by_id) != len(metrics_rows):
+        raise ValueError("Ours benchmark metrics contain duplicate item IDs")
+
+    collision_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    selected = []
+    for ours in ours_rows:
+        item_id = str(ours["item_id"])
+        key = stable_item_key(item_id)
+        robobrain = robobrain_by_key.get(key)
+        metrics = metrics_by_id.get(item_id)
+        if robobrain is None or metrics is None:
+            raise KeyError(f"Missing aligned result or benchmark metrics for {item_id}")
+        if robobrain.get("status") != "ok" or robobrain.get("render_box_world") is None:
+            continue
+        if not bool(metrics.get("task_success")):
+            continue
+
+        scene_key = (str(ours["source_name"]), str(ours["sample_id"]))
+        if scene_key not in collision_cache:
+            collision_cache[scene_key] = load_collision_context(sources[scene_key[0]], scene_key[1])
+        collision = compute_collision_metrics(np.asarray(robobrain["render_box_world"]), collision_cache[scene_key])
+        external_collision_ids = sorted(set(collision["collision_object_ids"]) - {str(ours["object_id"])})
+        if external_collision_ids:
+            selected.append(
+                {
+                    "stable_item_key": key,
+                    "ours": ours,
+                    "robobrain": robobrain,
+                    "metrics": metrics,
+                    "collision_object_ids": external_collision_ids,
+                }
+            )
+    return sorted(
+        selected,
+        key=lambda row: (
+            str(row["ours"]["source_name"]),
+            str(row["ours"]["sample_id"]),
+            str(row["stable_item_key"]),
+        ),
+    )
+
+
+def expected_outputs(output_dir: Path) -> list[Path]:
+    return [
+        output_dir / f"{stem}.{suffix}"
+        for stem in ("robobrain_rgb", "robobrain_topdown", "ours_rgb", "ours_topdown", "comparison")
+        for suffix in ("png", "pdf")
+    ]
+
+
+def write_manifest(path: Path, cases: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for case in cases:
+            ours = case["ours"]
+            metrics = case["metrics"]
+            row = {
+                "stable_item_key": case["stable_item_key"],
+                "ours_item_id": ours["item_id"],
+                "robobrain_item_id": case["robobrain"]["item_id"],
+                "source_name": ours["source_name"],
+                "sample_id": ours["sample_id"],
+                "object_id": ours["object_id"],
+                "instruction": ours["instruction"],
+                "target_relation": metrics["target_relation"],
+                "reference_object_id": metrics["reference_object_id"],
+                "reference_name": metrics["reference_name"],
+                "robobrain_collision_object_ids": case["collision_object_ids"],
+                "ours_task_success": True,
+                "output_dir": os.fspath(path.parent / case["stable_item_key"]),
+            }
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def main() -> None:
     args = parse_args()
     config_path = resolve_path(args.config)
-    item_id = str(args.item_id)
-    items = load_test_items(config_path)
-    try:
-        item = next(candidate for candidate in items if str(candidate["item_id"]) == item_id)
-    except StopIteration as error:
-        raise KeyError(f"Item {item_id!r} not found in the fixed test split") from error
+    output_dir = resolve_path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     sources = load_sources(config_path)
-    source = sources[str(item["source_name"])]
-    scene = load_scene(str(source["dataset_dir"]), str(item["sample_id"]))
-    robobrain = load_jsonl_record(resolve_path(args.robobrain_results), item_id)
-    ours = load_json_record(resolve_path(args.ours_results), item_id)
-    metadata = render_figure(item, scene, source, robobrain, ours, resolve_path(args.output_dir))
-    print(json.dumps(metadata, indent=2, ensure_ascii=False))
+    ours_rows = load_json_rows(resolve_path(args.ours_results))
+    robobrain_rows = load_jsonl_rows(resolve_path(args.robobrain_results))
+    metrics_rows = load_jsonl_rows(resolve_path(args.ours_metrics))
+    cases = select_suitable_cases(ours_rows, robobrain_rows, metrics_rows, sources)
+    if args.item_id:
+        requested = str(args.item_id)
+        cases = [
+            case
+            for case in cases
+            if requested in {str(case["stable_item_key"]), str(case["ours"]["item_id"]), str(case["robobrain"]["item_id"])}
+        ]
+        if not cases:
+            raise KeyError(f"Item {requested!r} is not in the strictly selected comparison set")
+
+    write_manifest(output_dir / "selection_manifest.jsonl", cases)
+    rendered = skipped = 0
+    loaded_scene_key: tuple[str, str] | None = None
+    scene: dict[str, Any] | None = None
+    for index, case in enumerate(cases, start=1):
+        ours = case["ours"]
+        sample_output_dir = output_dir / str(case["stable_item_key"])
+        if not args.overwrite and all(path.is_file() for path in expected_outputs(sample_output_dir)):
+            skipped += 1
+            continue
+
+        scene_key = (str(ours["source_name"]), str(ours["sample_id"]))
+        if scene_key != loaded_scene_key:
+            source = sources[scene_key[0]]
+            scene = load_scene(str(source["dataset_dir"]), scene_key[1])
+            loaded_scene_key = scene_key
+        assert scene is not None
+        render_case(
+            ours,
+            scene,
+            case["robobrain"],
+            set(case["collision_object_ids"]),
+            sample_output_dir,
+        )
+        rendered += 1
+        if index == 1 or index % 25 == 0 or index == len(cases):
+            print(f"[{index}/{len(cases)}] rendered={rendered} skipped={skipped}", flush=True)
+
+    print(
+        json.dumps(
+            {
+                "selected": len(cases),
+                "rendered": rendered,
+                "skipped": skipped,
+                "output_dir": os.fspath(output_dir),
+                "manifest": os.fspath(output_dir / "selection_manifest.jsonl"),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":

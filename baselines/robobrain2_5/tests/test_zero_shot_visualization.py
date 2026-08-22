@@ -23,7 +23,9 @@ from baselines.robobrain2_5.run_zero_shot_test import (
     load_ground_truth_placement,
     load_sources,
     load_test_items,
+    model_prompt_from_instruction,
     pointing_prompt_from_instruction,
+    swap_front_behind_relation,
 )
 
 
@@ -64,9 +66,29 @@ def test_move_template_becomes_official_vacant_space_prompt() -> None:
     prompt = pointing_prompt_from_instruction(
         "Move Krauter Sauce Box located at the right of Waschesteife Detergent Bottle to the back left of White Candle."
     )
-    assert prompt == "Identify spot within the vacant space that's the back left of White Candle."
+    assert prompt == "Identify spot within the vacant space that's the front left of White Candle."
     assert "Krauter Sauce Box" not in prompt
-    assert "[(x, y)]" in OFFICIAL_POINTING_SUFFIX
+
+
+def test_front_behind_relations_are_swapped_bidirectionally() -> None:
+    cases = {
+        "in front of White Candle": "behind White Candle",
+        "behind White Candle": "in front of White Candle",
+        "the front left of White Candle": "the back left of White Candle",
+        "the back left of White Candle": "the front left of White Candle",
+        "the front right of White Candle": "the back right of White Candle",
+        "the back right of White Candle": "the front right of White Candle",
+        "the left of White Candle": "the left of White Candle",
+    }
+    for source, expected in cases.items():
+        assert swap_front_behind_relation(source) == expected
+
+
+def test_exact_model_prompt_keeps_official_coordinate_suffix() -> None:
+    prompt = model_prompt_from_instruction("Move Red Bowl to in front of White Candle.")
+    assert prompt.startswith("Identify spot within the vacant space that's behind White Candle.")
+    assert prompt.endswith(OFFICIAL_POINTING_SUFFIX)
+    assert "[(x, y)]" in prompt
 
 
 def test_ground_truth_placement_matches_fixed_split_label() -> None:

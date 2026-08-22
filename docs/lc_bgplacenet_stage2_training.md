@@ -133,6 +133,31 @@ python tools/export_lc_bgplacenet_stage2_inference_web.py \
 
 网页输出为 `<input-dir>/web_vis/index.html`，默认分页并按需渲染样本，避免一次性加载全量 decoder PNG。页面只额外生成 P3 俯视 heatmap 到 `web_vis/assets/`，Decoder 1～4 和最终 top-1 图片仍引用推理目录中的原始文件，不复制大图。点击任一阶段后可用左右方向键切换。最终 top-1 图和 P3 粗区域 heatmap 位于每条样本的折叠诊断区域。
 
+对不在 Stage-2 labels 中的 canonical 样本做 prediction-only 定向推理：
+
+```bash
+python tools/infer_lc_bgplacenet_stage2.py \
+  --config configs/lc_bgplacenet_stage2_enriched.yaml \
+  --checkpoint outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8_enriched/best.pt \
+  --split all \
+  --sample-id hope__scene_0000__0005 \
+  --object-id obj_3 \
+  --instruction "Put the tomato sauce can in the back left of the mustard bottle." \
+  --no-gt \
+  --output-dir outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8_enriched/inference_custom_hope_scene_0000_0005
+```
+
+`--instruction` 模式要求同时提供 `--sample-id`、`--object-id` 和 `--no-gt`，直接从 canonical metadata 构造单条输入，不修改 labels 或数据划分。将其 P3 预测渲染为三张同视角的单栏论文图：
+
+```bash
+python tools/render_lc_bgplacenet_stage2_point_mask.py \
+  --predictions outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8_enriched/inference_custom_hope_scene_0000_0005/predictions.json \
+  --item-id hope__custom_hope_scene_0000_0005_obj_3 \
+  --output-dir outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8_enriched/result_visualizations/hope__scene_0000__0005
+```
+
+脚本分别输出完整 50000 点 RGB 场景、局部连续 P3 Mask 和局部 Top-1 放置框图，并同时保存 PNG 与 PDF。第二、三张图共享由源框、预测框和响应不低于 `0.5` 的核心区域联合确定的语义 ROI；该阈值只参与裁切，不过滤 ROI 内的响应。连续 Mask 按 `0.03 + 0.79 * score^1.35` 混入 `#FF2020`，局部点大小由 `0.82` 连续增加到 `1.20`。放置图使用点大小 `0.82`、100% 不透明的原始 RGB 点云；源框使用深青/亮青双层虚线，预测框采用由深蓝到底部、亮蓝到顶部的高度渐变和双层蓝色边线。最终局部版本使用文件名后缀 `local_dense_rgb_3d`，不会覆盖上一版本。
+
 ## 测试
 
 ```bash

@@ -17,3 +17,5 @@ checkpoints/
 cache/
 external/
 *.tar.gz
+figures/
+*.tar

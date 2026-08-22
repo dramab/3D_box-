@@ -50,6 +50,7 @@ from src.training.lc_bgplacenet_stage2 import (
     normalize_stage1_split,
     select_stage2_split_items,
 )
+from src.training.lc_bgplacenet_stage1 import _source_box_from_obb
 from src.visualization.bbox_projection import BOX_EDGES, project_world
 
 
@@ -83,6 +84,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None, help="Limit sample count.")
     parser.add_argument("--sample-id", default=None, help="Only infer one sample_id.")
     parser.add_argument("--object-id", default=None, help="Only infer one object_id; usually used with --sample-id.")
+    parser.add_argument(
+        "--instruction",
+        default=None,
+        help="Prediction-only instruction for a canonical sample absent from Stage-2 labels.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -132,8 +138,14 @@ def select_items(
     split: str,
     sample_id: str | None,
     object_id: str | None,
+    instruction: str | None = None,
 ) -> list[Stage2IndexItem]:
     """Select Stage 2 inference items from config and optional filters."""
+    if instruction is not None:
+        if sample_id is None or object_id is None:
+            raise ValueError("--instruction requires both --sample-id and --object-id")
+        return [build_prediction_only_item(cfg, sample_id, object_id, instruction)]
+
     sources = build_sources_from_config(cfg)
     items = build_stage2_index(sources)
     if split != "all":
@@ -146,6 +158,80 @@ def select_items(
             and (object_id is None or item.object_id == object_id)
         ]
     return items
+
+
+def build_prediction_only_item(
+    cfg: dict[str, Any],
+    sample_id: str,
+    object_id: str,
+    instruction: str,
+) -> Stage2IndexItem:
+    """Build one inference item directly from canonical metadata without GT labels."""
+    source = next(
+        (
+            row
+            for row in build_sources_from_config(cfg)
+            if (row.dataset_dir / "samples" / f"{sample_id}.json").exists()
+        ),
+        None,
+    )
+    if source is None:
+        raise FileNotFoundError(f"Canonical sample {sample_id} is missing from configured sources")
+
+    sample_path = source.dataset_dir / "samples" / f"{sample_id}.json"
+    with sample_path.open("r", encoding="utf-8") as handle:
+        record = json.load(handle)
+    object_record = next(
+        (row for row in record["objects"] if str(row["obj_id"]) == object_id),
+        None,
+    )
+    if object_record is None:
+        raise ValueError(f"Object {object_id} is missing from canonical sample {sample_id}")
+    voxel_rel = record.get("voxel_point_cloud_path")
+    if not voxel_rel:
+        raise ValueError(f"Canonical sample {sample_id} does not provide voxel_point_cloud_path")
+
+    camera = record["camera"]
+    camera_k = np.array(
+        [
+            [float(camera["fx"]), 0.0, float(camera["cx"])],
+            [0.0, float(camera["fy"]), float(camera["cy"])],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    camera_e_w2c = np.linalg.inv(np.asarray(camera["E_c2w"], dtype=np.float64)).astype(np.float32)
+    source_box = _source_box_from_obb(
+        object_record["bbox3d_canonical"],
+        object_record["pose_world"],
+    )
+    placeholder_place_box = np.concatenate(
+        [source_box[:3], source_box[3:6], np.zeros(1, dtype=np.float32)]
+    ).astype(np.float32)
+    item_token = f"{sample_id.replace('__', '_')}_{object_id}"
+    unused_path = source.free_bbox_dir / "prediction_only_unused"
+    return Stage2IndexItem(
+        item_id=f"{source.name}__custom_{item_token}__prediction_only",
+        label_index=-1,
+        source_name=source.name,
+        sample_id=sample_id,
+        object_id=object_id,
+        cluster_id=0,
+        instruction=instruction,
+        dataset_dir=source.dataset_dir,
+        free_bbox_dir=source.free_bbox_dir,
+        voxel_point_cloud_path=source.dataset_dir / str(voxel_rel),
+        rgb_path=source.dataset_dir / str(record["rgb_path"]),
+        camera_K=camera_k,
+        camera_E_w2c=camera_e_w2c,
+        support_mask_ply=unused_path,
+        direction_filtered_heatmap_ply=unused_path,
+        yaw_set_npz=unused_path,
+        source_box_gt=source_box,
+        place_box_gt=placeholder_place_box,
+        target_relation="prediction_only",
+        reference_object_id="prediction_only",
+    )
 
 
 def inference_collate(batch: list[dict[str, Any]], voxel_size_cm: float = 1.0) -> dict[str, Any]:
@@ -503,10 +589,12 @@ def save_predicted_heatmap_ply(output_path: Path, points: np.ndarray, scores: np
 def main() -> None:
     """Run Stage 2 inference."""
     args = parse_args()
+    if args.instruction is not None and not args.no_gt:
+        raise ValueError("Prediction-only --instruction inference requires --no-gt")
     cfg = load_config(args.config)
     device = resolve_device(cfg, args.device)
     model = load_model(cfg, args.checkpoint, device)
-    items = select_items(cfg, args.split, args.sample_id, args.object_id)
+    items = select_items(cfg, args.split, args.sample_id, args.object_id, args.instruction)
     dataset = Stage2InferenceDataset(items, max_samples=args.max_samples)
     batch_size = int(args.batch_size or cfg["training"]["batch_size"])
     num_workers = int(cfg["training"].get("num_workers", 0))
@@ -610,6 +698,7 @@ def main() -> None:
                                 zip(row_decoder_stages, decoder_stage_paths), start=1
                             )
                         ],
+                        "prediction_only": bool(args.instruction is not None),
                     }
                 )
 
