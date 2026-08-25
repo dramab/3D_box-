@@ -31,6 +31,7 @@ from baselines.robobrain2_5.zero_shot_visualization import (
     local_depth_cm,
     normalized_to_pixel,
     parse_point_answer,
+    parse_point_depth_answer,
     render_composite,
     source_dimensions_and_yaw,
     transform_points,
@@ -45,11 +46,18 @@ from src.datasets.canonical import load_sample_record
 DEFAULT_CONFIG = PROJECT_ROOT / "configs/lc_bgplacenet_stage2.yaml"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "baselines/robobrain2_5/hf_cache/RoboBrain2.5-8B-NV"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs/robobrain2_5_front_behind_swapped"
+ENRICHED_BOTTOM_CENTER_XYD_PROMPT_VARIANT = "enriched_label_bottom_center_xyd"
 
 
 OFFICIAL_POINTING_SUFFIX = (
     " Please provide its 2D coordinates. Your answer should be formatted as a tuple, "
     "i.e. [(x, y)], where the tuple contains the x and y coordinates of a point satisfying the conditions above."
+)
+
+BOTTOM_CENTER_XYD_SUFFIX = (
+    "\nYour answer should be formatted as a single-element list containing one tuple, "
+    "i.e., [(x, y, d)], where x and y are normalized image coordinates in the range "
+    "[0, 1000], and d is the absolute camera depth in centimeters."
 )
 
 FRONT_BEHIND_RELATION_SWAPS = (
@@ -87,10 +95,16 @@ def model_prompt_from_instruction(instruction: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run RoboBrain2.5 zero-shot point visualization on the fixed test split.")
+    parser = argparse.ArgumentParser(description="Run RoboBrain2.5 point prediction on the fixed test split.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--split", choices=("test",), default="test")
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--adapter-dir", type=Path, default=None, help="Optional local PEFT/LoRA adapter directory.")
+    parser.add_argument(
+        "--prompt-variant",
+        choices=("official_vacant_space_front_behind_swapped", ENRICHED_BOTTOM_CENTER_XYD_PROMPT_VARIANT),
+        default="official_vacant_space_front_behind_swapped",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--max-new-tokens", type=int, default=768)
     parser.add_argument("--max-samples", type=int, default=None, help="Only for a smoke run; omit for all fixed test items.")
@@ -135,12 +149,43 @@ def load_json_payload(path_text: str) -> Any:
         return json.load(handle)
 
 
-def load_ground_truth_placement(item: dict[str, Any], source: dict[str, Path]) -> dict[str, Any]:
-    """Read the held-out placement box for visualization only; it is never sent to RoboBrain."""
+def load_label_record(item: dict[str, Any], source: dict[str, Path]) -> dict[str, Any]:
+    """Resolve and validate the config-specific label referenced by one split item."""
     labels = load_json_payload(str(source["labels_path"]))
     label = labels[int(item["label_index"])]
     if str(label["sample_id"]) != str(item["sample_id"]) or str(label["object_id"]) != str(item["object_id"]):
         raise ValueError(f"Label index does not match split item: {item['item_id']}")
+    return label
+
+
+def model_prompt_from_item(item: dict[str, Any], source: dict[str, Path]) -> str:
+    """Build the official pointing prompt from structured enriched metadata when available."""
+    label = load_label_record(item, source)
+    placement_relation = label.get("spatial_relation", {}).get("placement", {})
+    relation = placement_relation.get("relation")
+    reference_name = placement_relation.get("reference_name")
+    if relation and reference_name:
+        destination_clause = swap_front_behind_relation(f"{relation} {reference_name}")
+        return f"Identify spot within the vacant space that's {destination_clause}." + OFFICIAL_POINTING_SUFFIX
+    return model_prompt_from_instruction(str(item["instruction"]))
+
+
+def bottom_center_xyd_prompt_from_item(item: dict[str, Any], source: dict[str, Path]) -> str:
+    """Keep the enriched label verbatim and request one bottom-center ``(x, y, d)`` point."""
+    label = load_label_record(item, source)
+    enriched_label = str(label["label"]).strip()
+    if enriched_label != str(item["instruction"]).strip():
+        raise ValueError(f"Enriched label does not match split instruction: {item['item_id']}")
+    return (
+        "Please predict the bottom-center placement point of the object to successfully complete the task. "
+        f'The task is: "{enriched_label}"'
+        + BOTTOM_CENTER_XYD_SUFFIX
+    )
+
+
+def load_ground_truth_placement(item: dict[str, Any], source: dict[str, Path]) -> dict[str, Any]:
+    """Read the held-out placement box for visualization only; it is never sent to RoboBrain."""
+    label = load_label_record(item, source)
     placement_path = source["free_bbox_dir"] / "placements" / f"{item['sample_id']}__placements.json"
     payload = load_json_payload(str(placement_path))
     object_record = next(record for record in payload["objects"] if str(record["object_id"]) == str(item["object_id"]))
@@ -179,10 +224,18 @@ def load_scene(dataset_dir_text: str, sample_id: str) -> dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=4096)
+def load_rgb_path(dataset_dir_text: str, sample_id: str) -> Path:
+    """Resolve the sole visual model input without loading depth or oracle geometry."""
+    dataset_dir = Path(dataset_dir_text)
+    record = load_sample_record(dataset_dir / "samples" / f"{sample_id}.json")
+    return dataset_dir / str(record["rgb_path"])
+
+
 class RoboBrainPointModel:
     """Minimal wrapper around the official single-image pointing inference path."""
 
-    def __init__(self, model_dir: Path, max_new_tokens: int) -> None:
+    def __init__(self, model_dir: Path, max_new_tokens: int, adapter_dir: Path | None = None) -> None:
         import torch
         from qwen_vl_utils import process_vision_info
         from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -197,6 +250,10 @@ class RoboBrainPointModel:
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_dir, dtype="auto", device_map="auto", local_files_only=True
         )
+        if adapter_dir is not None:
+            from peft import PeftModel
+
+            self.model = PeftModel.from_pretrained(self.model, adapter_dir, is_trainable=False)
         self.model.eval()
         self.max_new_tokens = int(max_new_tokens)
         self.input_device = next(self.model.parameters()).device
@@ -215,9 +272,20 @@ class RoboBrainPointModel:
 
 def output_record(
     item: dict[str, Any], scene: dict[str, Any], ground_truth: dict[str, Any], model_prompt: str,
-    answer: str, output_dir: Path
+    answer: str, output_dir: Path, model_dir: Path | None = None, adapter_dir: Path | None = None,
+    prediction_format: str = "xy",
 ) -> dict[str, Any]:
-    point, status = parse_point_answer(answer)
+    predicted_depth_cm: float | None = None
+    depth_source: str | None = None
+    if prediction_format == "xyd":
+        point_depth, status = parse_point_depth_answer(answer)
+        point = point_depth[:2] if point_depth is not None else None
+        predicted_depth_cm = point_depth[2] if point_depth is not None else None
+        depth_source = "model_absolute_camera_depth_cm" if point_depth is not None else None
+    elif prediction_format == "xy":
+        point, status = parse_point_answer(answer)
+    else:
+        raise ValueError(f"Unknown prediction format: {prediction_format}")
     pixel: tuple[int, int] | None = None
     world_point: np.ndarray | None = None
     candidate_corners: np.ndarray | None = None
@@ -226,9 +294,17 @@ def output_record(
         pixel, clamped = normalized_to_pixel(point, scene["camera"].width, scene["camera"].height)
         if clamped:
             status = "point_clamped"
-        depth_cm = local_depth_cm(scene["depth"], pixel)
+        if prediction_format == "xyd":
+            depth_cm = predicted_depth_cm
+            if depth_cm is None or not np.isfinite(depth_cm) or depth_cm <= 0.0:
+                depth_cm = None
+                status = "depth_invalid"
+        else:
+            depth_cm = local_depth_cm(scene["depth"], pixel)
+            depth_source = "rgbd_local_median_cm" if depth_cm is not None else None
         if depth_cm is None:
-            status = "depth_failed"
+            if status != "depth_invalid":
+                status = "depth_failed"
         else:
             world_point = backproject_world(pixel, depth_cm, scene["camera"])
             source = next(obj for obj in scene["objects"] if str(obj["obj_id"]) == str(item["object_id"]))
@@ -253,10 +329,16 @@ def output_record(
         "cluster_id": int(cluster_id) if cluster_id is not None else None,
         "instruction": str(item["instruction"]),
         "model_prompt": model_prompt,
+        "model_checkpoint": str(model_dir) if model_dir is not None else None,
+        "adapter_checkpoint": str(adapter_dir) if adapter_dir is not None else None,
         "raw_answer": answer, "normalized_point": list(point) if point is not None else None,
+        "predicted_depth_cm": predicted_depth_cm,
+        "depth_source": depth_source,
+        "prediction_format": prediction_format,
         "pixel": list(pixel) if pixel is not None else None, "world_point_cm": world_point.tolist() if world_point is not None else None,
         "render_box_world": candidate_box, "status": status, "visualization_path": str(visual_rel),
         "oracle_source_geometry_for_visualization": True,
+        "oracle_source_geometry_for_candidate_construction": True,
         "gt_bottom_center_world": np.asarray(ground_truth["bottom_center_world"]).tolist(),
         "gt_place_box_world": ground_truth["box"],
         "gt_for_visualization_only": True,
@@ -291,22 +373,57 @@ def main() -> None:
     model_dir = resolve_path(args.model_dir)
     if not (model_dir / "config.json").exists():
         raise FileNotFoundError(f"RoboBrain checkpoint is incomplete: {model_dir}")
-    model = RoboBrainPointModel(model_dir, args.max_new_tokens)
+    adapter_dir = resolve_path(args.adapter_dir) if args.adapter_dir is not None else None
+    if adapter_dir is not None:
+        if output_dir == DEFAULT_OUTPUT_DIR:
+            raise ValueError("A fine-tuned adapter requires a distinct --output-dir; refusing to mix zero-shot results.")
+        if not (adapter_dir / "adapter_config.json").exists():
+            raise FileNotFoundError(f"RoboBrain LoRA adapter is incomplete: {adapter_dir}")
+    run_config = {
+        "config": str(config_path),
+        "model_dir": str(model_dir),
+        "adapter_dir": str(adapter_dir) if adapter_dir is not None else None,
+        "split": args.split,
+        "prompt_variant": str(args.prompt_variant),
+        "prediction_format": "xyd" if args.prompt_variant == ENRICHED_BOTTOM_CENTER_XYD_PROMPT_VARIANT else "xy",
+        "max_new_tokens": int(args.max_new_tokens),
+    }
+    run_config_path = output_dir / "run_config.json"
+    if run_config_path.exists():
+        with run_config_path.open("r", encoding="utf-8") as handle:
+            previous_run_config = json.load(handle)
+        if previous_run_config != run_config:
+            raise ValueError(f"Existing output directory belongs to a different run: {run_config_path}")
+    else:
+        with run_config_path.open("w", encoding="utf-8") as handle:
+            json.dump(run_config, handle, indent=2, ensure_ascii=False)
+    model = RoboBrainPointModel(model_dir, args.max_new_tokens, adapter_dir=adapter_dir)
     for index, item in enumerate(items, start=1):
         item_id = str(item["item_id"])
         if item_id in completed:
             continue
         source = sources[str(item["source_name"])]
         dataset_dir = source["dataset_dir"]
-        scene = load_scene(str(dataset_dir), str(item["sample_id"]))
-        ground_truth = load_ground_truth_placement(item, source)
-        model_prompt = model_prompt_from_instruction(str(item["instruction"]))
+        if args.prompt_variant == ENRICHED_BOTTOM_CENTER_XYD_PROMPT_VARIANT:
+            model_prompt = bottom_center_xyd_prompt_from_item(item, source)
+            prediction_format = "xyd"
+        else:
+            model_prompt = model_prompt_from_item(item, source)
+            prediction_format = "xy"
+        rgb_path = load_rgb_path(str(dataset_dir), str(item["sample_id"]))
+        inference_error: Exception | None = None
         try:
-            answer = model.predict(model_prompt, Path(scene["rgb_path"]))
-            row = output_record(item, scene, ground_truth, model_prompt, answer, output_dir)
+            answer = model.predict(model_prompt, rgb_path)
         except Exception as error:
             answer = f"INFERENCE_ERROR: {type(error).__name__}: {error}"
-            row = output_record(item, scene, ground_truth, model_prompt, answer, output_dir)
+            inference_error = error
+        # Depth, scene objects, and GT are deliberately read only after model inference.
+        scene = load_scene(str(dataset_dir), str(item["sample_id"]))
+        ground_truth = load_ground_truth_placement(item, source)
+        row = output_record(
+            item, scene, ground_truth, model_prompt, answer, output_dir, model_dir, adapter_dir, prediction_format
+        )
+        if inference_error is not None:
             row["status"] = "inference_failed"
         write_jsonl(predictions_path, row)
         print(f"[{index}/{len(items)}] {item_id}: {row['status']}", flush=True)

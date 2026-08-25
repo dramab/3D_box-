@@ -117,10 +117,10 @@ def test_stage2_terminal_log_only_contains_core_metrics() -> None:
     )
 
 
-def test_placement_success_top5_does_not_use_source_or_yaw(monkeypatch) -> None:
+def test_placement_success_top5_does_not_use_source_size_or_yaw(monkeypatch) -> None:
     boxes = torch.zeros(1, 16, 7)
     boxes[0, :6, 0] = torch.arange(6, dtype=torch.float32)
-    boxes[0, :6, 3:6] = 2.0
+    boxes[0, :6, 3:6] = 9.0
     valid_mask = torch.zeros(1, 16, dtype=torch.bool)
     valid_mask[0, :6] = True
     outputs = {
@@ -141,7 +141,13 @@ def test_placement_success_top5_does_not_use_source_or_yaw(monkeypatch) -> None:
         "batch_indices": torch.tensor([0]),
     }
     cfg = {"data": {"voxel_size_cm": 1.0}, "validation": {"size_iou_threshold": 0.8}}
-    monkeypatch.setattr(stage2_training, "compute_collision_metrics", lambda box, context: {"collision": False})
+    evaluated_boxes = []
+
+    def record_collision(box, context):
+        evaluated_boxes.append(np.asarray(box).copy())
+        return {"collision": False}
+
+    monkeypatch.setattr(stage2_training, "compute_collision_metrics", record_collision)
     monkeypatch.setattr(stage2_training, "compute_direction_hit", lambda box, context: bool(box[0] == 1.0))
     monkeypatch.setattr(stage2_training, "compute_supported_and_stable", lambda *args, **kwargs: (True, 1.0))
 
@@ -150,6 +156,9 @@ def test_placement_success_top5_does_not_use_source_or_yaw(monkeypatch) -> None:
     assert metrics["placement_success_at_1_sum"] == 0.0
     assert metrics["placement_success_at_5_sum"] == 1.0
     assert metrics["successful_pose_count"] == 1.0
+    assert metrics["placement_size_correct_sum"] == 0.0
+    assert evaluated_boxes
+    assert all(np.array_equal(box[3:6], [2.0, 2.0, 2.0]) for box in evaluated_boxes)
 
     monkeypatch.setattr(stage2_training, "compute_direction_hit", lambda box, context: bool(box[0] == 5.0))
     metrics = compute_stage2_task_metric_sums(outputs, batch, cfg)

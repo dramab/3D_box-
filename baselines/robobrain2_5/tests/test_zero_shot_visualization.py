@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -15,6 +16,7 @@ from baselines.robobrain2_5.zero_shot_visualization import (
     local_depth_cm,
     normalized_to_pixel,
     parse_point_answer,
+    parse_point_depth_answer,
     source_dimensions_and_yaw,
     upright_box_corners,
 )
@@ -32,6 +34,11 @@ from baselines.robobrain2_5.run_zero_shot_test import (
 def test_parse_point_answer_matches_official_tuple_format() -> None:
     assert parse_point_answer("The location is [(120, 850)].")[0] == (120, 850)
     assert parse_point_answer("no coordinate")[1] == "parse_failed"
+
+
+def test_parse_point_depth_answer_matches_single_xyd_tuple() -> None:
+    assert parse_point_depth_answer("[(120, 850, 84.27)]")[0] == (120, 850, 84.27)
+    assert parse_point_depth_answer("[(120, 850)]")[1] == "parse_failed"
 
 
 def test_normalized_point_uses_official_clamping() -> None:
@@ -54,6 +61,46 @@ def test_source_geometry_creates_upright_render_box() -> None:
     corners = upright_box_corners(np.array([0.0, 0.0, 3.0]), dimensions, yaw)
     assert np.allclose(dimensions, [2.0, 4.0, 6.0])
     assert np.isclose(corners[:, 2].min(), 0.0)
+
+
+def test_xyd_output_uses_model_depth_instead_of_rgbd(tmp_path: Path, monkeypatch) -> None:
+    import baselines.robobrain2_5.run_zero_shot_test as run_module
+
+    monkeypatch.setattr(run_module, "render_composite", lambda *args, **kwargs: Image.new("RGB", (8, 8)))
+    camera = Camera(10.0, 10.0, 5.0, 5.0, 10, 10, np.eye(4))
+    source = {
+        "obj_id": "obj_0",
+        "bbox3d_canonical": [-1, -1, 0, 1, 1, 2],
+        "pose_world": np.eye(4).tolist(),
+    }
+    scene = {
+        "rgb": np.zeros((10, 10, 3), dtype=np.uint8),
+        "depth": np.full((10, 10), np.nan, dtype=np.float32),
+        "camera": camera,
+        "objects": [source],
+    }
+    gt_center = np.asarray([0.0, 0.0, 100.0])
+    gt = {
+        "bottom_center_world": gt_center,
+        "box": [0, 0, 101, 2, 2, 2, 0],
+        "corners": upright_box_corners(np.asarray([0.0, 0.0, 101.0]), np.asarray([2, 2, 2]), 0.0),
+    }
+    item = {
+        "item_id": "item_0",
+        "source_name": "source",
+        "sample_id": "sample",
+        "object_id": "obj_0",
+        "instruction": "Place the object.",
+    }
+
+    row = run_module.output_record(
+        item, scene, gt, "prompt", "[(500, 500, 100.0)]", tmp_path, prediction_format="xyd"
+    )
+
+    assert row["status"] == "ok"
+    assert row["depth_source"] == "model_absolute_camera_depth_cm"
+    assert row["predicted_depth_cm"] == 100.0
+    assert np.allclose(row["world_point_cm"], [0.0, 0.0, 100.0])
 
 
 def test_fixed_test_split_does_not_require_cluster_id() -> None:

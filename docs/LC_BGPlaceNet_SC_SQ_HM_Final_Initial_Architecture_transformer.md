@@ -145,4 +145,4 @@ place_box         [B,7]
 source_box        [B,6]
 ```
 
-所有有效输出的 `(dx,dy,dz)` 严格等于当前 Stage 1 Source Size。`place_box` 是 `place_boxes[:,0]` 的兼容字段。最佳 checkpoint 只按 `Placement Success@1` 选择；`Placement Success@5` 用于统计前 5 个候选中是否存在同时通过 Placement Size IoU、语言关系、连通支撑和碰撞四项条件的候选。Source 3D IoU 独立报告；Yaw 只在中心 2 cm 匹配成功的样本中计算条件准确率。
+所有有效输出的 `(dx,dy,dz)` 严格等于当前 Stage 1 Source Size。`place_box` 是 `place_boxes[:,0]` 的兼容字段。最佳 checkpoint 只按 `Placement Success@1` 选择；`Placement Success@5` 用于统计前 5 个候选中是否存在同时通过语言关系、连通支撑和碰撞三项条件的候选。支撑和碰撞使用“预测放置中心 + GT 长宽高 + 预测 yaw”构造的评估框；Source 3D IoU、Placement Size IoU 独立报告；Yaw 只在中心 2 cm 匹配成功的样本中计算条件准确率。

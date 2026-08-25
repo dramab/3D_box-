@@ -179,16 +179,20 @@ def compute_yaw_valid_at_matched_center(
     return bool(valid), distance, matched
 
 
+def build_placement_evaluation_box(
+    predicted_box: np.ndarray,
+    gt_box: np.ndarray,
+) -> np.ndarray:
+    """Use the predicted center/yaw with GT dimensions for support and collision."""
+    evaluation_box = np.asarray(predicted_box, dtype=np.float64).copy()
+    evaluation_box[3:6] = np.asarray(gt_box, dtype=np.float64)[3:6]
+    return evaluation_box
+
+
 def placement_success(
-    placement_size_correct: bool,
     language_relation_correct: bool,
     supported_and_stable: bool,
     collision_free: bool,
 ) -> bool:
-    """Return the four-condition Placement Success decision for one candidate."""
-    return bool(
-        placement_size_correct
-        and language_relation_correct
-        and supported_and_stable
-        and collision_free
-    )
+    """Return the three-condition Placement Success decision for one candidate."""
+    return bool(language_relation_correct and supported_and_stable and collision_free)

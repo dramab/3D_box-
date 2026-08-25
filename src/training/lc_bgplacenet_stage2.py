@@ -39,6 +39,7 @@ from src.models.lc_bgplacenet.stage2 import (
     yaw_bin_angles,
 )
 from src.placement_metrics import (
+    build_placement_evaluation_box,
     compute_aabb_iou_3d,
     compute_size_iou as _compute_size_iou,
     compute_supported_and_stable,
@@ -1094,7 +1095,7 @@ def compute_stage2_task_metric_sums(
     batch: dict[str, Any],
     cfg: dict[str, Any],
 ) -> dict[str, float]:
-    """Compute four-condition Placement Success and separate source/yaw metrics."""
+    """Compute three-condition Placement Success and separate source/size/yaw metrics."""
     place_gt = batch["place_box_gt"].detach().cpu().numpy()
     place_sets = outputs["place_boxes"].detach().cpu().numpy()
     place_set_masks = outputs["place_valid_mask"].detach().cpu().numpy()
@@ -1147,17 +1148,20 @@ def compute_stage2_task_metric_sums(
         target_yaw = gt_yaw_masks[sample_index, valid_gt]
         for output_index in emitted:
             box = place_sets[sample_index, output_index]
+            evaluation_box = build_placement_evaluation_box(box, gt)
             size_metrics = compute_size_metrics(box, gt, size_iou_threshold)
             direction_correct = compute_direction_hit(box, context)
             supported, _ = compute_supported_and_stable(
-                box,
+                evaluation_box,
                 occupied_keys,
                 voxel_size_cm,
                 downward_cm=support_downward_cm,
                 upper_cm=support_upper_cm,
                 cache=support_cache,
             )
-            collision_free = not compute_collision_metrics(box, context.collision_context)["collision"]
+            collision_free = not compute_collision_metrics(
+                evaluation_box, context.collision_context
+            )["collision"]
             yaw_valid, center_distance, _ = compute_yaw_valid_at_matched_center(
                 box,
                 int(place_yaw_bins[sample_index, output_index]),
@@ -1179,7 +1183,6 @@ def compute_stage2_task_metric_sums(
             )
             candidate_components.append(components)
             candidate_success = placement_success(
-                size_metrics["size_correct"],
                 direction_correct,
                 supported,
                 collision_free,

@@ -59,9 +59,9 @@ Hungarian 在全部方向合法中心和与有效 Query 等量的背景虚拟目
 
 Stage 1 参数组使用 `training.lr × 0.1`，SPACE-Former 使用完整 `training.lr`。`ReduceLROnPlateau(mode=max)` 监控 validation `placement_success_at_1`，绝对提升不足 `0.001` 连续停滞超过 3 个 epoch 后将两个参数组学习率同时乘以 `0.5`。最佳 checkpoint 仅按 validation 的 `Placement Success@1` 保存。
 
-同一个候选必须同时满足以下四项才计为 Placement Success：预测与 GT 长宽高的 dimensions-only IoU ≥ 0.8；语言空间关系正确；Supported and Stable；Collision-Free。Supported and Stable 使用完整场景点云（保留 source 原位置体素），取预测框底面下方 3 cm 至上方 1 cm 的体素，投影至 XY 后依次执行 `3×3 binary closing`、封闭孔洞填充和 8 邻域连通域标记；预测底面 footprint 必须 100% 落在覆盖其底面中心的同一个连通域中。
+同一个候选必须同时满足以下三项才计为 Placement Success：语言空间关系正确、Supported and Stable、Collision-Free。支撑与碰撞评估使用“预测放置中心 + GT 长宽高 + 预测 yaw”构造的评估框；语言关系仍按当前预测候选判断。Supported and Stable 使用完整场景点云（保留 source 原位置体素），取评估框底面下方 3 cm 至上方 1 cm 的体素，投影至 XY 后依次执行 `3×3 binary closing`、封闭孔洞填充和 8 邻域连通域标记；评估框底面 footprint 必须 100% 落在覆盖其底面中心的同一个连通域中。Collision-Free 对同一评估框沿用 benchmark 现有的 OBB 碰撞判定。
 
-Source 完整 3D AABB IoU 及其 0.5 阈值准确率单独报告，不参与 Placement Success。Yaw 同样独立报告：`center_match_rate` 表示预测底面中心在 2 cm 内匹配到 GT 中心的比例；`yaw_valid_given_center_match` 只以中心匹配成功样本为分母，统计预测 yaw 是否属于该中心合法 yaw 集合。
+Source 完整 3D AABB IoU 及其 0.5 阈值准确率、Placement Size IoU 及其 0.8 阈值准确率均单独报告，不参与 Placement Success。Yaw 同样独立报告：`center_match_rate` 表示预测底面中心在 2 cm 内匹配到 GT 中心的比例；`yaw_valid_given_center_match` 只以中心匹配成功样本为分母，统计预测 yaw 是否属于该中心合法 yaw 集合。
 
 训练保持 FP32。P1/P2/P3 的 sparse lookup 排序索引在一次 forward 内由四层 Decoder 复用；训练不执行 pose NMS，采样诊断仅在日志 step 计算；每个 batch 的 Hungarian 代价只进行一次 GPU→CPU 传输，仍使用 SciPy 精确匹配。日志通过 `matched_query_count` 和 `background_query_count` 记录真实/背景分配数量，便于检查背景代价是否合适。进度条最多每 20 step 同步一次 loss。
 
@@ -107,7 +107,7 @@ python tools/train_lc_bgplacenet_stage2.py \
 
 主要验证指标包括：
 
-- `placement_success_at_1`、`placement_success_at_5`，分别统计 top-1 和前 5 个候选中是否存在同时满足四项放置条件的候选。
+- `placement_success_at_1`、`placement_success_at_5`，分别统计 top-1 和前 5 个候选中是否存在同时满足语言关系、支撑稳定和无碰撞三项条件的候选。
 - `successful_pose_rate`、`duplicate_pair_rate`。
 - `placement_size_accuracy`、`language_relation_correct_rate`、`supported_and_stable_rate`、`collision_free_rate`。
 - 独立 Source 指标：`source_iou`、`source_iou_accuracy`。

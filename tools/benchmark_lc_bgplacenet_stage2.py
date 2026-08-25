@@ -42,6 +42,7 @@ from src.annotation.free_bbox.geometry import get_bbox_corners, transform_points
 from src.annotation.free_bbox.io_utils import load_ply
 from src.datasets.canonical import CameraParams, ObjectInfo, load_sample_record
 from src.placement_metrics import (
+    build_placement_evaluation_box,
     compute_aabb_iou_3d,
     compute_supported_and_stable,
     compute_yaw_valid_at_matched_center,
@@ -360,7 +361,7 @@ def run_benchmark(
     support_downward_cm: float = 3.0,
     support_upper_cm: float = 1.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Compute Placement Success plus separate source and conditional-yaw metrics."""
+    """Compute three-condition Placement Success plus separate source/size/yaw metrics."""
     item_by_id = _build_item_lookup(cfg, split)
     prediction_ids = {str(row.get("item_id")) for row in predictions}
     split_ids = set(item_by_id)
@@ -403,15 +404,16 @@ def run_benchmark(
         placements = row.get("placements", [])
         for rank, placement in enumerate(placements):
             box = np.asarray(placement["box"], dtype=np.float64)
+            evaluation_box = build_placement_evaluation_box(box, place_box_gt)
             size_metrics = compute_size_metrics(box, place_box_gt, size_iou_threshold)
             direction_metrics = compute_direction_metrics(
                 box,
                 direction_metadata[str(row["item_id"])],
                 direction_scene_cache[scene_key],
             )
-            collision_metrics = compute_collision_metrics(box, collision_context)
+            collision_metrics = compute_collision_metrics(evaluation_box, collision_context)
             supported, support_coverage = compute_supported_and_stable(
-                box,
+                evaluation_box,
                 occupied_keys,
                 voxel_size_cm,
                 downward_cm=support_downward_cm,
@@ -430,7 +432,6 @@ def run_benchmark(
             )
             collision_free = not collision_metrics["collision"]
             success = placement_success(
-                size_metrics["size_correct"],
                 direction_metrics["direction_hit"],
                 supported,
                 collision_free,
@@ -455,9 +456,18 @@ def run_benchmark(
                     "placement_success": success,
                 }
             )
-        if not candidate_rows:
-            raise ValueError(f"Prediction has no emitted placements: {item.item_id}")
-        first = candidate_rows[0]
+        first = candidate_rows[0] if candidate_rows else {
+            "placement_size_iou": 0.0,
+            "placement_size_correct": False,
+            "language_relation_correct": False,
+            "predicted_relation": None,
+            "supported_and_stable": False,
+            "collision_free": False,
+            "collision_object_ids": [],
+            "center_matched": False,
+            "yaw_valid_at_matched_center": False,
+            "placement_success": False,
+        }
         per_sample_rows.append(
             {
                 "item_id": item.item_id,
@@ -479,6 +489,8 @@ def run_benchmark(
                 "collision_object_ids": first["collision_object_ids"],
                 "center_matched": first["center_matched"],
                 "yaw_valid_at_matched_center": first["yaw_valid_at_matched_center"],
+                "prediction_emitted": bool(candidate_rows),
+                "prediction_status": row.get("prediction_status"),
                 "placement_success_at_1": bool(first["placement_success"]),
                 "placement_success_at_5": any(
                     candidate["placement_success"] for candidate in candidate_rows[:5]
@@ -502,6 +514,7 @@ def run_benchmark(
             "support_morphology": "3x3_closing_then_fill_holes_8_connected",
             "support_required_coverage": 1.0,
             "source_object_voxels_excluded": False,
+            "support_collision_box_geometry": "predicted_center_gt_dimensions_predicted_yaw",
             "voxel_size_cm": voxel_size_cm,
             "direction_metric": "auto_label_spatial_relation",
         },

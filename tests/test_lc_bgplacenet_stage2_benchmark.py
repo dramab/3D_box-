@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
+import tools.benchmark_lc_bgplacenet_stage2 as benchmark
 from src.datasets.canonical import CameraParams, ObjectInfo
 from tools.benchmark_lc_bgplacenet_stage2 import (
     build_collision_context,
@@ -13,7 +16,7 @@ from tools.benchmark_lc_bgplacenet_stage2 import (
     compute_size_metrics,
     summarize_rows,
 )
-from src.placement_metrics import placement_success
+from src.placement_metrics import build_placement_evaluation_box, placement_success
 
 
 def test_size_iou_keeps_dimension_order_and_threshold() -> None:
@@ -121,9 +124,18 @@ def test_collision_metric_treats_box_contact_as_non_collision() -> None:
     assert metrics["collision_object_ids"] == []
 
 
-def test_placement_success_requires_all_four_conditions() -> None:
-    assert placement_success(True, True, True, True)
-    assert not placement_success(True, True, False, True)
+def test_placement_evaluation_box_uses_predicted_pose_and_gt_dimensions() -> None:
+    predicted = np.array([1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 0.7])
+    gt = np.array([11.0, 12.0, 13.0, 4.0, 5.0, 6.0, 1.2])
+
+    evaluation_box = build_placement_evaluation_box(predicted, gt)
+
+    np.testing.assert_allclose(evaluation_box, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.7])
+
+
+def test_placement_success_requires_all_three_conditions() -> None:
+    assert placement_success(True, True, True)
+    assert not placement_success(True, False, True)
 
 
 def test_benchmark_summary_reports_placement_and_conditional_yaw() -> None:
@@ -164,3 +176,46 @@ def test_benchmark_summary_reports_placement_and_conditional_yaw() -> None:
     assert summary["yaw_valid_given_center_match"] == 1.0
     assert summary["placement_success_at_1"] == 1.0
     assert summary["placement_success_at_5"] == 1.0
+
+
+def test_benchmark_counts_empty_candidate_list_as_failure(monkeypatch) -> None:
+    """A failed external prediction should remain in the benchmark denominator."""
+    item = SimpleNamespace(
+        item_id="item_0",
+        source_name="source",
+        sample_id="sample",
+        object_id="obj_0",
+        cluster_id=0,
+        source_box_gt=np.asarray([0, 0, 0, 2, 2, 2], dtype=np.float64),
+    )
+    monkeypatch.setattr(benchmark, "_build_item_lookup", lambda *_: {"item_0": item})
+    monkeypatch.setattr(benchmark, "_get_collision_context", lambda *_: {})
+    monkeypatch.setattr(benchmark, "load_direction_scene_context", lambda *_: {})
+    monkeypatch.setattr(
+        benchmark,
+        "_load_metric_targets",
+        lambda *_: (
+            np.zeros((0, 3), dtype=np.int64),
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0, 12), dtype=bool),
+        ),
+    )
+    predictions = [{
+        "item_id": "item_0",
+        "source_box": item.source_box_gt.tolist(),
+        "place_box_gt": [0, 0, 1, 2, 2, 2, 0],
+        "placements": [],
+        "prediction_status": "depth_failed",
+    }]
+    rows, summary = benchmark.run_benchmark(
+        {"data": {"voxel_size_cm": 1.0}},
+        predictions,
+        {"item_0": {"target_relation": "the left of", "reference_object_id": "obj_1"}},
+        split="test",
+        size_iou_threshold=0.8,
+    )
+
+    assert rows[0]["prediction_emitted"] is False
+    assert rows[0]["prediction_status"] == "depth_failed"
+    assert rows[0]["placement_success_at_1"] is False
+    assert summary["overall"]["placement_success_at_1"] == 0.0

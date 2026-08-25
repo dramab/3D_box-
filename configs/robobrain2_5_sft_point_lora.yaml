@@ -1,0 +1,35 @@
+model:
+  base_model: baselines/robobrain2_5/hf_cache/RoboBrain2.5-8B-NV
+  # PyTorch SDPA avoids requiring a separate FlashAttention installation.
+  attn_implementation: sdpa
+  lora:
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+
+data:
+  benchmark_config: configs/lc_bgplacenet_stage2_enriched.yaml
+  annotations_dir: outputs/robobrain2_5_sft_bottom_center_xyd_lora_enriched/data
+  schema_version: robobrain2_5_bottom_center_xyd_sft/v1
+  prompt_variant: enriched_label_bottom_center_xyd
+  # Qwen3-VL image token budget: 16 to 512 merged 28x28 patches.
+  min_pixels: 12544
+  max_pixels: 401408
+
+training:
+  output_dir: outputs/robobrain2_5_sft_bottom_center_xyd_lora_enriched/checkpoints
+  seed: 20260825
+  epochs: 20
+  # 8 GPUs x batch 1 x accumulation 8 = global batch size 64.
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_workers: 8
+  learning_rate: 0.00001
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  # Cosine decay with a short linear warmup stabilizes LoRA adaptation.
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  logging_steps: 300
+  save_total_limit: 2

@@ -54,6 +54,18 @@ def parse_point_answer(answer: str) -> tuple[tuple[int, int] | None, str]:
     return (x, y), "ok"
 
 
+def parse_point_depth_answer(answer: str) -> tuple[tuple[int, int, float] | None, str]:
+    """Parse one normalized image point plus absolute camera depth."""
+    import re
+
+    number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+    matches = re.findall(rf"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*({number})\s*\)", str(answer))
+    if not matches:
+        return None, "parse_failed"
+    x, y, depth = matches[0]
+    return (int(x), int(y), float(depth)), "ok"
+
+
 def normalized_to_pixel(point: tuple[int, int], width: int, height: int) -> tuple[tuple[int, int], bool]:
     """Mirror the official renderer's 0--1000 coordinate conversion and clamping."""
     raw_x = int(round(point[0] / 1000.0 * width))
