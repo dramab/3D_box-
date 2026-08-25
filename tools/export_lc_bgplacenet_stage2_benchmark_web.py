@@ -279,15 +279,18 @@ def collect_rows(
                 "instruction": str(pred.get("instruction", "")),
                 "prediction_png": os.path.relpath(prediction_png, output_dir),
                 "topdown_png": os.path.relpath(topdown_png, output_dir),
-                "size_iou": float(metrics.get("size_iou", 0.0)),
-                "size_correct": bool(metrics.get("size_correct", False)),
-                "direction_hit": bool(metrics.get("direction_hit", False)),
+                "size_iou": float(metrics.get("placement_size_iou", 0.0)),
+                "size_correct": bool(metrics.get("placement_size_correct", False)),
+                "direction_hit": bool(metrics.get("language_relation_correct", False)),
                 "target_relation": str(metrics.get("target_relation", "")),
                 "predicted_relation": str(metrics.get("predicted_relation", "")),
                 "reference_name": str(metrics.get("reference_name", "")),
                 "reference_object_id": str(metrics.get("reference_object_id", "")),
-                "collision": bool(metrics.get("collision", False)),
-                "collision_object_count": int(metrics.get("collision_object_count", 0)),
+                "supported_and_stable": bool(metrics.get("supported_and_stable", False)),
+                "yaw_valid": bool(metrics.get("yaw_valid_at_matched_center", False)),
+                "placement_success": bool(metrics.get("placement_success_at_1", False)),
+                "collision": not bool(metrics.get("collision_free", False)),
+                "collision_object_count": len(metrics.get("collision_object_ids", [])),
                 "collision_object_ids": [str(obj_id) for obj_id in metrics.get("collision_object_ids", [])],
                 "best_heatmap_score": float(pred.get("best_heatmap_score", 0.0)),
                 "search": search_text,
@@ -308,6 +311,9 @@ def write_html(output_path: Path, rows: list[dict[str, Any]], summary: dict[str,
         direction_class = "pass" if row["direction_hit"] else "fail"
         size_class = "pass" if row["size_correct"] else "fail"
         collision_class = "fail" if row["collision"] else "pass"
+        support_class = "pass" if row["supported_and_stable"] else "fail"
+        yaw_class = "pass" if row["yaw_valid"] else "fail"
+        placement_class = "pass" if row["placement_success"] else "fail"
         collision_ids = ", ".join(row["collision_object_ids"]) if row["collision_object_ids"] else "none"
         cards.append(
             f"""
@@ -324,7 +330,10 @@ def write_html(output_path: Path, rows: list[dict[str, Any]], summary: dict[str,
     <div class="badges">
       <span class="badge {direction_class}">Dir {_status_text(row["direction_hit"])}</span>
       <span class="badge {size_class}">Size {_status_text(row["size_correct"])}</span>
+      <span class="badge {support_class}">Support {_status_text(row["supported_and_stable"])}</span>
       <span class="badge {collision_class}">Collision {"YES" if row["collision"] else "NO"}</span>
+      <span class="badge {yaw_class}">Yaw {_status_text(row["yaw_valid"])}</span>
+      <span class="badge {placement_class}">Placement@1 {_status_text(row["placement_success"])}</span>
     </div>
   </header>
   <div class="visuals">
@@ -614,9 +623,9 @@ def write_html(output_path: Path, rows: list[dict[str, Any]], summary: dict[str,
         <h1>LC-BGPlaceNet Stage 2 Benchmark</h1>
         <div class="summary">
           <span>{len(rows)} samples</span>
-          <span>size {float(overall.get("size_accuracy", 0.0)):.4f}</span>
-          <span>direction {float(overall.get("direction_hit_rate", 0.0)):.4f}</span>
-          <span>collision {float(overall.get("collision_rate", 0.0)):.4f}</span>
+          <span>placement@1 {float(overall.get("placement_success_at_1", 0.0)):.4f}</span>
+          <span>placement@5 {float(overall.get("placement_success_at_5", 0.0)):.4f}</span>
+          <span>support {float(overall.get("supported_and_stable_rate", 0.0)):.4f}</span>
         </div>
       </div>
       <div class="controls">

@@ -13,6 +13,7 @@ from src.annotation.free_bbox.pipeline import (
     _active_center_mask_2d,
     _build_center_yaw_set,
     _validate_active_aligned_supervision,
+    _yaw_only_search_geometry,
 )
 from src.annotation.free_bbox.surface import _remove_excluded_surface_voxels
 from src.annotation.free_bbox.voxel_utils import world_to_voxel
@@ -134,6 +135,22 @@ def test_yaw_only_upright_box_keeps_xy_order_when_canonical_z_is_up() -> None:
     assert np.isclose(box["yaw_degrees"], 30.0)
 
 
+def test_yaw_only_search_geometry_keeps_original_world_center() -> None:
+    bbox = np.array([-5.0, -1.0, -2.0, 5.0, 1.0, 2.0], dtype=np.float64)
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, :3] = np.array(
+        [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]], dtype=np.float64
+    )
+    pose[:3, 3] = [10.0, 20.0, 30.0]
+    search_bbox, search_pose = _yaw_only_search_geometry(
+        SimpleNamespace(bbox3d_canonical=bbox, pose_world=pose)
+    )
+
+    np.testing.assert_allclose(search_bbox[3:] - search_bbox[:3], [2.0, 4.0, 10.0])
+    np.testing.assert_allclose(search_pose[:3, 3], [10.0, 20.0, 30.0])
+    np.testing.assert_allclose(search_pose[:3, :3], np.eye(3))
+
+
 def test_center_yaw_set_groups_filtered_candidates_by_bottom_center() -> None:
     """同一底面中心通过过滤的多个 yaw 应聚合到同一布尔 mask。"""
     transforms = []
@@ -141,16 +158,14 @@ def test_center_yaw_set_groups_filtered_candidates_by_bottom_center() -> None:
         transform = np.eye(4, dtype=np.float64)
         transform[:3, :3] = rotation_z_3x3(angle)
         transforms.append(transform)
-    obj = SimpleNamespace(
-        bbox3d_canonical=np.array([-1.0, -2.0, -3.0, 1.0, 2.0, 3.0], dtype=np.float64)
-    )
+    bbox = np.array([-1.0, -2.0, -3.0, 1.0, 2.0, 3.0], dtype=np.float64)
     record = {
         "members": np.array([[3, 4, 0], [3, 4, 2], [8, 9, 1]], dtype=int),
         "member_bottom_centers": np.array([[5, 6, 1], [5, 6, 1], [9, 10, 1]], dtype=int),
     }
 
     payload = _build_center_yaw_set(
-        obj,
+        bbox,
         record,
         {"yaw_angles": np.array([0.0, np.pi / 2.0, np.pi]), "T_rotated": transforms},
         {"origin": [0.0, 0.0, 0.0], "voxel_size": 1.0},

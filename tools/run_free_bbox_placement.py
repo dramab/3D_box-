@@ -85,7 +85,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safety-margin", type=float, default=0.5, help="碰撞安全边距，单位 cm。")
     parser.add_argument("--yaw-steps", type=int, default=24, help="yaw 离散步数。")
     parser.add_argument("--min-surface-area", type=float, default=50.0, help="最小支撑面面积，单位 cm^2。")
-    parser.add_argument("--min-support-ratio", type=float, default=1.0, help="最小支撑比例。")
     parser.add_argument("--dbscan-eps", type=float, default=None, help="DBSCAN eps；不传则按物体尺度估计。")
     parser.add_argument("--dbscan-min-samples", type=int, default=1, help="DBSCAN min_samples。")
     parser.add_argument(
@@ -93,11 +92,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="单物体最多输出多少个簇代表；不传则每个簇输出一个。",
-    )
-    parser.add_argument(
-        "--no-preserve-orientation",
-        action="store_true",
-        help="搜索阶段不保留原始 roll/pitch，仅使用 yaw-only 姿态；最终导出框始终为 yaw-only upright 监督框。",
     )
     args = parser.parse_args()
     if args.workers < 1:
@@ -159,11 +153,9 @@ def make_config(args: argparse.Namespace) -> FreeBBoxConfig:
         safety_margin=args.safety_margin,
         yaw_steps=args.yaw_steps,
         min_surface_area=args.min_surface_area,
-        min_support_ratio=args.min_support_ratio,
         dbscan_eps=args.dbscan_eps,
         dbscan_min_samples=args.dbscan_min_samples,
         max_reps_total=args.max_reps_total,
-        preserve_orientation=not args.no_preserve_orientation,
     )
 
 

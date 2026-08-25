@@ -80,7 +80,11 @@ loss:
     lambda_iou: 0.2
 
 validation:
+  source_iou_threshold: 0.5
   size_iou_threshold: 0.8
+  center_match_threshold_cm: 2.0
+  support_downward_cm: 3.0
+  support_upper_cm: 1.0
 
 training:
   output_dir: outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8

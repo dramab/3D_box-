@@ -5,7 +5,7 @@ src/annotation/free_bbox/pipeline.py
 
 流程:
     CanonicalScene -> voxel PLY -> OCCUPIED/FREE 栅格 -> 逐物体:
-        支撑面检测 -> 支撑面本层 FFT 碰撞搜索 -> 稳定/可见/遮挡过滤 ->
+        支撑面检测 -> yaw-only FFT 碰撞搜索 -> 连通支撑/可见/遮挡过滤 ->
         底面中心约束 -> DBSCAN 聚类 -> 每簇最优 3D box、热力 PLY 和有效 yaw 集合输出
 """
 
@@ -21,11 +21,17 @@ from src.annotation.free_bbox.cluster import build_heat_counts, cluster_placemen
 from src.annotation.free_bbox.collision import find_table_placements
 from src.annotation.free_bbox.datatypes import FreeBBoxConfig, FreeBBoxResult
 from src.annotation.free_bbox.filters import (
+    compute_bottom_center_voxels,
     build_depth_buffer,
     filter_occluded_placements,
-    filter_stable_placements,
     filter_visible_placements,
     is_fully_visible,
+)
+from src.placement_metrics import (
+    build_connected_support_region,
+    footprint_voxel_keys,
+    quantize_occupied_points,
+    support_z_key_bounds,
 )
 from src.annotation.free_bbox.geometry import build_yaw_only_upright_box, get_bbox_corners, transform_points
 from src.annotation.free_bbox.grid_ops import prepare_grid_base, voxelize_obb
@@ -115,6 +121,88 @@ def _compute_placed_transform(
     return transform
 
 
+def _yaw_only_search_geometry(obj) -> tuple[np.ndarray, np.ndarray]:
+    """Build the centered upright box used consistently by search and export."""
+    upright = build_yaw_only_upright_box(
+        obj.bbox3d_canonical,
+        obj.pose_world,
+        np.zeros(3, dtype=np.float64),
+    )
+    dims = np.asarray(upright["dimensions"], dtype=np.float64)
+    bbox = np.concatenate([-dims * 0.5, dims * 0.5])
+    original_center = (np.asarray(obj.bbox3d_canonical)[:3] + np.asarray(obj.bbox3d_canonical)[3:]) * 0.5
+    center_world = transform_points(original_center[None, :], obj.pose_world)[0]
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, 3] = center_world
+    return bbox, pose
+
+
+def _filter_connected_support_candidates(
+    candidates: np.ndarray,
+    bbox3d: np.ndarray,
+    yaw_data: dict,
+    landing_z: int,
+    vp: dict,
+    occupied_keys: np.ndarray,
+    downward_cm: float = 3.0,
+    upper_cm: float = 1.0,
+    chunk_size: int = 2000,
+) -> np.ndarray:
+    """Apply the benchmark's exact connected-area support rule to GT candidates."""
+    if len(candidates) == 0:
+        return candidates
+
+    voxel_size = float(vp["voxel_size"])
+    centers = compute_bottom_center_voxels(candidates, yaw_data, landing_z)
+    centers_world = voxel_to_world(centers, vp)
+    z_min, z_max = support_z_key_bounds(
+        float(centers_world[0, 2]), downward_cm, upper_cm, voxel_size
+    )
+    region = build_connected_support_region(occupied_keys, z_min, z_max)
+    center_keys = np.floor(centers_world[:, :2] / voxel_size).astype(np.int64)
+    center_local = center_keys - region.origin_xy
+    center_in = np.all(center_local >= 0, axis=1) & np.all(
+        center_local < np.asarray(region.labels.shape), axis=1
+    )
+    component_ids = np.zeros(len(candidates), dtype=np.int32)
+    valid_centers = center_local[center_in]
+    component_ids[center_in] = region.labels[valid_centers[:, 0], valid_centers[:, 1]]
+
+    keep = np.zeros(len(candidates), dtype=bool)
+    for yaw_idx, transform in enumerate(yaw_data["T_rotated"]):
+        indices = np.flatnonzero(candidates[:, 2] == yaw_idx)
+        if len(indices) == 0:
+            continue
+        reference_box = build_yaw_only_upright_box(
+            bbox3d,
+            np.asarray(transform, dtype=np.float64),
+            centers_world[indices[0]],
+        )
+        place_box = np.concatenate(
+            [
+                reference_box["center_world"],
+                reference_box["dimensions"],
+                [np.deg2rad(float(reference_box["yaw_degrees"]))],
+            ]
+        )
+        reference_center_key = np.floor(place_box[:2] / voxel_size).astype(np.int64)
+        offsets = footprint_voxel_keys(place_box, voxel_size) - reference_center_key
+        for start in range(0, len(indices), int(chunk_size)):
+            batch_indices = indices[start : start + int(chunk_size)]
+            footprint = center_keys[batch_indices, None, :] + offsets[None, :, :]
+            local = footprint - region.origin_xy
+            in_bounds = np.all(local >= 0, axis=2) & np.all(
+                local < np.asarray(region.labels.shape), axis=2
+            )
+            clipped = np.clip(local, 0, np.asarray(region.labels.shape) - 1)
+            labels = region.labels[clipped[:, :, 0], clipped[:, :, 1]]
+            component = component_ids[batch_indices, None]
+            keep[batch_indices] = (component[:, 0] != 0) & np.all(
+                in_bounds & (labels == component), axis=1
+            )
+    return candidates[keep]
+
+
 def _support_mask_3d(surface_mask_2d: np.ndarray, table_z: int, grid_shape: tuple[int, int, int]) -> np.ndarray:
     """将二维支撑面 mask 放入三维体素层。"""
     mask_3d = np.zeros(tuple(grid_shape), dtype=bool)
@@ -162,7 +250,7 @@ def _validate_active_aligned_supervision(
 
 
 def _build_center_yaw_set(
-    obj,
+    bbox3d: np.ndarray,
     record: dict,
     yaw_data: dict,
     vp: dict,
@@ -191,7 +279,7 @@ def _build_center_yaw_set(
     yaw_angles_rad = []
     for transform in yaw_data["T_rotated"]:
         yaw_box = build_yaw_only_upright_box(
-            obj.bbox3d_canonical,
+            bbox3d,
             np.asarray(transform, dtype=np.float64),
             np.zeros(3, dtype=np.float64),
         )
@@ -209,6 +297,7 @@ def _build_center_yaw_set(
 def _build_saved_placements(
     scene_prefix: str,
     obj,
+    bbox3d: np.ndarray,
     reps: np.ndarray,
     cluster_infos: list[dict],
     landing_z: int,
@@ -216,7 +305,7 @@ def _build_saved_placements(
     vp: dict,
 ) -> list[dict]:
     """将每簇最优候选转换为 yaw-only 监督框标注。"""
-    corners_obj = get_bbox_corners(obj.bbox3d_canonical)
+    corners_obj = get_bbox_corners(bbox3d)
     placements = []
     for rank, (rep, info) in enumerate(zip(reps, cluster_infos)):
         yaw_idx = int(rep[2])
@@ -224,7 +313,7 @@ def _build_saved_placements(
         obb6d_corners = transform_points(corners_obj, obb6d_transform)
         obb6d_aabb = np.concatenate([obb6d_corners.min(axis=0), obb6d_corners.max(axis=0)])
         yaw_box = build_yaw_only_upright_box(
-            obj.bbox3d_canonical,
+            bbox3d,
             obb6d_transform,
             np.asarray(info["bottom_center_world"], dtype=np.float64),
         )
@@ -288,6 +377,7 @@ class FreeBBoxPipeline:
 
         scene_prefix = _sample_prefix(scene)
         voxel_points, _ = load_ply(scene.voxel_point_cloud_path)
+        occupied_keys = quantize_occupied_points(voxel_points, cfg.voxel_size)
         extra_points = _object_bbox_world_corners(scene.objects)
         grid_scene, grid_min, voxel_size = build_grid_from_voxel_points(
             voxel_points,
@@ -313,6 +403,7 @@ class FreeBBoxPipeline:
             corners_obj = get_bbox_corners(obj.bbox3d_canonical)
             orig_world = transform_points(corners_obj, obj.pose_world)
             orig_aabb = np.concatenate([orig_world.min(axis=0), orig_world.max(axis=0)])
+            search_bbox, search_pose = _yaw_only_search_geometry(obj)
 
             target_voxels = voxelize_obb(
                 obj.bbox3d_canonical,
@@ -387,24 +478,26 @@ class FreeBBoxPipeline:
 
             candidates, meta, yaw_data = find_table_placements(
                 grid_base,
-                obj.bbox3d_canonical,
-                obj.pose_world,
+                search_bbox,
+                search_pose,
                 vp,
                 table_z,
                 completed_support_mask,
                 center_mask_2d=active_center_mask,
                 safety_margin=cfg.safety_margin,
                 yaw_steps=cfg.yaw_steps,
-                preserve_orientation=cfg.preserve_orientation,
+                preserve_orientation=False,
             )
             n_raw = int(meta["valid_raw"])
             landing_z = int(meta["landing_z"])
 
-            candidates = filter_stable_placements(
+            candidates = _filter_connected_support_candidates(
                 candidates,
+                search_bbox,
                 yaw_data,
-                completed_support_mask,
-                min_support_ratio=cfg.min_support_ratio,
+                landing_z,
+                vp,
+                occupied_keys,
                 chunk_size=cfg.stability_chunk_size,
             )
             n_stable = len(candidates)
@@ -412,8 +505,8 @@ class FreeBBoxPipeline:
             candidates = filter_visible_placements(
                 candidates,
                 landing_z,
-                obj.bbox3d_canonical,
-                obj.pose_world,
+                search_bbox,
+                search_pose,
                 E_w2c,
                 K,
                 camera.img_w,
@@ -426,8 +519,8 @@ class FreeBBoxPipeline:
             candidates = filter_occluded_placements(
                 candidates,
                 landing_z,
-                obj.bbox3d_canonical,
-                obj.pose_world,
+                search_bbox,
+                search_pose,
                 depth_buffer,
                 K,
                 E_w2c,
@@ -456,6 +549,7 @@ class FreeBBoxPipeline:
             placements = _build_saved_placements(
                 scene_prefix,
                 obj,
+                search_bbox,
                 reps,
                 cluster_infos,
                 landing_z,
@@ -500,6 +594,7 @@ class FreeBBoxPipeline:
                     scene_prefix,
                     scene,
                     obj,
+                    search_bbox,
                     placements,
                     cluster_records,
                     yaw_data,
@@ -528,6 +623,9 @@ class FreeBBoxPipeline:
                     "support_mask_ply": _relative_output_path(output_root, support_mask_path),
                     "support_alignment": {
                         "method": "active_center_on_completed_support",
+                        "stability_method": "full_cloud_3x3_closing_fill_holes_8_connected",
+                        "stability_z_band_cm": [-3.0, 1.0],
+                        "source_object_voxels_excluded": False,
                         "voxel_origin": np.asarray(grid_min, dtype=np.float64).tolist(),
                         "voxel_size_cm": float(voxel_size),
                         "completed_support_voxels": int(frame_completed_support_mask.sum()),
@@ -546,6 +644,7 @@ class FreeBBoxPipeline:
         scene_prefix: str,
         scene,
         obj,
+        bbox3d: np.ndarray,
         placements: list[dict],
         cluster_records: list[dict],
         yaw_data: dict,
@@ -580,7 +679,7 @@ class FreeBBoxPipeline:
             vis_path = output_paths["visualizations"] / vis_name
 
             heat_counts = build_heat_counts(record["member_bottom_centers"], grid_scene.shape)
-            yaw_targets = _build_center_yaw_set(obj, record, yaw_data, vp)
+            yaw_targets = _build_center_yaw_set(bbox3d, record, yaw_data, vp)
             _validate_active_aligned_supervision(
                 active_support_3d,
                 heat_counts,

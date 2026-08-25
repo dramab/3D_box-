@@ -107,61 +107,6 @@ def filter_visible_placements(
     return candidates[keep]
 
 
-def filter_stable_placements(
-    candidates: np.ndarray,
-    yaw_data: dict,
-    table_mask_2d: np.ndarray,
-    min_support_ratio: float = 1.0,
-    chunk_size: int = 2000,
-) -> np.ndarray:
-    """保留 XY 投影足迹被支撑面充分支撑且质心投影在支撑区域上的候选。"""
-    if len(candidates) == 0:
-        return candidates
-
-    grid_x, grid_y = table_mask_2d.shape
-    keep = np.zeros(len(candidates), dtype=bool)
-    for yaw_idx, _ in enumerate(yaw_data["yaw_angles"]):
-        mask = candidates[:, 2] == yaw_idx
-        if not np.any(mask):
-            continue
-        batch = candidates[mask]
-        footprint = yaw_data["footprints"][yaw_idx]
-        if len(footprint) == 0:
-            continue
-
-        n_foot = len(footprint)
-        batch_keep = np.zeros(len(batch), dtype=bool)
-        for start in range(0, len(batch), int(chunk_size)):
-            end = min(start + int(chunk_size), len(batch))
-            sub = batch[start:end]
-            fi = sub[:, 0:1] + footprint[:, 0:1].T
-            fj = sub[:, 1:2] + footprint[:, 1:2].T
-            in_bounds = (fi >= 0) & (fi < grid_x) & (fj >= 0) & (fj < grid_y)
-            fi_c = np.clip(fi, 0, grid_x - 1)
-            fj_c = np.clip(fj, 0, grid_y - 1)
-            on_table = table_mask_2d[fi_c, fj_c] & in_bounds
-            ratio = on_table.sum(axis=1) / max(n_foot, 1)
-
-            com_i = sub[:, 0] + footprint[:, 0].mean()
-            com_j = sub[:, 1] + footprint[:, 1].mean()
-            com_i_int = np.round(com_i).astype(int)
-            com_j_int = np.round(com_j).astype(int)
-            com_in = (
-                (com_i_int >= 0)
-                & (com_i_int < grid_x)
-                & (com_j_int >= 0)
-                & (com_j_int < grid_y)
-            )
-            com_ok = com_in & table_mask_2d[
-                np.clip(com_i_int, 0, grid_x - 1),
-                np.clip(com_j_int, 0, grid_y - 1),
-            ]
-            batch_keep[start:end] = (ratio >= float(min_support_ratio)) & com_ok
-
-        keep[mask] = batch_keep
-    return candidates[keep]
-
-
 def compute_bottom_center_voxels(
     candidates: np.ndarray,
     yaw_data: dict,

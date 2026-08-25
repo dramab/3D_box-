@@ -126,7 +126,7 @@ L_source = 4 L_source-center + 2 L_source-size + 0.2 L_source-IoU
 
 前三层辅助监督的内部比例与匹配一致，采用 `2 L_cls + 8 L_center + L_yaw + L_corner`。
 
-Stage 1 不冻结，使用 0.1× 学习率并持续接受 Source Box 监督。Stage 2 使用监控 validation `task_success_rate` 的 `ReduceLROnPlateau(mode=max, factor=0.5, patience=3, threshold=0.001, threshold_mode=abs)`。恢复训练先加载模型、AdamW moments 和 scheduler 历史，再由当前配置学习率覆盖两个参数组并保持 `0.1:1`。CLIP 是否冻结由原配置决定。
+Stage 1 不冻结，使用 0.1× 学习率并持续接受 Source Box 监督。Stage 2 使用监控 validation `placement_success_at_1` 的 `ReduceLROnPlateau(mode=max, factor=0.5, patience=3, threshold=0.001, threshold_mode=abs)`。恢复训练先加载模型、AdamW moments 和 scheduler 历史，再由当前配置学习率覆盖两个参数组并保持 `0.1:1`。CLIP 是否冻结由原配置决定。
 
 ## 8. 输出
 
@@ -145,4 +145,4 @@ place_box         [B,7]
 source_box        [B,6]
 ```
 
-所有有效输出的 `(dx,dy,dz)` 严格等于当前 Stage 1 Source Size。`place_box` 是 `place_boxes[:,0]` 的兼容字段。最佳 checkpoint 只按 top-1 `task_success_rate` 选择；`task_success_top5` 用于统计前 5 个候选的任务成功覆盖率。
+所有有效输出的 `(dx,dy,dz)` 严格等于当前 Stage 1 Source Size。`place_box` 是 `place_boxes[:,0]` 的兼容字段。最佳 checkpoint 只按 `Placement Success@1` 选择；`Placement Success@5` 用于统计前 5 个候选中是否存在同时通过 Placement Size IoU、语言关系、连通支撑和碰撞四项条件的候选。Source 3D IoU 独立报告；Yaw 只在中心 2 cm 匹配成功的样本中计算条件准确率。

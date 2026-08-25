@@ -596,7 +596,7 @@ def select_suitable_cases(
     metrics_rows: list[dict[str, Any]],
     sources: dict[str, dict[str, Path]],
 ) -> list[dict[str, Any]]:
-    """Select task-successful predictions where RoboBrain hits another scene object."""
+    """Select placement-successful predictions where RoboBrain hits another scene object."""
     robobrain_by_key = {stable_item_key(str(row["item_id"])): row for row in robobrain_rows}
     metrics_by_id = {str(row["item_id"]): row for row in metrics_rows}
     if len(robobrain_by_key) != len(robobrain_rows):
@@ -615,7 +615,7 @@ def select_suitable_cases(
             raise KeyError(f"Missing aligned result or benchmark metrics for {item_id}")
         if robobrain.get("status") != "ok" or robobrain.get("render_box_world") is None:
             continue
-        if not bool(metrics.get("task_success")):
+        if not bool(metrics.get("placement_success_at_1")):
             continue
 
         scene_key = (str(ours["source_name"]), str(ours["sample_id"]))
@@ -668,7 +668,7 @@ def write_manifest(path: Path, cases: list[dict[str, Any]]) -> None:
                 "reference_object_id": metrics["reference_object_id"],
                 "reference_name": metrics["reference_name"],
                 "robobrain_collision_object_ids": case["collision_object_ids"],
-                "ours_task_success": True,
+                "ours_placement_success_at_1": True,
                 "output_dir": os.fspath(path.parent / case["stable_item_key"]),
             }
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -693,7 +693,7 @@ def main() -> None:
             if requested in {str(case["stable_item_key"]), str(case["ours"]["item_id"]), str(case["robobrain"]["item_id"])}
         ]
         if not cases:
-            raise KeyError(f"Item {requested!r} is not in the strictly selected comparison set")
+            raise KeyError(f"Item {requested!r} is not in the selected placement-success comparison set")
 
     write_manifest(output_dir / "selection_manifest.jsonl", cases)
     rendered = skipped = 0

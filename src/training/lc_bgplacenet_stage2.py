@@ -31,13 +31,20 @@ from src.annotation.auto_label import describe_spatial_relation
 from src.annotation.free_bbox.geometry import get_bbox_corners, transform_points
 from src.annotation.free_bbox.io_utils import load_ply
 from src.datasets.canonical import CameraParams, load_sample_record
-from src.models.lc_bgplacenet.stage1 import aabb_iou_3d
 from src.models.lc_bgplacenet.stage2 import (
     NUM_QUERIES,
     NUM_YAW_BINS,
     SPACEFormerStage2,
     aggregate_sparse_mask,
     yaw_bin_angles,
+)
+from src.placement_metrics import (
+    compute_aabb_iou_3d,
+    compute_size_iou as _compute_size_iou,
+    compute_supported_and_stable,
+    compute_yaw_valid_at_matched_center,
+    placement_success,
+    quantize_occupied_points,
 )
 from src.training.lc_bgplacenet_stage1 import (
     STAGE1_SPLIT_NAME_SET,
@@ -228,11 +235,7 @@ def _place_box_from_placement(placement: dict[str, Any]) -> np.ndarray:
 
 def compute_size_iou(pred_dims: np.ndarray, gt_dims: np.ndarray) -> float:
     """Compute dimension-only volume IoU while preserving dimension order."""
-    pred = np.maximum(np.asarray(pred_dims, dtype=np.float64), 0.0)
-    gt = np.maximum(np.asarray(gt_dims, dtype=np.float64), 0.0)
-    intersection = float(np.prod(np.minimum(pred, gt)))
-    union = float(np.prod(np.maximum(pred, gt)))
-    return intersection / union if union > 0.0 else 0.0
+    return _compute_size_iou(pred_dims, gt_dims)
 
 
 def compute_size_metrics(
@@ -243,26 +246,6 @@ def compute_size_metrics(
     """Compute dimension IoU and its thresholded correctness flag."""
     size_iou = compute_size_iou(place_box[3:6], place_box_gt[3:6])
     return {"size_iou": size_iou, "size_correct": bool(size_iou >= float(threshold))}
-
-
-def compute_yaw_metrics(
-    place_box: np.ndarray,
-    place_box_gt: np.ndarray,
-    yaw_sensitive_ratio: float,
-) -> dict[str, Any]:
-    """Compute 180-degree-equivalent yaw error for direction-sensitive boxes."""
-    gt_dx, gt_dy = float(place_box_gt[3]), float(place_box_gt[4])
-    size_ratio = abs(gt_dx - gt_dy) / max(min(gt_dx, gt_dy), 1e-6)
-    yaw_sensitive = size_ratio >= float(yaw_sensitive_ratio)
-    if not yaw_sensitive:
-        return {"yaw_sensitive": False, "yaw_error_deg": None}
-    yaw_delta = (float(place_box[6] - place_box_gt[6]) + math.pi * 0.5) % math.pi - math.pi * 0.5
-    return {"yaw_sensitive": True, "yaw_error_deg": abs(math.degrees(yaw_delta))}
-
-
-def compute_task_success(direction_hit: bool, collision: bool, size_correct: bool) -> bool:
-    """Return the shared val/benchmark task-success decision."""
-    return bool(direction_hit and not collision and size_correct)
 
 
 def _place_box_to_bbox_and_transform(place_box: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1111,8 +1094,7 @@ def compute_stage2_task_metric_sums(
     batch: dict[str, Any],
     cfg: dict[str, Any],
 ) -> dict[str, float]:
-    """Compute top-1 inference and top-5 candidate task metrics."""
-    place_pred = outputs["place_box"].detach().cpu().numpy()
+    """Compute four-condition Placement Success and separate source/yaw metrics."""
     place_gt = batch["place_box_gt"].detach().cpu().numpy()
     place_sets = outputs["place_boxes"].detach().cpu().numpy()
     place_set_masks = outputs["place_valid_mask"].detach().cpu().numpy()
@@ -1120,30 +1102,44 @@ def compute_stage2_task_metric_sums(
     gt_centers = batch["gt_bottom_centers"].detach().cpu().numpy()
     gt_yaw_masks = batch["gt_yaw_masks"].detach().cpu().numpy()
     gt_valid_masks = batch["gt_valid_mask"].detach().cpu().numpy()
+    world_coords = batch["world_coords"].detach().cpu().numpy()
+    point_batch_indices = batch["batch_indices"].detach().cpu().numpy()
     contexts = batch["validation_contexts"]
-    size_iou_threshold = float(cfg.get("validation", {}).get("size_iou_threshold", 0.8))
+    validation_cfg = cfg.get("validation", {})
+    source_iou_threshold = float(validation_cfg.get("source_iou_threshold", 0.5))
+    size_iou_threshold = float(validation_cfg.get("size_iou_threshold", 0.8))
+    center_match_threshold_cm = float(validation_cfg.get("center_match_threshold_cm", 2.0))
+    support_downward_cm = float(validation_cfg.get("support_downward_cm", 3.0))
+    support_upper_cm = float(validation_cfg.get("support_upper_cm", 1.0))
+    voxel_size_cm = float(cfg["data"]["voxel_size_cm"])
 
-    direction_hits = []
-    collision_free = []
-    size_ious = []
-    task_success = []
-    task_success_top5 = []
-    yaw_bin_valid = []
-    valid_pose_count = 0
+    source_pred = outputs["source_box"].detach().cpu().numpy()
+    source_gt = batch["source_box_gt"].detach().cpu().numpy()
+    source_ious = [compute_aabb_iou_3d(pred, gt) for pred, gt in zip(source_pred, source_gt)]
+    source_correct = [value >= source_iou_threshold for value in source_ious]
+    source_center_mae = np.abs(source_pred[:, :3] - source_gt[:, :3]).mean(axis=1)
+    source_size_iou = [compute_size_iou(pred[3:6], gt[3:6]) for pred, gt in zip(source_pred, source_gt)]
+
+    top1_size_ious = []
+    top1_size_correct = []
+    top1_direction = []
+    top1_supported = []
+    top1_collision_free = []
+    top1_center_matched = []
+    top1_yaw_valid = []
+    placement_at_1 = []
+    placement_at_5 = []
+    successful_pose_count = 0
     emitted_pose_count = 0
     duplicate_pairs = 0
     possible_pairs = 0
-    for sample_index, (pred, gt, context) in enumerate(zip(place_pred, place_gt, contexts)):
-        size_metrics = compute_size_metrics(pred, gt, size_iou_threshold)
-        direction_hit = compute_direction_hit(pred, context)
-        collision = compute_collision_metrics(pred, context.collision_context)["collision"]
-        direction_hits.append(direction_hit)
-        collision_free.append(not collision)
-        size_ious.append(size_metrics["size_iou"])
-        task_success.append(compute_task_success(direction_hit, collision, size_metrics["size_correct"]))
-
-        candidate_task_results = []
-        center_yaw_results = []
+    for sample_index, (gt, context) in enumerate(zip(place_gt, contexts)):
+        occupied_keys = quantize_occupied_points(
+            world_coords[point_batch_indices == sample_index], voxel_size_cm
+        )
+        support_cache = {}
+        candidate_results = []
+        candidate_components = []
         emitted = np.flatnonzero(place_set_masks[sample_index])
         emitted_pose_count += len(emitted)
         valid_gt = gt_valid_masks[sample_index]
@@ -1151,26 +1147,65 @@ def compute_stage2_task_metric_sums(
         target_yaw = gt_yaw_masks[sample_index, valid_gt]
         for output_index in emitted:
             box = place_sets[sample_index, output_index]
-            bottom = box[:3].copy()
-            bottom[2] -= box[5] * 0.5
-            if len(target_centers) == 0:
-                center_yaw_valid = False
-            else:
-                distance = np.linalg.norm(target_centers - bottom[None, :], axis=1)
-                nearest = int(np.argmin(distance))
-                center_yaw_valid = bool(
-                    distance[nearest] <= 2.0
-                    and target_yaw[nearest, int(place_yaw_bins[sample_index, output_index])]
-                )
-            box_size_ok = compute_size_metrics(box, gt, size_iou_threshold)["size_correct"]
-            box_direction_ok = compute_direction_hit(box, context)
-            box_collision = compute_collision_metrics(box, context.collision_context)["collision"]
-            candidate_success = compute_task_success(box_direction_ok, box_collision, box_size_ok)
-            center_yaw_results.append(center_yaw_valid)
-            candidate_task_results.append(candidate_success)
-            valid_pose_count += int(candidate_success)
-        task_success_top5.append(any(candidate_task_results[:5]))
-        yaw_bin_valid.append(bool(center_yaw_results[0]) if center_yaw_results else False)
+            size_metrics = compute_size_metrics(box, gt, size_iou_threshold)
+            direction_correct = compute_direction_hit(box, context)
+            supported, _ = compute_supported_and_stable(
+                box,
+                occupied_keys,
+                voxel_size_cm,
+                downward_cm=support_downward_cm,
+                upper_cm=support_upper_cm,
+                cache=support_cache,
+            )
+            collision_free = not compute_collision_metrics(box, context.collision_context)["collision"]
+            yaw_valid, center_distance, _ = compute_yaw_valid_at_matched_center(
+                box,
+                int(place_yaw_bins[sample_index, output_index]),
+                target_centers,
+                target_yaw,
+                center_match_threshold_cm,
+            )
+            center_matched = bool(
+                center_distance is not None and center_distance <= center_match_threshold_cm
+            )
+            components = (
+                size_metrics["size_iou"],
+                size_metrics["size_correct"],
+                direction_correct,
+                supported,
+                collision_free,
+                center_matched,
+                yaw_valid,
+            )
+            candidate_components.append(components)
+            candidate_success = placement_success(
+                size_metrics["size_correct"],
+                direction_correct,
+                supported,
+                collision_free,
+            )
+            candidate_results.append(candidate_success)
+            successful_pose_count += int(candidate_success)
+
+        if candidate_components:
+            first = candidate_components[0]
+            top1_size_ious.append(first[0])
+            top1_size_correct.append(first[1])
+            top1_direction.append(first[2])
+            top1_supported.append(first[3])
+            top1_collision_free.append(first[4])
+            top1_center_matched.append(first[5])
+            top1_yaw_valid.append(first[6])
+        else:
+            top1_size_ious.append(0.0)
+            top1_size_correct.append(False)
+            top1_direction.append(False)
+            top1_supported.append(False)
+            top1_collision_free.append(False)
+            top1_center_matched.append(False)
+            top1_yaw_valid.append(False)
+        placement_at_1.append(any(candidate_results[:1]))
+        placement_at_5.append(any(candidate_results[:5]))
 
         for left in range(len(emitted)):
             for right in range(left + 1, len(emitted)):
@@ -1182,29 +1217,25 @@ def compute_stage2_task_metric_sums(
                 yaw_delta = min(yaw_delta, NUM_YAW_BINS - yaw_delta)
                 duplicate_pairs += int(distance < 0.25 and yaw_delta <= 1)
 
-    source_pred = outputs["source_box"].detach().cpu().numpy()
-    source_gt = batch["source_box_gt"].detach().cpu().numpy()
-    source_center_mae = np.abs(source_pred[:, :3] - source_gt[:, :3]).mean(axis=1)
-    source_size_iou = [compute_size_iou(pred[3:6], gt[3:6]) for pred, gt in zip(source_pred, source_gt)]
-    source_box_iou = aabb_iou_3d(
-        outputs["source_box"].detach(), batch["source_box_gt"]
-    ).sum()
-
     return {
-        "sample_count": float(len(place_pred)),
-        "direction_hit_sum": float(sum(direction_hits)),
-        "collision_free_sum": float(sum(collision_free)),
-        "size_iou_sum": float(sum(size_ious)),
-        "task_success_sum": float(sum(task_success)),
-        "task_success_top5_sum": float(sum(task_success_top5)),
-        "yaw_bin_valid_at_1_sum": float(sum(yaw_bin_valid)),
-        "valid_pose_count": float(valid_pose_count),
+        "sample_count": float(len(place_gt)),
+        "source_iou_sum": float(sum(source_ious)),
+        "source_iou_correct_sum": float(sum(source_correct)),
+        "placement_size_iou_sum": float(sum(top1_size_ious)),
+        "placement_size_correct_sum": float(sum(top1_size_correct)),
+        "language_relation_correct_sum": float(sum(top1_direction)),
+        "supported_and_stable_sum": float(sum(top1_supported)),
+        "collision_free_sum": float(sum(top1_collision_free)),
+        "center_match_sum": float(sum(top1_center_matched)),
+        "yaw_valid_on_matched_center_sum": float(sum(top1_yaw_valid)),
+        "placement_success_at_1_sum": float(sum(placement_at_1)),
+        "placement_success_at_5_sum": float(sum(placement_at_5)),
+        "successful_pose_count": float(successful_pose_count),
         "emitted_pose_count": float(emitted_pose_count),
         "duplicate_pair_count": float(duplicate_pairs),
         "possible_pair_count": float(possible_pairs),
         "source_center_mae_sum": float(np.sum(source_center_mae)),
         "source_size_iou_sum": float(np.sum(source_size_iou)),
-        "source_box_iou_sum": float(source_box_iou.cpu()),
     }
 
 
@@ -1253,7 +1284,7 @@ def _build_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     cfg: dict[str, Any],
 ) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
-    """Build the task-success plateau scheduler from training config."""
+    """Build the placement-success plateau scheduler from training config."""
     scheduler_cfg = cfg["training"].get("lr_scheduler", {})
     scheduler_type = str(scheduler_cfg.get("type", "reduce_on_plateau")).lower()
     if scheduler_type != "reduce_on_plateau":
@@ -1301,12 +1332,14 @@ def _format_stage2_log(payload: dict[str, Any]) -> str:
         ),
         "valid": (
             ("loss", "loss"),
-            ("task_success_rate", "task@1"),
-            ("task_success_top5", "task@5"),
-            ("valid_pose_rate", "valid_pose"),
-            ("direction_hit_rate", "direction"),
+            ("placement_success_at_1", "placement@1"),
+            ("placement_success_at_5", "placement@5"),
+            ("language_relation_correct_rate", "relation"),
+            ("supported_and_stable_rate", "support"),
             ("collision_free_rate", "collision_free"),
-            ("size_iou", "size_iou"),
+            ("placement_size_iou", "size_iou"),
+            ("center_match_rate", "center_match"),
+            ("yaw_valid_given_center_match", "yaw|match"),
             ("p3_gt_point_coverage", "p3_gt_cov"),
             ("lr_stage1", "lr_s1"),
             ("lr_stage2", "lr_s2"),
@@ -1410,7 +1443,7 @@ def train_stage2(
         train_loader = _make_loader(train_set, cfg, shuffle=True, sampler=train_sampler)
         val_loader = _make_loader(val_set, cfg, shuffle=False, sampler=val_sampler)
         metrics_path = output_dir / "metrics.jsonl"
-        best_task_success_rate = -math.inf
+        best_placement_success_at_1 = -math.inf
         global_step = 0
         start_epoch = 0
         show_progress = _is_main_process(rank) and bool(cfg["training"].get("progress_bar", True))
@@ -1422,19 +1455,22 @@ def train_stage2(
             optimizer.load_state_dict(checkpoint["optimizer"])
             start_epoch = int(checkpoint["epoch"]) + 1
             global_step = int(checkpoint["step"])
-            best_task_success_rate = float(checkpoint.get("best_task_success_rate", -math.inf))
-            if "scheduler" in checkpoint:
+            has_placement_metric = "best_placement_success_at_1" in checkpoint
+            best_placement_success_at_1 = float(
+                checkpoint.get("best_placement_success_at_1", -math.inf)
+            )
+            if has_placement_metric and "scheduler" in checkpoint:
                 scheduler.load_state_dict(checkpoint["scheduler"])
-            elif math.isfinite(best_task_success_rate):
-                # Existing checkpoints predate the scheduler; seed its plateau baseline.
-                scheduler.step(best_task_success_rate)
+            elif math.isfinite(best_placement_success_at_1):
+                # Placement-metric checkpoints predating scheduler state still seed its baseline.
+                scheduler.step(best_placement_success_at_1)
             _override_optimizer_learning_rates(optimizer, base_lr)
             scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
             if _is_main_process(rank):
                 resumed_lrs = _optimizer_learning_rates(optimizer)
                 print(
                     f"Resumed Stage 2 from {resume_path} at epoch={start_epoch}, "
-                    f"step={global_step}, best_task_success_rate={best_task_success_rate:.6f}, "
+                    f"step={global_step}, best_placement_success_at_1={best_placement_success_at_1:.6f}, "
                     f"lr_stage1={resumed_lrs['lr_stage1']:.2e}, lr_stage2={resumed_lrs['lr_stage2']:.2e}"
                 )
 
@@ -1497,10 +1533,10 @@ def train_stage2(
                 distributed=distributed,
             )
             epoch_lrs = _optimizer_learning_rates(optimizer)
-            current_success_rate = val_metrics.get("task_success_rate", -math.inf)
-            is_best = current_success_rate > best_task_success_rate
+            current_success_rate = val_metrics.get("placement_success_at_1", -math.inf)
+            is_best = current_success_rate > best_placement_success_at_1
             if is_best:
-                best_task_success_rate = current_success_rate
+                best_placement_success_at_1 = current_success_rate
             scheduler.step(current_success_rate)
             if _is_main_process(rank):
                 val_payload = {
@@ -1519,7 +1555,7 @@ def train_stage2(
                     "scheduler": scheduler.state_dict(),
                     "epoch": epoch,
                     "step": global_step,
-                    "best_task_success_rate": best_task_success_rate,
+                    "best_placement_success_at_1": best_placement_success_at_1,
                     **_optimizer_learning_rates(optimizer),
                     "config": cfg,
                 }
@@ -1551,19 +1587,23 @@ def evaluate_stage2(
     totals = {
         "loss_sum": 0.0,
         "sample_count": 0.0,
-        "direction_hit_sum": 0.0,
+        "source_iou_sum": 0.0,
+        "source_iou_correct_sum": 0.0,
+        "placement_size_iou_sum": 0.0,
+        "placement_size_correct_sum": 0.0,
+        "language_relation_correct_sum": 0.0,
+        "supported_and_stable_sum": 0.0,
         "collision_free_sum": 0.0,
-        "size_iou_sum": 0.0,
-        "task_success_sum": 0.0,
-        "task_success_top5_sum": 0.0,
-        "yaw_bin_valid_at_1_sum": 0.0,
-        "valid_pose_count": 0.0,
+        "center_match_sum": 0.0,
+        "yaw_valid_on_matched_center_sum": 0.0,
+        "placement_success_at_1_sum": 0.0,
+        "placement_success_at_5_sum": 0.0,
+        "successful_pose_count": 0.0,
         "emitted_pose_count": 0.0,
         "duplicate_pair_count": 0.0,
         "possible_pair_count": 0.0,
         "source_center_mae_sum": 0.0,
         "source_size_iou_sum": 0.0,
-        "source_box_iou_sum": 0.0,
         "p3_gt_point_coverage_sum": 0.0,
     }
     validation_log_sums: dict[str, float] = {}
@@ -1611,19 +1651,24 @@ def evaluate_stage2(
     sample_count = max(totals["sample_count"], 1.0)
     emitted_pose_count = max(totals["emitted_pose_count"], 1.0)
     possible_pair_count = max(totals["possible_pair_count"], 1.0)
+    matched_center_count = max(totals["center_match_sum"], 1.0)
     metrics = {
         "loss": totals["loss_sum"] / sample_count,
-        "direction_hit_rate": totals["direction_hit_sum"] / sample_count,
+        "source_iou": totals["source_iou_sum"] / sample_count,
+        "source_iou_accuracy": totals["source_iou_correct_sum"] / sample_count,
+        "placement_size_iou": totals["placement_size_iou_sum"] / sample_count,
+        "placement_size_accuracy": totals["placement_size_correct_sum"] / sample_count,
+        "language_relation_correct_rate": totals["language_relation_correct_sum"] / sample_count,
+        "supported_and_stable_rate": totals["supported_and_stable_sum"] / sample_count,
         "collision_free_rate": totals["collision_free_sum"] / sample_count,
-        "size_iou": totals["size_iou_sum"] / sample_count,
-        "task_success_rate": totals["task_success_sum"] / sample_count,
-        "task_success_top5": totals["task_success_top5_sum"] / sample_count,
-        "yaw_bin_valid_at_1": totals["yaw_bin_valid_at_1_sum"] / sample_count,
-        "valid_pose_rate": totals["valid_pose_count"] / emitted_pose_count,
+        "center_match_rate": totals["center_match_sum"] / sample_count,
+        "yaw_valid_given_center_match": totals["yaw_valid_on_matched_center_sum"] / matched_center_count,
+        "placement_success_at_1": totals["placement_success_at_1_sum"] / sample_count,
+        "placement_success_at_5": totals["placement_success_at_5_sum"] / sample_count,
+        "successful_pose_rate": totals["successful_pose_count"] / emitted_pose_count,
         "duplicate_pair_rate": totals["duplicate_pair_count"] / possible_pair_count,
         "source_center_mae": totals["source_center_mae_sum"] / sample_count,
         "source_size_iou": totals["source_size_iou_sum"] / sample_count,
-        "source_box_iou": totals["source_box_iou_sum"] / sample_count,
         "p3_gt_point_coverage": totals["p3_gt_point_coverage_sum"] / sample_count,
     }
     sampling_metrics = dict(validation_log_sums)

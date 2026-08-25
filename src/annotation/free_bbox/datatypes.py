@@ -25,14 +25,12 @@ class FreeBBoxConfig:
     safety_margin: float = 0.5
     yaw_steps: int = 24
     min_surface_area: float = 50.0
-    min_support_ratio: float = 1.0
     occlusion_threshold: float = 0.3
     dbscan_eps: Optional[float] = None
     dbscan_min_samples: int = 1
     max_reps_total: Optional[int] = None
     stability_chunk_size: int = 2000
     metric_chunk_size: int = 512
-    preserve_orientation: bool = True
 
 
 @dataclass

@@ -57,7 +57,11 @@ L_source = 4 L_source-center + 2 L_source-size + 0.2 L_source-IoU
 
 Hungarian 在全部方向合法中心和与有效 Query 等量的背景虚拟目标之间执行一对一匹配。真实中心代价为 GT Source Size 归一化后的底面中心 L1 距离，背景代价由 `loss.background_match_cost` 定义，当前为 `0.25`。匹配真实中心的 Query 接受分类、中心、Yaw 和角点监督；匹配背景的 Query 仅接受 placement score 为 0 的分类监督。前三层辅助监督复用最终层匹配并采用 `2:8:1:1` 内部比例，由总损失中的 `0.1 L_aux` 统一缩放。Yaw 使用 12 维 multi-hot `BCEWithLogits`，角点项在 GT 的全部有效 yaw 中取最小值。
 
-Stage 1 参数组使用 `training.lr × 0.1`，SPACE-Former 使用完整 `training.lr`。`ReduceLROnPlateau(mode=max)` 监控 validation `task_success_rate`，绝对提升不足 `0.001` 连续停滞超过 3 个 epoch 后将两个参数组学习率同时乘以 `0.5`。最佳 checkpoint 仅按 validation 的 top-1 `task_success_rate` 保存，不设置 Source IoU 门槛。该指标与推理最终采用的位姿一致，成功条件为尺寸 IoU ≥ 0.8、满足文本空间方向关系且与场景已有物体无碰撞。
+Stage 1 参数组使用 `training.lr × 0.1`，SPACE-Former 使用完整 `training.lr`。`ReduceLROnPlateau(mode=max)` 监控 validation `placement_success_at_1`，绝对提升不足 `0.001` 连续停滞超过 3 个 epoch 后将两个参数组学习率同时乘以 `0.5`。最佳 checkpoint 仅按 validation 的 `Placement Success@1` 保存。
+
+同一个候选必须同时满足以下四项才计为 Placement Success：预测与 GT 长宽高的 dimensions-only IoU ≥ 0.8；语言空间关系正确；Supported and Stable；Collision-Free。Supported and Stable 使用完整场景点云（保留 source 原位置体素），取预测框底面下方 3 cm 至上方 1 cm 的体素，投影至 XY 后依次执行 `3×3 binary closing`、封闭孔洞填充和 8 邻域连通域标记；预测底面 footprint 必须 100% 落在覆盖其底面中心的同一个连通域中。
+
+Source 完整 3D AABB IoU 及其 0.5 阈值准确率单独报告，不参与 Placement Success。Yaw 同样独立报告：`center_match_rate` 表示预测底面中心在 2 cm 内匹配到 GT 中心的比例；`yaw_valid_given_center_match` 只以中心匹配成功样本为分母，统计预测 yaw 是否属于该中心合法 yaw 集合。
 
 训练保持 FP32。P1/P2/P3 的 sparse lookup 排序索引在一次 forward 内由四层 Decoder 复用；训练不执行 pose NMS，采样诊断仅在日志 step 计算；每个 batch 的 Hungarian 代价只进行一次 GPU→CPU 传输，仍使用 SciPy 精确匹配。日志通过 `matched_query_count` 和 `background_query_count` 记录真实/背景分配数量，便于检查背景代价是否合适。进度条最多每 20 step 同步一次 loss。
 
@@ -95,7 +99,7 @@ python tools/train_lc_bgplacenet_stage2.py \
   --resume outputs/lc_bgplacenet_stage2_space_former_aligned/last.pt
 ```
 
-`training.epochs` 表示总 epoch 上限，而非恢复后追加的 epoch 数。checkpoint 中的模型、AdamW moments 和 scheduler 历史会恢复；旧 checkpoint 没有 scheduler state 时，以 `best_task_success_rate` 初始化平台基线。随后始终由当前配置的 `training.lr` 覆盖 checkpoint 学习率，并保持 Stage 1/Stage 2 为 `0.1:1`。例如恢复已完成 epoch 54 的 checkpoint，若要继续训练，必须将 `training.epochs` 设置为大于 55。
+`training.epochs` 表示总 epoch 上限，而非恢复后追加的 epoch 数。checkpoint 中的模型与 AdamW moments 会恢复；只有包含 `best_placement_success_at_1` 的新 checkpoint 才恢复 scheduler 历史。旧成功定义下的 checkpoint 会重置最佳值和 scheduler 平台状态，避免不可比较的指标互相污染。随后始终由当前配置的 `training.lr` 覆盖 checkpoint 学习率，并保持 Stage 1/Stage 2 为 `0.1:1`。例如恢复已完成 epoch 54 的 checkpoint，若要继续训练，必须将 `training.epochs` 设置为大于 55。
 
 ## 日志与验证
 
@@ -103,9 +107,11 @@ python tools/train_lc_bgplacenet_stage2.py \
 
 主要验证指标包括：
 
-- `task_success_rate`、`task_success_top5`，分别统计 top-1 和前 5 个候选中的任务成功率。
-- `valid_pose_rate`、`duplicate_pair_rate`。
-- `direction_hit_rate`、`collision_free_rate`、`size_iou`。
+- `placement_success_at_1`、`placement_success_at_5`，分别统计 top-1 和前 5 个候选中是否存在同时满足四项放置条件的候选。
+- `successful_pose_rate`、`duplicate_pair_rate`。
+- `placement_size_accuracy`、`language_relation_correct_rate`、`supported_and_stable_rate`、`collision_free_rate`。
+- 独立 Source 指标：`source_iou`、`source_iou_accuracy`。
+- 独立中心/Yaw 指标：`center_match_rate`、`yaw_valid_given_center_match`。
 - `p3_gt_point_coverage`：每条样本 direction-positive GT 点落入实际 top-8 P3 cell 的比例，再对验证样本宏平均。
 - `source_center_mae`、`source_size_iou`。
 

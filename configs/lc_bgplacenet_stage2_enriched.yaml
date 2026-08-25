@@ -80,10 +80,14 @@ loss:
     lambda_iou: 0.2
 
 validation:
+  source_iou_threshold: 0.5
   size_iou_threshold: 0.8
+  center_match_threshold_cm: 2.0
+  support_downward_cm: 3.0
+  support_upper_cm: 1.0
 
 training:
-  output_dir: outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8_enriched
+  output_dir: outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8_enriched_placement_success
   # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
   stage1_pretrained_checkpoint:
   device: auto
@@ -94,7 +98,7 @@ training:
   pin_memory: true
   progress_bar: true
   lr: 0.0001
-  # Stage 1 参数组自动使用主学习率的 0.1 倍；ReduceLROnPlateau 监控 validation task_success_rate。
+  # Stage 1 参数组自动使用主学习率的 0.1 倍；ReduceLROnPlateau 监控 placement_success_at_1。
   lr_scheduler:
     type: reduce_on_plateau
     mode: max

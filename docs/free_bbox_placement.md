@@ -10,15 +10,15 @@
 
 - 支撑面检测沿用旧 `free_bbox` 逻辑：优先在体素点云中 RANSAC 检测水平面，失败时回退到体素栅格逐层连通域。
 - free_bbox 栅格原点按 voxel size 对齐到 canonical active 点云使用的世界格线，禁止以任意浮点 `scene_min` 建立第二套错位网格。
-- 形态学补全后的 `completed support mask` 只用于 footprint 支撑率、稳定性和净空计算；与支撑层 active occupancy 相交得到的 `active center mask` 用于候选底面中心、heatmap 和 yaw 监督。
+- `active center mask` 用于限制候选底面中心、heatmap 和 yaw 监督；稳定性则与 benchmark 共用完整场景点云的连通面积判定，并保留 source 原位置体素。
 - 支撑面候选会扣除 `table_z±1` 范围内所有场景物体 OBB 的 XY 投影，避免把薄物体或其它实体表面误选为可放置平面。
 - OBB 体素化使用体素 AABB 与 OBB 的相交判断，边界接触也按占据处理，避免薄物体因没有覆盖体素中心而漏检。
 - 3D box 的候选底层放在支撑面本层，不再使用 `table_z + 1`。
 - 聚类仍使用 DBSCAN，但每个簇只输出一个最优 3D box。
 - 簇内最优选择顺序为：底面中心热力最大、支撑面积最大、距离簇中心最近、距离碰撞障碍最近距离最大。
 - 无碰撞候选生成后立即过滤：候选 3D box 的底面中心必须落在 `active center mask`；聚类阶段会再次执行相同校验。
-- 输出给模型监督和可视化的 `corners_world` / `transform_world` 统一为 yaw-only upright box：去掉 roll/pitch，并根据原 OBB 哪个局部轴最接近 world-Z 重排尺寸，使竖直尺寸落在输出 Z 轴。
-- 搜索阶段仍可通过默认配置保留原始 roll/pitch 来做碰撞、可见性和遮挡过滤；对应的原始 6DoF 放置框会保存在 `obb6d_*` 字段中，便于排查。
+- 搜索、稳定性、可见性、遮挡、yaw-set 和最终导出统一使用 yaw-only upright box：先根据原 OBB 中最接近 world-Z 的局部轴重排尺寸，再仅扫描 world-Z yaw，避免搜索 footprint 与监督框不一致。
+- 稳定性取最终 yaw-only 框底面下方 3 cm 至上方 1 cm 的完整场景体素，执行 `3×3 closing`、封闭孔洞填充和 8 邻域连通域标记，并要求 footprint 100% 位于覆盖底面中心的同一连通域。
 
 ## 输出文件
 
@@ -41,7 +41,7 @@ visualizations/
 
 - `*_support_mask.ply`: 每帧一份与模型输入 active voxel 对齐的二值 mask，白色表示允许作为候选底面中心的 active support；形态学补出的非 active 体素不写入模型监督 PLY。
 - `*_placements.json`: 每帧汇总标注。
-- `*__box.json`: 每个簇选出的最优 3D box 单独保存；`placement.corners_world` 为模型监督使用的 yaw-only upright box，`placement.obb6d_corners_world` 为搜索阶段原始 6DoF OBB。
+- `*__box.json`: 每个簇选出的最优 3D box 单独保存；搜索与 `placement.corners_world` 均使用 yaw-only upright box。历史 `obb6d_*` 字段保留用于兼容已有读取代码。
 - `*__heatmap.ply`: 与该最优 3D box 对应的簇级 active 体素热力点云；所有正热力中心都必须属于 `active center mask`，最优框底面中心位于该簇热力峰值。
 - `*__yaw_set.npz`: 与 heatmap 同簇的中心-yaw 监督。每个底面中心只保存一次，`valid_yaw_mask` 标记该中心通过碰撞、稳定性、可见性、遮挡和底面中心过滤的所有 yaw。新增目录不会修改现有 JSON schema 或字段。
 - `*__vis.png`: 每个最终 freebox 一张可视化图片，绿色框与模型监督一致，显示 yaw-only upright box。
@@ -56,7 +56,7 @@ with np.load(yaw_set_path) as target:
     heat_counts = target["heat_counts"]             # [P]
 ```
 
-`yaw_angles_rad` 已转换为最终 yaw-only upright Box 的局部 X 轴方向。它不一定等于保留原始 roll/pitch 搜索时使用的原始 yaw。
+`yaw_angles_rad` 就是搜索和最终 yaw-only upright Box 的局部 X 轴方向。
 
 > **Stage 2 读取注意事项：** `yaw_sets` 保存的是语言方向过滤前、通过 free_bbox 几何过滤的全部可放置中心；`direction_filtered_heatmaps` 中的正样本是这些中心经过语言方向过滤后的子集。因此，构建 Stage 2 监督时必须先用 `(red == 255) & (blue == 30)` 提取方向过滤后仍保留的正点，再按 `bottom_center_world` 与对应 `yaw_set.npz` 对齐，仅读取匹配行的 `valid_yaw_mask`。不能直接把 yaw set 中的全部中心作为当前指令的正样本。
 >
@@ -97,7 +97,7 @@ yaw = (placement["yaw_degrees"] + 90.0) % 360.0
 
 不要用 `aabb_world[3:] - aabb_world[:3]` 作为 OBB 的 `w,h,l`。`aabb_world` 是 world 轴对齐外接框尺寸，只适合做范围检查；当 yaw 不为 0 时，它会混入旋转后的外接包围尺寸，不等于模型监督的 box 局部尺寸。
 
-如果需要排查搜索阶段的真实 6DoF 放置姿态，可读取以下字段：
+如果需要排查搜索阶段的 yaw-only 放置姿态，可读取以下兼容字段：
 
 ```python
 obb6d_T = placement["obb6d_transform_world"]
@@ -106,7 +106,7 @@ search_yaw = placement["search_yaw_degrees"]
 axis_mapping = placement["yaw_only_axis_mapping"]  # canonical 轴到 yaw-only X/Y/Z 的映射
 ```
 
-`obb6d_*` 字段仅用于调试和复现搜索结果，不作为 yaw-only 模型的默认监督。
+`obb6d_*` 是历史兼容命名；新生成标注中它们同样表示 yaw-only 搜索框，仅用于调试，不作为模型默认监督。
 
 ## 运行示例
 

@@ -102,20 +102,22 @@ def test_stage2_terminal_log_only_contains_core_metrics() -> None:
 
     valid_log = _format_stage2_log({
         "split": "valid", "epoch": 0, "step": 100, "loss": 3.0,
-        "task_success_rate": 0.1, "task_success_top5": 0.5,
-        "valid_pose_rate": 0.4, "direction_hit_rate": 0.8,
-        "collision_free_rate": 0.9, "size_iou": 0.7,
+        "placement_success_at_1": 0.1, "placement_success_at_5": 0.5,
+        "language_relation_correct_rate": 0.8, "supported_and_stable_rate": 0.85,
+        "collision_free_rate": 0.9, "placement_size_iou": 0.7,
+        "center_match_rate": 0.55, "yaw_valid_given_center_match": 0.6,
         "p3_gt_point_coverage": 0.625, "lr_stage1": 5e-6, "lr_stage2": 5e-5,
         "sampling/layer0_p1_sample_total_count": 131072.0,
     })
     assert valid_log == (
-        "[valid] epoch=0 step=100 loss=3.0000 task@1=0.1000 task@5=0.5000 "
-        "valid_pose=0.4000 direction=0.8000 collision_free=0.9000 size_iou=0.7000 "
+        "[valid] epoch=0 step=100 loss=3.0000 placement@1=0.1000 placement@5=0.5000 "
+        "relation=0.8000 support=0.8500 collision_free=0.9000 size_iou=0.7000 "
+        "center_match=0.5500 yaw|match=0.6000 "
         "p3_gt_cov=0.6250 lr_s1=5.00e-06 lr_s2=5.00e-05"
     )
 
 
-def test_task_success_top5_uses_only_task_conditions(monkeypatch) -> None:
+def test_placement_success_top5_does_not_use_source_or_yaw(monkeypatch) -> None:
     boxes = torch.zeros(1, 16, 7)
     boxes[0, :6, 0] = torch.arange(6, dtype=torch.float32)
     boxes[0, :6, 3:6] = 2.0
@@ -130,26 +132,28 @@ def test_task_success_top5_uses_only_task_conditions(monkeypatch) -> None:
     }
     batch = {
         "place_box_gt": torch.tensor([[0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0]]),
-        # 中心和 yaw 故意不匹配，用于确认它们不参与 task success 判定。
         "gt_bottom_centers": torch.tensor([[[100.0, 100.0, 100.0]]]),
         "gt_yaw_masks": torch.zeros(1, 1, NUM_YAW_BINS, dtype=torch.bool),
         "gt_valid_mask": torch.ones(1, 1, dtype=torch.bool),
         "validation_contexts": [SimpleNamespace(collision_context={})],
-        "source_box_gt": torch.tensor([[0.0, 0.0, 0.0, 2.0, 2.0, 2.0]]),
+        "source_box_gt": torch.tensor([[100.0, 100.0, 100.0, 2.0, 2.0, 2.0]]),
+        "world_coords": torch.tensor([[0.5, 0.5, -0.5]]),
+        "batch_indices": torch.tensor([0]),
     }
-    cfg = {"validation": {"size_iou_threshold": 0.8}}
+    cfg = {"data": {"voxel_size_cm": 1.0}, "validation": {"size_iou_threshold": 0.8}}
     monkeypatch.setattr(stage2_training, "compute_collision_metrics", lambda box, context: {"collision": False})
     monkeypatch.setattr(stage2_training, "compute_direction_hit", lambda box, context: bool(box[0] == 1.0))
+    monkeypatch.setattr(stage2_training, "compute_supported_and_stable", lambda *args, **kwargs: (True, 1.0))
 
     metrics = compute_stage2_task_metric_sums(outputs, batch, cfg)
 
-    assert metrics["task_success_sum"] == 0.0
-    assert metrics["task_success_top5_sum"] == 1.0
-    assert metrics["valid_pose_count"] == 1.0
+    assert metrics["placement_success_at_1_sum"] == 0.0
+    assert metrics["placement_success_at_5_sum"] == 1.0
+    assert metrics["successful_pose_count"] == 1.0
 
     monkeypatch.setattr(stage2_training, "compute_direction_hit", lambda box, context: bool(box[0] == 5.0))
     metrics = compute_stage2_task_metric_sums(outputs, batch, cfg)
-    assert metrics["task_success_top5_sum"] == 0.0
+    assert metrics["placement_success_at_5_sum"] == 0.0
 
 
 def _make_tiny_stage2_source(tmp_path) -> Stage1DataSource:
