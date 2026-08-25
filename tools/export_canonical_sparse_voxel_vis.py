@@ -19,9 +19,11 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
+from PIL import Image
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.transforms import Bbox
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -29,6 +31,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.annotation.free_bbox.io_utils import load_ply
 from src.datasets.canonical import load_canonical_scene
+
+
+CAMERA_VIEW_ELEV = 0.0
+CAMERA_VIEW_AZIM = -90.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +64,13 @@ def parse_args() -> argparse.Namespace:
         "--oblique-point-size",
         type=float,
         default=None,
-        help="斜俯视 3D 图的散点面积，单位为 pt^2；默认 voxel=36，raw=1.8。",
+        help="斜视 3D 图的散点面积，单位为 pt^2；默认 voxel=24，raw=1.8。",
+    )
+    parser.add_argument(
+        "--oblique-view-elev",
+        type=float,
+        default=35.0,
+        help="斜视 3D 图的目标向下俯仰角，单位为度；默认 35。",
     )
     parser.add_argument(
         "--edge-feather-ratio",
@@ -243,24 +255,80 @@ def save_projected_point_visualization(
     return png_path, pdf_path
 
 
-def camera_yaw_aligned_points(
+def camera_pose_aligned_points(
     points: np.ndarray,
     camera,
     *,
     center: np.ndarray | None = None,
 ) -> np.ndarray:
-    """保留相机水平朝向，同时将 world-Z 固定为可视化竖直方向。"""
-    camera_forward = np.asarray(camera.E_c2w[:3, 2], dtype=np.float64)
-    forward_xy = camera_forward.copy()
-    forward_xy[2] = 0.0
-    forward_xy /= np.linalg.norm(forward_xy)
-
-    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    camera_right = np.cross(forward_xy, world_up)
-    basis = np.column_stack([camera_right, forward_xy, world_up])
+    """按原始相机完整姿态对齐为绘图的右、前、上坐标。"""
+    rotation_c2w = np.asarray(camera.E_c2w[:3, :3], dtype=np.float64)
     if center is None:
         center = 0.5 * (points.min(axis=0) + points.max(axis=0))
-    return (points - np.asarray(center, dtype=np.float64)) @ basis
+    camera_points = (points - np.asarray(center, dtype=np.float64)) @ rotation_c2w
+    # pinhole 相机坐标为 x-right、y-down、z-forward；绘图坐标改为 x-right、y-forward、z-up。
+    return camera_points[:, [0, 2, 1]] * np.array([1.0, 1.0, -1.0])
+
+
+def camera_downward_elevation_degrees(camera) -> float:
+    """返回相机 forward 相对 world 水平面的向下俯仰角。"""
+    forward = np.asarray(camera.E_c2w[:3, 2], dtype=np.float64)
+    horizontal_norm = float(np.linalg.norm(forward[:2]))
+    return float(np.degrees(np.arctan2(-forward[2], horizontal_norm)))
+
+
+def trim_white_margin(
+    output_path: Path,
+    *,
+    threshold: int = 248,
+    margin_px: int = 8,
+) -> tuple[int, int, int, int, int, int] | None:
+    """裁掉外层白边，并返回相对原始画布的裁剪范围。"""
+    image = Image.open(output_path).convert("RGB")
+    pixels = np.asarray(image)
+    foreground = np.any(pixels < int(threshold), axis=2)
+    rows, columns = np.nonzero(foreground)
+    if len(rows) == 0:
+        return None
+    left = max(int(columns.min()) - margin_px, 0)
+    top = max(int(rows.min()) - margin_px, 0)
+    right = min(int(columns.max()) + margin_px + 1, image.width)
+    bottom = min(int(rows.max()) + margin_px + 1, image.height)
+    original_size = (image.width, image.height)
+    image.crop((left, top, right, bottom)).save(output_path)
+    return left, top, right, bottom, *original_size
+
+
+def save_cropped_figure(
+    fig,
+    png_path: Path,
+    pdf_path: Path,
+    *,
+    dpi: int = 200,
+    facecolor: str = "white",
+    transparent: bool = False,
+) -> None:
+    """保存 PNG，并用相同紧凑边界导出矢量 PDF。"""
+    fig.savefig(
+        png_path,
+        dpi=dpi,
+        facecolor=facecolor,
+        transparent=transparent,
+        pad_inches=0,
+    )
+    crop_bounds = None if transparent else trim_white_margin(png_path)
+    if crop_bounds is None:
+        fig.savefig(pdf_path, facecolor=facecolor, pad_inches=0)
+        return
+
+    left, top, right, bottom, canvas_width, canvas_height = crop_bounds
+    pdf_crop = Bbox.from_bounds(
+        left / dpi,
+        (canvas_height - bottom) / dpi,
+        (right - left) / dpi,
+        (bottom - top) / dpi,
+    )
+    fig.savefig(pdf_path, facecolor=facecolor, bbox_inches=pdf_crop, pad_inches=0)
 
 
 def save_oblique_point_visualization(
@@ -272,13 +340,15 @@ def save_oblique_point_visualization(
     output_label: str,
     edge_feather_ratio: float,
     transparent_background: bool,
+    view_elev: float,
 ) -> tuple[Path, Path]:
-    """保存相机水平朝向约束、桌面校正的斜俯视 3D 论文图。"""
-    aligned_points = camera_yaw_aligned_points(points, scene.camera)
+    """保持原相机方位和滚转，以目标俯仰角保存 3D 点云论文图。"""
+    aligned_points = camera_pose_aligned_points(points, scene.camera)
     point_min = aligned_points.min(axis=0)
     point_max = aligned_points.max(axis=0)
     span = np.maximum(point_max - point_min, 1.0)
     padding = np.array([0.035, 0.035, 0.055]) * span
+    relative_elev = float(view_elev) - camera_downward_elevation_degrees(scene.camera)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_stem = output_dir / f"{scene.sample_id}_{output_label}_oblique_3d"
@@ -309,19 +379,18 @@ def save_oblique_point_visualization(
     ax.set_ylim(point_min[1] - padding[1], point_max[1] + padding[1])
     ax.set_zlim(point_min[2] - padding[2], point_max[2] + padding[2])
     ax.set_box_aspect(tuple(span.tolist()), zoom=1.65)
-    # 弱透视兼顾空间纵深与物体比例，固定视角保证不同样本之间可比较。
+    # 点云已编码原相机方位和滚转，仅补偿俯仰角以增强空间层次。
     ax.set_proj_type("persp", focal_length=2.2)
-    ax.view_init(elev=25.0, azim=-72.0, roll=0.0)
+    ax.view_init(elev=relative_elev, azim=CAMERA_VIEW_AZIM, roll=0.0)
     ax.set_axis_off()
 
-    fig.savefig(
+    save_cropped_figure(
+        fig,
         png_path,
-        dpi=200,
+        pdf_path,
         facecolor=figure_facecolor,
         transparent=transparent_background,
-        pad_inches=0,
     )
-    fig.savefig(pdf_path, facecolor=figure_facecolor, pad_inches=0)
     plt.close(fig)
     return png_path, pdf_path
 
@@ -338,7 +407,7 @@ def main() -> None:
         output_label = "raw_points"
     else:
         point_size = 24.0 if args.point_size is None else args.point_size
-        oblique_point_size = 36.0 if args.oblique_point_size is None else args.oblique_point_size
+        oblique_point_size = 24.0 if args.oblique_point_size is None else args.oblique_point_size
         output_label = "sparse_voxels"
     if args.edge_feather_ratio > 0.0:
         output_label = f"{output_label}_feathered"
@@ -362,6 +431,7 @@ def main() -> None:
             output_label,
             args.edge_feather_ratio,
             args.transparent_background,
+            args.oblique_view_elev,
         ),
     )
     for output_path in output_paths:

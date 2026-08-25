@@ -161,7 +161,7 @@ python tools/export_canonical_sparse_voxel_vis.py \
     --output-dir outputs/visualizations
 ```
 
-工具会同时输出两组 PNG 预览和矢量 PDF：`*_sparse_voxels` 与 RGB 像素级对齐；`*_sparse_voxels_oblique_3d` 保留真实相机的水平观察方位，将 world-Z 校正为画面竖直方向，并以固定斜俯视透视突出桌面和物体的三维结构。像素对齐图的点面积由 `--point-size` 控制，默认值为 `24 pt^2`；斜俯视图由 `--oblique-point-size` 控制，默认值为 `36 pt^2`。
+工具会同时输出两组 PNG 预览和 PDF：`*_sparse_voxels` 与 RGB 像素级对齐；`*_sparse_voxels_oblique_3d` 保持样本 `E_c2w` 中的原始方位和滚转，并默认采用与热力图一致的 `35°` 向下俯仰角。两种图均移除网格、坐标轴、刻度、标签和坐标方向标，3D 图还会紧凑裁掉外层白边。像素对齐图与 3D 图的默认点面积均为 `24 pt^2`，可分别通过 `--point-size` 与 `--oblique-point-size` 调整；3D 图的俯仰角可通过 `--oblique-view-elev` 调整。
 
 如需使用固定 50000 点的初始点云绘制更细粒度的同类图片，增加 `--point-source raw`：
 
@@ -173,4 +173,27 @@ python tools/export_canonical_sparse_voxel_vis.py \
     --point-source raw
 ```
 
-初始点云模式输出 `*_raw_points` 和 `*_raw_points_oblique_3d`，不会覆盖稀疏体素图；两种图的默认点面积分别为 `2.5 pt^2` 和 `1.8 pt^2`，仍可用 `--point-size` 与 `--oblique-point-size` 覆盖。斜俯视图使用固定的弱透视相机、关闭深度着色，并以统一视角展示不同样本，避免远处颜色发灰和强透视造成的比例畸变。
+初始点云模式输出 `*_raw_points` 和 `*_raw_points_oblique_3d`，不会覆盖稀疏体素图；两种图的默认点面积分别为 `2.5 pt^2` 和 `1.8 pt^2`，仍可用 `--point-size` 与 `--oblique-point-size` 覆盖。3D 图关闭深度着色，并严格继承各样本的原始相机姿态。
+
+如需在同一 RGB 稀疏体素底图上分别展示原物体框与预测放置框，可使用：
+
+```bash
+python tools/render_lc_bgplacenet_stage2_point_boxes.py \
+    --dataset-dir data/hope \
+    --sample-id hope__scene_0000__0005 \
+    --object-id obj_3 \
+    --predictions-json <predictions.json> \
+    --output-path outputs/visualizations/hope__scene_0000__0005_rgb_pointcloud_source_box.png \
+    --source-only
+
+python tools/render_lc_bgplacenet_stage2_point_boxes.py \
+    --dataset-dir data/hope \
+    --sample-id hope__scene_0000__0005 \
+    --object-id obj_3 \
+    --predictions-json <predictions.json> \
+    --output-path outputs/visualizations/hope__scene_0000__0005_rgb_pointcloud_source_and_placement_boxes.png
+```
+
+两张图均使用完整 1 cm RGB 体素点云、`24 pt²` 点面积和 `35°` 目标俯仰角，并采用相同的白底、原相机方位、紧凑裁剪与无坐标轴样式。第一张仅显示橙色虚线原物体框；第二张同时显示橙色虚线原物体框和紫色实线预测放置框。PNG 与同名矢量 PDF 会同时生成。
+
+如需论文中独立展示 Stage-2 P3 响应，可在 `render_lc_bgplacenet_stage2_point_mask.py` 中增加 `--heatmap-only` 并提供 `--support-mask`。该模式绘制完整 1 cm 环境体素点阵：支撑面以 `1.25 cm` 高度容差判定，其上的点继承所属 P3 cell 响应并使用蓝—青—黄—红热力色；非支撑面点统一使用不透明中性灰 `#6B7280`，两类点均使用相同点面积。输出删除 RGB 颜色、坐标轴、网格、标签和 3D box，保持样本原相机方位，默认使用 `24 pt²` 点面积和 `35°` 斜俯视角；后两者可分别通过 `--heatmap-only-point-size` 和 `--heatmap-only-view-elev` 调整，同时导出同名 PNG 与 PDF。

@@ -6,8 +6,7 @@
         --dataset-dir data/hope \
         --sample-id hope__scene_0000__0005 \
         --pred-heatmap outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8_enriched/inference_custom_hope_scene_0000_0005/pred_heatmaps/hope__custom_hope_scene_0000_0005_obj_3__prediction_only__hope__scene_0000__0005__obj_3__cluster_000__pred_heatmap.ply \
-        --output-path outputs/visualizations/hope__scene_0000__0005_paper_single_pointcloud_v2_p3_heatmap_upright.png \
-        --upright
+        --output-path outputs/visualizations/hope__scene_0000__0005_paper_single_pointcloud_v2_p3_heatmap.png
 
 局部版保留完整支撑面:
     python tools/render_lc_bgplacenet_stage2_point_mask.py \
@@ -16,8 +15,17 @@
         --pred-heatmap <pred_heatmap.ply> \
         --support-mask outputs/free_bbox_hope/support_masks/hope__scene_0000__0005__support_mask.ply \
         --output-path outputs/visualizations/<output>.png \
-        --upright --focus-score-threshold 0.4 --focus-margin-cm 8.0 \
+        --focus-score-threshold 0.4 --focus-margin-cm 8.0 \
         --keep-support-surface --support-surface-tolerance-cm 0.75
+
+绘制完整环境热力图，并单独导出红圈高概率区域的放大图:
+    python tools/render_lc_bgplacenet_stage2_point_mask.py \
+        --dataset-dir data/hope \
+        --sample-id hope__scene_0000__0005 \
+        --pred-heatmap <pred_heatmap.ply> \
+        --support-mask outputs/free_bbox_hope/support_masks/hope__scene_0000__0005__support_mask.ply \
+        --output-path outputs/visualizations/<output>.png \
+        --heatmap-only
 """
 
 from __future__ import annotations
@@ -28,7 +36,10 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
+from matplotlib.patches import Ellipse
+from mpl_toolkits.mplot3d import proj3d
 from PIL import Image
+from PIL import JpegImagePlugin  # noqa: F401  # 注册 Pillow PDF 导出所需的 JPEG 编码器。
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -40,8 +51,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.annotation.free_bbox.io_utils import load_ply
 from src.datasets.canonical import load_canonical_scene
 from tools.export_canonical_sparse_voxel_vis import (
-    camera_yaw_aligned_points,
+    CAMERA_VIEW_AZIM,
+    CAMERA_VIEW_ELEV,
+    camera_downward_elevation_degrees,
+    camera_pose_aligned_points,
     edge_fade_alpha,
+    trim_white_margin,
 )
 
 
@@ -53,7 +68,11 @@ PREDICTION_PALETTE = np.asarray(
 )
 DISPLAY_PALETTE = PREDICTION_PALETTE.copy()
 ZERO_RESPONSE_COLOR = np.asarray([12, 28, 105], dtype=np.float32) / 255.0
+NON_SUPPORT_COLOR = np.asarray([107, 114, 128], dtype=np.float32) / 255.0
 LOCAL_POINT_SIZE = 4.2
+HEATMAP_ONLY_POINT_SIZE = 24.0
+HEATMAP_ONLY_VIEW_ELEV = 35.0
+HEATMAP_FOCUS_SCORE_RATIO = 0.75
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,21 +97,21 @@ def parse_args() -> argparse.Namespace:
         help="点云绘制大小；增大该值可以减少点间空缺。",
     )
     parser.add_argument(
-        "--upright",
+        "--heatmap-only",
         action="store_true",
-        help="根据低高度桌面点的主方向自动旋转点云，使场景主方向更水平。",
+        help="用 P3 响应着色完整环境点阵，并以原相机方位圈选、放大高概率区域。",
     )
     parser.add_argument(
-        "--view-elev",
+        "--heatmap-only-point-size",
         type=float,
-        default=25.0,
-        help="3D 相机俯视角，单位为度。",
+        default=HEATMAP_ONLY_POINT_SIZE,
+        help="heatmap-only 点面积，单位为 pt^2。",
     )
     parser.add_argument(
-        "--view-azim",
+        "--heatmap-only-view-elev",
         type=float,
-        default=-72.0,
-        help="3D 相机水平朝向，单位为度；原图使用 -72 度。",
+        default=HEATMAP_ONLY_VIEW_ELEV,
+        help="heatmap-only 相对 world 水平面的目标俯仰角，单位为度。",
     )
     parser.add_argument(
         "--focus-score-threshold",
@@ -128,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--support-surface-tolerance-cm",
         type=float,
-        default=0.75,
+        default=1.25,
         help="保留支撑面时相对支撑面高度的容差，单位为 cm。",
     )
     return parser.parse_args()
@@ -141,39 +160,6 @@ def _validate_points(points: np.ndarray, name: str) -> np.ndarray:
     if len(points) == 0:
         raise ValueError(f"{name} must not be empty")
     return points
-
-
-def rotate_points_upright(points: np.ndarray, camera) -> tuple[np.ndarray, float]:
-    """Rotate around world-Z so the dominant tabletop direction is horizontal."""
-    points = _validate_points(points, "points")
-    low_height = points[:, 2] <= np.percentile(points[:, 2], 10.0)
-    planar_points = points[low_height, :2]
-    centered = planar_points - planar_points.mean(axis=0, keepdims=True)
-    covariance = centered.T @ centered / max(len(centered), 1)
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    # The shorter tabletop axis is the visible front-edge direction; using it
-    # avoids turning the camera into an unnatural side view.
-    direction = eigenvectors[:, int(np.argmin(eigenvalues))]
-
-    camera_forward = np.asarray(camera.E_c2w[:3, 2], dtype=np.float64)
-    camera_forward[2] = 0.0
-    camera_forward /= np.linalg.norm(camera_forward)
-    camera_right = np.cross(camera_forward, np.array([0.0, 0.0, 1.0]))[:2]
-    cross = direction[0] * camera_right[1] - direction[1] * camera_right[0]
-    angle = float(np.arctan2(cross, np.dot(direction, camera_right)))
-    if angle > 0.5 * np.pi:
-        angle -= np.pi
-    elif angle < -0.5 * np.pi:
-        angle += np.pi
-
-    cosine = np.cos(angle)
-    sine = np.sin(angle)
-    rotation = np.asarray([[cosine, -sine], [sine, cosine]], dtype=np.float64)
-    center = points[:, :2].mean(axis=0)
-    rotated_xy = (points[:, :2] - center) @ rotation.T + center
-    rotated = points.copy()
-    rotated[:, :2] = rotated_xy
-    return rotated, float(np.degrees(angle))
 
 
 def _palette_values() -> np.ndarray:
@@ -368,7 +354,7 @@ def support_surface_mask(
     support_mask_points: np.ndarray,
     support_mask_colors: np.ndarray,
     *,
-    tolerance_cm: float = 0.75,
+    tolerance_cm: float = 1.25,
 ) -> np.ndarray:
     """从 support mask 的白色 active 点估计支撑面，并保留完整高度层。"""
     scene_points = _validate_points(scene_points, "scene_points")
@@ -387,19 +373,132 @@ def support_surface_mask(
     return np.abs(scene_points[:, 2] - support_z) <= tolerance_cm
 
 
-def trim_white_margin(output_path: Path, *, threshold: int = 248, margin_px: int = 4) -> None:
-    """Crop only the outer white canvas without rescaling point spacing."""
-    image = Image.open(output_path).convert("RGB")
-    pixels = np.asarray(image)
-    foreground = np.any(pixels < int(threshold), axis=2)
-    rows, columns = np.nonzero(foreground)
-    if len(rows) == 0:
-        return
-    left = max(int(columns.min()) - margin_px, 0)
-    top = max(int(rows.min()) - margin_px, 0)
-    right = min(int(columns.max()) + margin_px + 1, image.width)
-    bottom = min(int(rows.max()) + margin_px + 1, image.height)
-    image.crop((left, top, right, bottom)).save(output_path)
+def save_heatmap_only_visualization(
+    scene,
+    environment_points: np.ndarray,
+    point_scores: np.ndarray,
+    support_point_mask: np.ndarray,
+    output_path: Path,
+    *,
+    point_size: float = HEATMAP_ONLY_POINT_SIZE,
+    view_elev: float = HEATMAP_ONLY_VIEW_ELEV,
+) -> Path:
+    """保存带红圈的完整热力图，并独立导出圆内放大图。"""
+    environment_points = _validate_points(environment_points, "environment_points")
+    point_scores = np.asarray(point_scores, dtype=np.float32)
+    if point_scores.shape != (len(environment_points),):
+        raise ValueError("point_scores must align with environment_points")
+    support_point_mask = np.asarray(support_point_mask, dtype=bool)
+    if support_point_mask.shape != (len(environment_points),):
+        raise ValueError("support_point_mask must align with environment_points")
+    if point_size <= 0.0:
+        raise ValueError("point_size must be positive")
+    view_center = 0.5 * (environment_points.min(axis=0) + environment_points.max(axis=0))
+    aligned_points = camera_pose_aligned_points(
+        environment_points, scene.camera, center=view_center
+    )
+    point_min = aligned_points.min(axis=0)
+    point_max = aligned_points.max(axis=0)
+    span = np.maximum(point_max - point_min, 1.0)
+    padding = np.array([0.05, 0.05, 0.04], dtype=np.float64) * span
+    relative_elev = float(view_elev) - camera_downward_elevation_degrees(scene.camera)
+    point_colors = heatmap_colors(point_scores)
+    point_colors[~support_point_mask] = NON_SUPPORT_COLOR
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dpi = 200
+    fig = plt.figure(figsize=(1556 / dpi, 1011 / dpi), facecolor="white")
+    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], projection="3d", facecolor="white")
+    ax.scatter(
+        aligned_points[:, 0],
+        aligned_points[:, 1],
+        aligned_points[:, 2],
+        c=point_colors,
+        s=point_size,
+        marker="o",
+        linewidths=0.0,
+        depthshade=False,
+        antialiased=True,
+    )
+    ax.set_xlim(point_min[0] - padding[0], point_max[0] + padding[0])
+    ax.set_ylim(point_min[1] - padding[1], point_max[1] + padding[1])
+    ax.set_zlim(point_min[2] - padding[2], point_max[2] + padding[2])
+    ax.set_box_aspect(tuple(span.tolist()), zoom=1.55)
+    ax.set_proj_type("persp", focal_length=2.2)
+    ax.view_init(elev=relative_elev, azim=CAMERA_VIEW_AZIM, roll=0.0)
+    ax.set_axis_off()
+
+    # 以高分点为焦点，在主图上圈选并独立导出圆内放大图。
+    maximum_score = float(point_scores[support_point_mask].max(initial=0.0))
+    focus_mask = support_point_mask & (
+        point_scores >= HEATMAP_FOCUS_SCORE_RATIO * maximum_score
+    )
+    if maximum_score <= 0.0 or not np.any(focus_mask):
+        focus_mask[np.argmax(point_scores)] = True
+    fig.canvas.draw()
+    focus_projected = np.column_stack(
+        proj3d.proj_transform(*aligned_points[focus_mask].T, ax.get_proj())[:2]
+    )
+    focus_pixels = ax.transData.transform(focus_projected)
+    circle_center_pixels = focus_pixels.mean(axis=0)
+    circle_radius_pixels = max(
+        24.0,
+        float(np.linalg.norm(focus_pixels - circle_center_pixels, axis=1).max())
+        + 10.0,
+    )
+    # 直接裁剪主图圆内像素，确保放大图不混入圈外点或改变原透视关系。
+    canvas = np.asarray(fig.canvas.buffer_rgba()).copy()
+    canvas_height, canvas_width = canvas.shape[:2]
+    center_x, center_y = circle_center_pixels
+    radius = int(np.ceil(circle_radius_pixels))
+    left = max(int(np.floor(center_x)) - radius, 0)
+    right = min(int(np.ceil(center_x)) + radius + 1, canvas_width)
+    top = max(canvas_height - int(np.ceil(center_y)) - radius, 0)
+    bottom = min(canvas_height - int(np.floor(center_y)) + radius + 1, canvas_height)
+    inset_image = canvas[top:bottom, left:right, :3]
+    grid_y, grid_x = np.ogrid[: inset_image.shape[0], : inset_image.shape[1]]
+    crop_center_x = center_x - left
+    crop_center_y = canvas_height - center_y - top
+    outside_circle = (
+        (grid_x - crop_center_x) ** 2 + (grid_y - crop_center_y) ** 2
+        > circle_radius_pixels**2
+    )
+    inset_image[outside_circle] = 255
+
+    zoom_output_path = output_path.with_name(
+        f"{output_path.stem}_zoom{output_path.suffix}"
+    )
+    zoom_image = Image.fromarray(inset_image).resize(
+        (800, 800), resample=Image.Resampling.LANCZOS
+    )
+    zoom_image.save(zoom_output_path)
+    zoom_pdf_path = zoom_output_path.with_suffix(".pdf")
+    zoom_image.convert("RGB").save(zoom_pdf_path, resolution=200.0)
+
+    circle_center = fig.transFigure.inverted().transform(circle_center_pixels)
+    circle_width = 2.0 * circle_radius_pixels / fig.bbox.width
+    circle_height = 2.0 * circle_radius_pixels / fig.bbox.height
+    accent_color = "#dc2626"
+    fig.add_artist(
+        Ellipse(
+            circle_center,
+            width=circle_width,
+            height=circle_height,
+            transform=fig.transFigure,
+            fill=False,
+            edgecolor=accent_color,
+            linewidth=2.4,
+            zorder=20,
+        )
+    )
+    fig.savefig(output_path, dpi=dpi, facecolor="white", pad_inches=0)
+    plt.close(fig)
+
+    trim_white_margin(output_path, margin_px=8)
+    pdf_path = output_path.with_suffix(".pdf")
+    with Image.open(output_path) as image:
+        image.convert("RGB").save(pdf_path, resolution=200.0)
+    return pdf_path
 
 
 def save_heatmap_visualization(
@@ -412,16 +511,14 @@ def save_heatmap_visualization(
     mask_alpha: float,
     compact: bool = False,
     view_points: np.ndarray | None = None,
-    view_elev: float = 25.0,
-    view_azim: float = -72.0,
     point_size: float = LOCAL_POINT_SIZE,
 ) -> None:
     """Save the heatmap using the existing oblique point-cloud figure style."""
     if view_points is None:
         view_points = scene_points
     view_center = 0.5 * (view_points.min(axis=0) + view_points.max(axis=0))
-    aligned_points = camera_yaw_aligned_points(scene_points, scene.camera, center=view_center)
-    aligned_view_points = camera_yaw_aligned_points(view_points, scene.camera, center=view_center)
+    aligned_points = camera_pose_aligned_points(scene_points, scene.camera, center=view_center)
+    aligned_view_points = camera_pose_aligned_points(view_points, scene.camera, center=view_center)
     point_min = aligned_view_points.min(axis=0)
     point_max = aligned_view_points.max(axis=0)
     span = np.maximum(point_max - point_min, 1.0)
@@ -490,7 +587,8 @@ def save_heatmap_visualization(
     ax.set_zlim(point_min[2] - padding[2], point_max[2] + padding[2])
     ax.set_box_aspect(tuple(span.tolist()), zoom=1.9 if compact else 2.0)
     ax.set_proj_type("persp", focal_length=2.2)
-    ax.view_init(elev=view_elev, azim=view_azim, roll=0.0)
+    # 点云已经应用原始相机的完整姿态，不再叠加任何手工角度。
+    ax.view_init(elev=CAMERA_VIEW_ELEV, azim=CAMERA_VIEW_AZIM, roll=0.0)
     ax.set_axis_off()
     fig.savefig(output_path, dpi=200, facecolor="white", pad_inches=0)
     plt.close(fig)
@@ -505,11 +603,48 @@ def main() -> None:
         raise ValueError("voxel_size_cm must be positive")
     sample_path = args.dataset_dir / "samples" / f"{args.sample_id}.json"
     scene = load_canonical_scene(sample_path, dataset_root=args.dataset_dir)
-    scene_points, scene_colors = load_ply(scene.point_cloud_path)
-    voxel_points, _ = load_ply(scene.voxel_point_cloud_path)
     heatmap_points, heatmap_colors_data = load_ply(args.pred_heatmap)
     heatmap_scores = normalize_scores_by_max(decode_heatmap_scores(heatmap_colors_data))
+    voxel_points, _ = load_ply(scene.voxel_point_cloud_path)
     origin = np.floor(voxel_points.min(axis=0) / args.voxel_size_cm) * args.voxel_size_cm
+    if args.heatmap_only:
+        if args.support_mask is None:
+            raise ValueError("--heatmap-only requires --support-mask")
+        environment_scores = map_continuous_scores(
+            voxel_points,
+            heatmap_points,
+            heatmap_scores,
+            p3_stride_cm=args.p3_stride_cm,
+            origin=origin,
+        )
+        support_points, support_colors = load_ply(args.support_mask)
+        environment_support_mask = support_surface_mask(
+            voxel_points,
+            support_points,
+            support_colors,
+            tolerance_cm=args.support_surface_tolerance_cm,
+        )
+        pdf_path = save_heatmap_only_visualization(
+            scene,
+            voxel_points,
+            environment_scores,
+            environment_support_mask,
+            args.output_path,
+            point_size=args.heatmap_only_point_size,
+            view_elev=args.heatmap_only_view_elev,
+        )
+        zoom_path = args.output_path.with_name(
+            f"{args.output_path.stem}_zoom{args.output_path.suffix}"
+        )
+        print(
+            f"Saved {args.output_path}, {pdf_path}, {zoom_path}, and {zoom_path.with_suffix('.pdf')} "
+            f"(environment_points={len(voxel_points)}, point_size={args.heatmap_only_point_size:.1f}, "
+            f"support_points={int(environment_support_mask.sum())}, "
+            f"view_elev={args.heatmap_only_view_elev:.1f}, heatmap_only=on)"
+        )
+        return
+
+    scene_points, scene_colors = load_ply(scene.point_cloud_path)
     point_scores = map_continuous_scores(
         scene_points,
         heatmap_points,
@@ -541,12 +676,8 @@ def main() -> None:
             support_colors,
             tolerance_cm=args.support_surface_tolerance_cm,
         )
-    render_points = scene_points
-    rotation_degrees = 0.0
-    if args.upright:
-        render_points, rotation_degrees = rotate_points_upright(scene_points, scene.camera)
-    view_points = render_points
-    render_points = render_points[render_mask]
+    view_points = scene_points
+    render_points = scene_points[render_mask]
     render_colors = scene_colors[render_mask]
     render_scores = point_scores[render_mask]
     save_heatmap_visualization(
@@ -558,13 +689,11 @@ def main() -> None:
         mask_alpha=args.mask_alpha,
         compact=compact,
         view_points=view_points,
-        view_elev=args.view_elev,
-        view_azim=args.view_azim,
         point_size=args.point_size,
     )
     print(
         f"Saved {args.output_path} "
-        f"(points={len(render_points)}, z_rotation_degrees={rotation_degrees:.2f}, "
+        f"(points={len(render_points)}, camera_pose=original, "
         f"support_surface={'on' if args.keep_support_surface else 'off'})"
     )
 

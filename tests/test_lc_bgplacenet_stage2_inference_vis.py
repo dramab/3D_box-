@@ -14,6 +14,11 @@ import tools.render_lc_bgplacenet_stage2_point_mask as point_mask_vis
 from src.annotation.free_bbox.io_utils import save_ply
 from src.models.lc_bgplacenet.stage2 import NUM_YAW_BINS
 from tools.benchmark_lc_bgplacenet_stage2 import load_predictions
+from tools.export_canonical_sparse_voxel_vis import (
+    CAMERA_VIEW_AZIM,
+    CAMERA_VIEW_ELEV,
+    camera_pose_aligned_points,
+)
 from tools.export_lc_bgplacenet_stage2_inference_web import collect_rows, write_html
 
 
@@ -34,6 +39,66 @@ def test_continuous_mask_maps_all_scores_and_preserves_zero_response_color() -> 
     assert blended[1, 0] > colors[1, 0] / 255.0
     assert point_sizes[1] > point_sizes[0] > point_sizes[2]
     assert point_sizes[2] == point_mask_vis.LOCAL_POINT_SIZE
+
+
+def test_camera_aligned_view_preserves_full_original_pose() -> None:
+    camera = SimpleNamespace(E_c2w=np.eye(4, dtype=np.float64))
+    camera.E_c2w[:3, :3] = np.column_stack(
+        ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0])
+    )
+    center = np.asarray([2.0, 3.0, 4.0], dtype=np.float64)
+    camera_axes_world = camera.E_c2w[:3, [0, 2, 1]].T + center
+
+    aligned = camera_pose_aligned_points(camera_axes_world, camera, center=center)
+
+    np.testing.assert_allclose(aligned, np.diag([1.0, 1.0, -1.0]), atol=1e-7)
+    assert CAMERA_VIEW_ELEV == 0.0
+    assert CAMERA_VIEW_AZIM == -90.0
+
+
+def test_heatmap_only_visualization_exports_environment_points_without_axes(tmp_path) -> None:
+    elevation = np.radians(45.0)
+    forward = np.asarray([0.0, np.cos(elevation), -np.sin(elevation)])
+    right = np.asarray([1.0, 0.0, 0.0])
+    down = np.cross(forward, right)
+    e_c2w = np.eye(4, dtype=np.float64)
+    e_c2w[:3, :3] = np.column_stack([right, down, forward])
+    scene = SimpleNamespace(
+        camera=SimpleNamespace(
+            E_c2w=e_c2w,
+            fx=100.0,
+            fy=100.0,
+            cx=50.0,
+            cy=40.0,
+            img_w=100,
+            img_h=80,
+        )
+    )
+    environment_points = np.asarray(
+        [[0.0, 0.0, 200.0], [20.0, 0.0, 200.0], [0.0, 20.0, 200.0]],
+        dtype=np.float64,
+    )
+    point_scores = np.asarray([0.0, 0.5, 1.0], dtype=np.float32)
+    support_point_mask = np.asarray([True, True, False])
+    png_path = tmp_path / "heatmap_only.png"
+
+    pdf_path = point_mask_vis.save_heatmap_only_visualization(
+        scene, environment_points, point_scores, support_point_mask, png_path
+    )
+
+    assert png_path.is_file()
+    assert pdf_path == png_path.with_suffix(".pdf")
+    assert pdf_path.is_file()
+    zoom_path = tmp_path / "heatmap_only_zoom.png"
+    assert zoom_path.is_file()
+    assert zoom_path.with_suffix(".pdf").is_file()
+    with Image.open(png_path) as image:
+        assert image.width > 0 and image.height > 0
+    with Image.open(zoom_path) as image:
+        assert image.size == (800, 800)
+    np.testing.assert_allclose(
+        point_mask_vis.camera_downward_elevation_degrees(scene.camera), 45.0
+    )
 
 
 def test_local_crop_keeps_semantic_core_and_removes_unrelated_points() -> None:
