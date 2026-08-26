@@ -2,6 +2,8 @@
 
 Stage 2 使用 `SPACE-Former`（Size-Prompted Affordance and Collision Explorer）完成有界集合预测。模型复用并联合训练 Stage 1 的 Backbone、语言融合与 Source Grounding；CLIP 延续配置中的冻结状态。
 
+单Placement Query直接回归baseline使用独立配置`configs/lc_bgplacenet_stage2_direct_box_1q_enriched.yaml`，其结构、固定enriched划分和训练方法见`docs/lc_bgplacenet_stage2_direct_box_training.md`。
+
 ## 数据与监督
 
 每条训练样本读取：

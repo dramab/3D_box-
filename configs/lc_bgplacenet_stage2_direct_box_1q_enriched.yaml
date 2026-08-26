@@ -1,0 +1,98 @@
+data:
+  # 与 enriched 主模型严格共用由 active_aligned 映射得到的固定划分。
+  split_dir: data/splits/active_aligned_enriched
+  voxel_size_cm: 1.0
+  valid_fraction: 0.1
+  test_fraction: 0.1
+  split_seed: 20260624
+  max_train_samples:
+  max_valid_samples:
+  sources:
+    - name: dopose
+      dataset_dir: data/dopose
+      free_bbox_dir: outputs/free_bbox_dopose
+      labels_path: outputs/enriched_label_outputs_dopose/auto_labels_dopose/all_labels_enriched.json
+    - name: hope
+      dataset_dir: data/hope
+      free_bbox_dir: outputs/free_bbox_hope
+      labels_path: outputs/enriched_label_outputs_hope/auto_labels_hope/all_labels_enriched.json
+    - name: housecat
+      dataset_dir: data/housecat
+      free_bbox_dir: outputs/free_bbox_housecat
+      labels_path: outputs/enriched_label_outputs_housecat/auto_labels_housecat/all_labels_enriched.json
+    - name: omni
+      dataset_dir: data/omni_filter
+      free_bbox_dir: outputs/free_bbox_omni
+      labels_path: outputs/enriched_label_outputs_omni/auto_labels_omni/all_labels_enriched.json
+    - name: ycbv
+      dataset_dir: data/ycbv
+      free_bbox_dir: outputs/free_bbox_ycbv
+      labels_path: outputs/enriched_label_outputs_ycbv/auto_labels_ycbv/all_labels_enriched.json
+
+model:
+  type: direct_box_1q
+  hidden_dim: 256
+  backbone:
+    type: spconv
+    in_channels: 70
+    num_blocks: 3
+  clip:
+    model_name_or_path: /data/limengfei/xingqunqi/models/clip-vit-base-patch16
+    freeze: true
+    max_length: 77
+    voxel_feature_dim: 64
+    local_files_only: true
+  fusion:
+    num_heads: 8
+    dropout: 0.1
+  source_grounding:
+    num_heads: 8
+    num_layers: 4
+    dropout: 0.1
+  direct_box:
+    # 单个 Placement Query 使用全局体素 memory 直接回归一个合法放置模式。
+    num_heads: 8
+    num_layers: 4
+    dropout: 0.1
+
+loss:
+  # 与完整模型最终 Decoder 的中心、Yaw、角点及 Source 权重保持一致。
+  lambda_center: 5.0
+  lambda_yaw: 0.5
+  lambda_corner: 0.5
+  lambda_src: 0.5
+  source:
+    lambda_center: 4.0
+    lambda_size: 2.0
+    lambda_iou: 0.2
+
+validation:
+  source_iou_threshold: 0.5
+  size_iou_threshold: 0.8
+  center_match_threshold_cm: 2.0
+  support_downward_cm: 3.0
+  support_upper_cm: 1.0
+
+training:
+  output_dir: outputs/lc_bgplacenet_stage2_direct_box_1q_enriched
+  # 训练命令显式传入 enriched Stage 1 checkpoint，避免误用其他数据划分的权重。
+  stage1_pretrained_checkpoint:
+  device: auto
+  seed: 20260624
+  epochs: 65
+  batch_size: 8
+  num_workers: 8
+  pin_memory: true
+  progress_bar: true
+  lr: 0.0001
+  # Stage 1 参数组使用 0.1 倍学习率；调度器监控 validation Placement Success@1。
+  lr_scheduler:
+    type: reduce_on_plateau
+    mode: max
+    factor: 0.5
+    patience: 3
+    threshold: 0.001
+    threshold_mode: abs
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  log_every: 300

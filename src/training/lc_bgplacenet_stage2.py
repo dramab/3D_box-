@@ -1,8 +1,8 @@
 """
 LC-BGPlaceNet Stage 2 training utilities.
 
-Stage 2 trains bounded SPACE-Former set prediction from canonical active voxel
-point clouds, language instructions and free_bbox center/yaw-set supervision.
+Stage 2 trains either SPACE-Former set prediction or the Direct-Box 1Q baseline
+from canonical active voxels, language and free_bbox center/yaw supervision.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from src.annotation.auto_label import describe_spatial_relation
 from src.annotation.free_bbox.geometry import get_bbox_corners, transform_points
 from src.annotation.free_bbox.io_utils import load_ply
 from src.datasets.canonical import CameraParams, load_sample_record
+from src.models.lc_bgplacenet.direct_box import DirectBox1QStage2
 from src.models.lc_bgplacenet.stage2 import (
     NUM_QUERIES,
     NUM_YAW_BINS,
@@ -70,6 +71,17 @@ from src.training.lc_bgplacenet_stage1 import (
 
 
 BOX_COLLISION_EPS_CM = 1e-6
+DIRECT_BOX_MODEL_TYPE = "direct_box_1q"
+
+
+def build_stage2_model(model_cfg: dict[str, Any]) -> torch.nn.Module:
+    """Build the configured Stage 2 architecture."""
+    model_type = str(model_cfg.get("type", "space_former")).lower()
+    if model_type == "space_former":
+        return SPACEFormerStage2(model_cfg)
+    if model_type == DIRECT_BOX_MODEL_TYPE:
+        return DirectBox1QStage2(model_cfg)
+    raise ValueError(f"Unsupported Stage 2 model type: {model_type}")
 
 
 @dataclass(frozen=True)
@@ -960,13 +972,97 @@ def _set_losses_for_predictions(
     return cls_loss, center_loss, yaw_loss, corner_loss
 
 
+def select_nearest_direct_box_targets(
+    pred_bottom_centers: torch.Tensor,
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Match each single-query prediction to its nearest valid placement target."""
+    valid_mask = batch["gt_valid_mask"]
+    if torch.any(~valid_mask.any(dim=1)):
+        raise ValueError("Direct-Box 1Q requires at least one valid target per sample")
+    target_size = batch["source_box_gt"][:, None, 3:6].clamp_min(1e-4)
+    normalized_distance = torch.abs(
+        pred_bottom_centers[:, None, :] - batch["gt_bottom_centers"]
+    ).div(target_size).mean(dim=-1)
+    nearest_indices = normalized_distance.masked_fill(~valid_mask, float("inf")).argmin(dim=1)
+    batch_indices = torch.arange(len(pred_bottom_centers), device=pred_bottom_centers.device)
+    return (
+        nearest_indices,
+        batch["gt_bottom_centers"][batch_indices, nearest_indices],
+        batch["gt_yaw_masks"][batch_indices, nearest_indices],
+    )
+
+
+def compute_direct_box_1q_loss(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    cfg: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Compute nearest-valid-center, multi-yaw, corner and source losses."""
+    loss_cfg = cfg["loss"]
+    pred_center = outputs["pred_bottom_centers"][:, 0]
+    pred_yaw_logits = outputs["raw_yaw_logits"][:, 0]
+    nearest_indices, target_center, target_yaw_mask = select_nearest_direct_box_targets(
+        pred_center, batch
+    )
+    target_size = batch["source_box_gt"][:, 3:6].clamp_min(1e-4)
+    pred_size = outputs["source_box"][:, 3:6].clamp_min(1e-4)
+    center_loss = F.smooth_l1_loss(
+        (pred_center - target_center) / target_size,
+        torch.zeros_like(pred_center),
+    )
+    yaw_loss = F.binary_cross_entropy_with_logits(
+        pred_yaw_logits,
+        target_yaw_mask.to(pred_yaw_logits.dtype),
+    )
+    corner_loss = _minimum_valid_corner_loss(
+        pred_center,
+        pred_size,
+        pred_yaw_logits,
+        target_center,
+        target_size,
+        target_yaw_mask,
+    )
+    source_cfg = loss_cfg["source"]
+    source_loss, source_terms = source_box_loss(
+        outputs["source_box"],
+        batch["source_box_gt"],
+        lambda_center=float(source_cfg.get("lambda_center", 4.0)),
+        lambda_size=float(source_cfg.get("lambda_size", 2.0)),
+        lambda_iou=float(source_cfg.get("lambda_iou", 0.2)),
+    )
+    total = (
+        float(loss_cfg.get("lambda_center", 5.0)) * center_loss
+        + float(loss_cfg.get("lambda_yaw", 0.5)) * yaw_loss
+        + float(loss_cfg.get("lambda_corner", 0.5)) * corner_loss
+        + float(loss_cfg.get("lambda_src", 0.5)) * source_loss
+    )
+    sample_count = pred_center.new_tensor(float(len(pred_center)))
+    terms = {
+        "loss": total,
+        "loss_center": center_loss.detach(),
+        "loss_yaw": yaw_loss.detach(),
+        "loss_corner": corner_loss.detach(),
+        "loss_src": source_loss.detach(),
+        "valid_query_count": sample_count,
+        "matched_query_count": sample_count,
+        "background_query_count": sample_count.new_zeros(()),
+        "padded_query_count": sample_count.new_zeros(()),
+        "nearest_target_index_mean": nearest_indices.float().mean().detach(),
+    }
+    terms.update(source_terms)
+    return terms
+
+
 def compute_stage2_loss(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
     cfg: dict[str, Any],
     compute_diagnostics: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """Compute SPACE-Former region, set-prediction and source losses."""
+    """Compute the configured Stage 2 architecture loss."""
+    if str(cfg.get("model", {}).get("type", "space_former")).lower() == DIRECT_BOX_MODEL_TYPE:
+        return compute_direct_box_1q_loss(outputs, batch, cfg)
     loss_cfg = cfg["loss"]
     focal_cfg = loss_cfg.get("focal", {})
     sigma = float(cfg["data"].get("heatmap_sigma_voxels", 2.0)) * float(
@@ -1302,7 +1398,7 @@ def _build_lr_scheduler(
     )
 
 
-def load_stage1_weights(model: SPACEFormerStage2, checkpoint_path: str | Path, device: torch.device) -> list[str]:
+def load_stage1_weights(model: torch.nn.Module, checkpoint_path: str | Path, device: torch.device) -> list[str]:
     """Initialize shared Stage 1 modules from a Stage 1 checkpoint."""
     checkpoint = torch.load(Path(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
@@ -1403,7 +1499,7 @@ def train_stage2(
         )
         validation_contexts = build_stage2_validation_contexts(val_set.items)
 
-        model = SPACEFormerStage2(cfg["model"]).to(device)
+        model = build_stage2_model(cfg["model"]).to(device)
         init_checkpoint = stage1_checkpoint or cfg["training"].get("stage1_pretrained_checkpoint")
         if resume_checkpoint is None and init_checkpoint:
             skipped = load_stage1_weights(model, init_checkpoint, device)
@@ -1577,7 +1673,7 @@ def train_stage2(
 
 @torch.no_grad()
 def evaluate_stage2(
-    model: SPACEFormerStage2 | DistributedDataParallel,
+    model: torch.nn.Module | DistributedDataParallel,
     loader: DataLoader,
     cfg: dict[str, Any],
     device: torch.device,
@@ -1587,6 +1683,7 @@ def evaluate_stage2(
 ) -> dict[str, float]:
     """Evaluate Stage 2 on one dataloader."""
     model.eval()
+    tracks_p3_coverage = str(cfg.get("model", {}).get("type", "space_former")).lower() == "space_former"
     totals = {
         "loss_sum": 0.0,
         "sample_count": 0.0,
@@ -1618,9 +1715,10 @@ def evaluate_stage2(
         losses = compute_stage2_loss(outputs, batch, cfg)
         metric_sums = compute_stage2_task_metric_sums(outputs, batch, cfg)
         totals["loss_sum"] += float(losses["loss"].detach().cpu()) * metric_sums["sample_count"]
-        totals["p3_gt_point_coverage_sum"] += (
-            float(losses["p3_gt_point_coverage"].detach().cpu()) * metric_sums["sample_count"]
-        )
+        if tracks_p3_coverage:
+            totals["p3_gt_point_coverage_sum"] += (
+                float(losses["p3_gt_point_coverage"].detach().cpu()) * metric_sums["sample_count"]
+            )
         for key, value in metric_sums.items():
             totals[key] += value
         for key, value in losses.items():
@@ -1672,8 +1770,9 @@ def evaluate_stage2(
         "duplicate_pair_rate": totals["duplicate_pair_count"] / possible_pair_count,
         "source_center_mae": totals["source_center_mae_sum"] / sample_count,
         "source_size_iou": totals["source_size_iou_sum"] / sample_count,
-        "p3_gt_point_coverage": totals["p3_gt_point_coverage_sum"] / sample_count,
     }
+    if tracks_p3_coverage:
+        metrics["p3_gt_point_coverage"] = totals["p3_gt_point_coverage_sum"] / sample_count
     sampling_metrics = dict(validation_log_sums)
     for key, value in validation_log_sums.items():
         denominator_key = None

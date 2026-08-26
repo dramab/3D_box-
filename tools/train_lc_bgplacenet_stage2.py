@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Train LC-BGPlaceNet Stage 2: dense 3D placement field.
+Train a configured LC-BGPlaceNet Stage 2 placement model.
 
 使用示例:
      python tools/train_lc_bgplacenet_stage2.py \
@@ -39,7 +39,7 @@ from src.training.lc_bgplacenet_stage2 import load_config, train_stage2
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Train LC-BGPlaceNet Stage 2.")
+    parser = argparse.ArgumentParser(description="Train a configured LC-BGPlaceNet Stage 2 model.")
     parser.add_argument("--config", type=Path, required=True, help="Stage 2 YAML config path.")
     parser.add_argument("--stage1-checkpoint", type=Path, default=None, help="Stage 1 checkpoint for initialization.")
     parser.add_argument("--resume", type=Path, default=None, help="Resume training from a Stage 2 checkpoint.")

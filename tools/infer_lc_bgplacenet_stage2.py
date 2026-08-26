@@ -36,7 +36,6 @@ os.environ.setdefault("MPLCONFIGDIR", os.fspath(PROJECT_ROOT / "outputs" / ".mat
 from src.annotation.free_bbox.io_utils import load_ply, save_ply
 from src.datasets.canonical import ObjectInfo, load_canonical_scene
 from src.models.lc_bgplacenet.stage2 import (
-    LCBGPlaceNetDensePlacement,
     boxes_from_bottom_centers,
     pose_nms,
 )
@@ -45,6 +44,7 @@ from src.training.lc_bgplacenet_stage2 import (
     _quantize_world_points,
     build_sources_from_config,
     build_stage2_index,
+    build_stage2_model,
     load_config,
     move_batch_to_device,
     normalize_stage1_split,
@@ -314,9 +314,9 @@ def resolve_device(cfg: dict[str, Any], override: str | None) -> torch.device:
     return device
 
 
-def load_model(cfg: dict[str, Any], checkpoint_path: Path, device: torch.device) -> LCBGPlaceNetDensePlacement:
+def load_model(cfg: dict[str, Any], checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
     """Load a Stage 2 model checkpoint for inference."""
-    model = LCBGPlaceNetDensePlacement(cfg["model"]).to(device)
+    model = build_stage2_model(cfg["model"]).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     model.load_state_dict(state_dict)
@@ -460,7 +460,7 @@ def export_visualization(
 
 
 def build_decoder_stage_predictions(outputs: dict[str, torch.Tensor]) -> list[dict[str, torch.Tensor]]:
-    """Postprocess all four decoder layers without changing the final prediction path."""
+    """Postprocess every available decoder stage and the final prediction."""
     query_valid_mask = outputs["query_valid_mask"]
     source_size = outputs["source_box"][:, 3:6].clamp_min(1e-4)
     stages = []
@@ -626,9 +626,19 @@ def main() -> None:
             placement_scores = outputs["place_scores"].detach().cpu().numpy()
             placement_yaw_bins = outputs["place_yaw_bins"].detach().cpu().numpy()
             placement_valid = outputs["place_valid_mask"].detach().cpu().numpy()
-            region_scores = torch.sigmoid(outputs["region_logits"]).detach().cpu().numpy()
-            region_points = outputs["region_world_coords"].detach().cpu().numpy()
-            region_batch_indices = outputs["region_batch_indices"].detach().cpu().numpy()
+            has_region_prediction = "region_logits" in outputs
+            region_scores = (
+                torch.sigmoid(outputs["region_logits"]).detach().cpu().numpy()
+                if has_region_prediction else None
+            )
+            region_points = (
+                outputs["region_world_coords"].detach().cpu().numpy()
+                if has_region_prediction else None
+            )
+            region_batch_indices = (
+                outputs["region_batch_indices"].detach().cpu().numpy()
+                if has_region_prediction else None
+            )
             decoder_stages = [
                 {key: value.detach().cpu().numpy() for key, value in stage.items()}
                 for stage in build_decoder_stage_predictions(outputs)
@@ -637,17 +647,21 @@ def main() -> None:
             for row_idx, item in enumerate(raw_items):
                 stem = f"{item.item_id}__{item.sample_id}__{item.object_id}__cluster_{item.cluster_id:03d}"
                 vis_path = output_dir / f"{stem}.png"
-                pred_heatmap_path = heatmap_dir / f"{stem}__pred_heatmap.ply"
+                pred_heatmap_path = (
+                    heatmap_dir / f"{stem}__pred_heatmap.ply"
+                    if has_region_prediction else None
+                )
                 decoder_stage_paths = [
                     decoder_stage_dir / f"{stem}__decoder_{stage_index}.png"
-                    for stage_index in range(1, 5)
+                    for stage_index in range(1, len(decoder_stages) + 1)
                 ]
-                row_mask = region_batch_indices == row_idx
-                save_predicted_heatmap_ply(
-                    pred_heatmap_path,
-                    region_points[row_mask],
-                    region_scores[row_mask],
-                )
+                if has_region_prediction:
+                    row_mask = region_batch_indices == row_idx
+                    save_predicted_heatmap_ply(
+                        pred_heatmap_path,
+                        region_points[row_mask],
+                        region_scores[row_mask],
+                    )
                 export_visualization(
                     item,
                     source_boxes[row_idx],
@@ -691,7 +705,9 @@ def main() -> None:
                         "place_box_gt": item.place_box_gt.tolist(),
                         "best_place_score": float(placement_scores[row_idx, 0]),
                         "visualization_png": os.fspath(vis_path),
-                        "pred_heatmap_ply": os.fspath(pred_heatmap_path),
+                        "pred_heatmap_ply": (
+                            os.fspath(pred_heatmap_path) if pred_heatmap_path is not None else None
+                        ),
                         "decoder_stages": [
                             decoder_stage_to_record(stage_index, stage, stage_path)
                             for stage_index, (stage, stage_path) in enumerate(
