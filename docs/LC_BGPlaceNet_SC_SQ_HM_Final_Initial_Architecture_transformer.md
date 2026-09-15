@@ -33,7 +33,7 @@ a_i = logsumexp_j(a_ij) - log(number_of_valid_tokens)
 region_logit_i = a_i + MLP([f_i, a_i])
 ```
 
-Region GT 直接在 P3 world coordinates 上，以 `direction_filtered_heatmaps` 正点为中心生成三维高斯 soft target，并在由 P1 active support 聚合得到的 P3 support 外置零；标准差由 `data.heatmap_sigma_voxels × data.voxel_size_cm` 唯一定义。推理按 `space_former.num_region_cells` 直接取每个样本 top-K，当前为 top-8，不设阈值。`p3_gt_point_coverage` 统计每条样本 direction-positive GT 点落入实际 top-8 cell 的比例，并进行样本宏平均。
+Region GT 直接在 P3 world coordinates 上，以 `direction_filtered_heatmaps` 正点为中心生成三维高斯 soft target，并在 P1 active support 聚合得到的 P3 support mask 与方向合法 P3 mask 之外置零；标准差由 `data.heatmap_sigma_voxels × data.voxel_size_cm` 唯一定义。推理按 `space_former.num_region_cells` 直接取每个样本 top-K，当前为 top-8，不设阈值。`p3_gt_point_coverage` 统计每条样本 direction-positive GT 点落入实际 top-8 cell 的比例，并进行样本宏平均。
 
 ## 3. Query
 

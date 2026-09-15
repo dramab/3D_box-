@@ -1,16 +1,12 @@
 data:
-  # 输入 active 点云的体素大小，单位为厘米；应与 point_clouds_voxel_1cm 保持一致。
-  voxel_size_cm: 1.0
-  # direction-filtered 正点高斯监督的标准差；高斯仅保留在方向合法 P3 cell 内。
-  heatmap_sigma_voxels: 8.0
-  # 复用由旧 active_aligned 逐条映射得到的 enriched train/valid/test 划分文件。
+  # 与 enriched 主模型和 Direct-Box baseline 共用固定划分。
   split_dir: data/splits/active_aligned_enriched
+  voxel_size_cm: 1.0
   valid_fraction: 0.1
   test_fraction: 0.1
   split_seed: 20260624
   max_train_samples:
   max_valid_samples:
-  # canonical 数据源，以及对应生成的 free_bbox placement 和 enriched label 结果。
   sources:
     - name: dopose
       dataset_dir: data/dopose
@@ -34,6 +30,7 @@ data:
       labels_path: outputs/enriched_label_outputs_ycbv/auto_labels_ycbv/all_labels_enriched.json
 
 model:
+  type: direct_box_1q_pabr
   hidden_dim: 256
   backbone:
     type: spconv
@@ -52,28 +49,25 @@ model:
     num_heads: 8
     num_layers: 4
     dropout: 0.1
-  space_former:
+  direct_box:
+    # 单 Query 全局解码器先预测粗中心和粗 yaw。
+    num_heads: 8
+    num_layers: 4
+    dropout: 0.1
+  pabr:
+    # 从粗 yaw 开始对齐 Source Box 边界，并在 P1/P2/P3 上迭代细化。
     voxel_size_cm: 1.0
     num_heads: 8
+    num_layers: 4
     dropout: 0.1
-    # Text-Guided Region Cross Encoder 的 Cross Block 层数。
-    region_cross_num_layers: 4
-    # P3 hard proposal 保留得分最高的 8 个区域，再展开为固定 48 个 Query。
-    num_region_cells: 8
 
 loss:
-  # Source Size 归一化中心距离超过该代价时，Hungarian 可将 Query 分配给背景。
-  background_match_cost: 0.25
-  lambda_region: 500.0
-  lambda_cls: 1.0
   lambda_center: 5.0
   lambda_yaw: 0.5
   lambda_corner: 0.5
   lambda_src: 0.5
+  # 粗 Direct-Box 输出和前三层 PABR 共用最终层选定的最近合法目标。
   lambda_aux: 0.1
-  focal:
-    alpha: 0.25
-    gamma: 2.0
   source:
     lambda_center: 4.0
     lambda_size: 2.0
@@ -87,8 +81,8 @@ validation:
   support_upper_cm: 1.0
 
 training:
-  output_dir: outputs/lc_bgplacenet_stage2_space_former_aligned_loss_48query_full_gt_guass_8_enriched_placement_success
-  # 留空表示不从配置默认加载 Stage 1 checkpoint；可通过 CLI --stage1-checkpoint 显式传入。
+  output_dir: outputs/lc_bgplacenet_stage2_direct_box_1q_pabr_enriched
+  # 训练命令显式传入 Direct-Box checkpoint，兼容加载其全部已有参数。
   stage1_pretrained_checkpoint:
   device: auto
   seed: 20260624
@@ -98,7 +92,7 @@ training:
   pin_memory: true
   progress_bar: true
   lr: 0.0001
-  # Stage 1 参数组自动使用主学习率的 0.1 倍；ReduceLROnPlateau 监控 placement_success_at_1。
+  # 共享 Stage 1 参数使用 0.1 倍学习率；PABR 和 Direct-Box 头使用完整学习率。
   lr_scheduler:
     type: reduce_on_plateau
     mode: max

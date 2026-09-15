@@ -44,6 +44,7 @@ from src.training.lc_bgplacenet_stage2 import (
     _override_optimizer_learning_rates,
     build_space_former_targets,
     build_dense_heatmap_targets,
+    build_p3_direction_valid_mask,
     build_stage2_index,
     compute_p3_gt_point_coverage,
     compute_stage2_loss,
@@ -556,6 +557,34 @@ def test_region_gaussian_target_is_zero_outside_active_support() -> None:
     )
 
     torch.testing.assert_close(targets, torch.tensor([1.0, 0.0]))
+
+
+def test_p3_direction_mask_blocks_gaussian_across_relation_boundary() -> None:
+    region_coords = torch.tensor([
+        [0, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 2, 0, 0],
+    ])
+    direction_mask = build_p3_direction_valid_mask(
+        region_coords=region_coords,
+        region_spatial_shape=[3, 1, 1],
+        voxel_origins=torch.zeros(1, 3),
+        positive_points=torch.tensor([[0.1, 0.0, 0.0]]),
+        positive_batch_indices=torch.tensor([0]),
+        voxel_size_cm=1.0,
+    )
+    targets = build_dense_heatmap_targets(
+        world_coords=torch.tensor([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [8.0, 0.0, 0.0]]),
+        batch_indices=torch.zeros(3, dtype=torch.long),
+        positive_points=torch.tensor([[0.0, 0.0, 0.0]]),
+        positive_batch_indices=torch.tensor([0]),
+        support_masks=torch.ones(3, dtype=torch.bool) & direction_mask,
+        batch_size=1,
+        sigma=8.0,
+    )
+
+    assert direction_mask.tolist() == [True, False, False]
+    torch.testing.assert_close(targets, torch.tensor([1.0, 0.0, 0.0]))
 
 
 def test_sample_token_is_261_dims_without_scale_or_occupancy_embedding() -> None:

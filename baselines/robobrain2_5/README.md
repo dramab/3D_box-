@@ -1,6 +1,6 @@
 # RoboBrain2.5 point baseline and LoRA SFT
 
-This baseline runs RoboBrain2.5-8B-NV on every instruction in the fixed LC-BGPlaceNet test split. It is a qualitative diagnostic only: it predicts a 2D point from RGB and language, then uses the canonical RGB-D image plus oracle source geometry solely to render an upright source box at that point. It does not evaluate collision, support, yaw feasibility, or task success.
+This baseline runs RoboBrain2.5-8B-NV or RoboBrain2.5-4B on every instruction in the fixed LC-BGPlaceNet test split. It is a qualitative diagnostic: it predicts a 2D point from RGB and language, then uses the canonical RGB-D image plus oracle source geometry solely to render an upright source box at that point. The 4B and 8B variants use the same prompt, prediction format, summary, and visualization pipeline.
 
 ## Environment
 
@@ -11,7 +11,43 @@ conda activate brain
 python -c "from transformers import AutoConfig; print('transformers ready')"
 ```
 
-## Run
+## RoboBrain2.5-4B zero-shot benchmark
+
+Download the public 4B checkpoint into the adapter's ignored cache directory:
+
+```bash
+conda activate brain
+hf download BAAI/RoboBrain2.5-4B \
+  --local-dir baselines/robobrain2_5/hf_cache/RoboBrain2.5-4B
+```
+
+Run one fixed-test item first. The command uses the same transformed pointing prompt and output format as the existing 8B benchmark:
+
+```bash
+conda activate brain
+CUDA_VISIBLE_DEVICES=0 python baselines/robobrain2_5/run_zero_shot_test.py \
+  --model-variant 4b \
+  --max-samples 1
+```
+
+After checking the raw answer and visualization, run the complete fixed test split with resumable JSONL output:
+
+```bash
+conda activate brain
+CUDA_VISIBLE_DEVICES=0 python baselines/robobrain2_5/run_zero_shot_test.py \
+  --model-variant 4b
+```
+
+The 4B results are isolated under `outputs/robobrain2_5_4b_front_behind_swapped/` and have the same layout as the 8B results:
+
+- `predictions.jsonl`: one durable row per instruction.
+- `summary.json`: run-health counts using the same fields as 8B.
+- `visualizations/`: predicted point/box and GT overlays.
+- `web_vis/index.html`: static result gallery.
+
+This command does not invoke `benchmark_zero_shot.py` or compute the official placement metrics.
+
+## RoboBrain2.5-8B-NV run
 
 The checkpoint must be stored at `hf_cache/RoboBrain2.5-8B-NV/` in this directory.
 
@@ -103,6 +139,50 @@ This remains a Top-1 point baseline. The predicted `(x, y, d)` is backprojected
 without borrowing RGB-D depth. Oracle source dimensions/current yaw are still
 used after inference to construct the candidate box, Source IoU is not
 applicable, and Placement Success@5 equals Placement Success@1.
+
+### RoboBrain2.5-4B LoRA SFT
+
+The 4B experiment reuses the same generated train/validation annotations,
+prompt, LoRA targets, optimization hyperparameters, cosine learning-rate
+schedule, and fixed enriched split as the 8B experiment. Its checkpoint and
+inference outputs are isolated under
+`outputs/robobrain2_5_4b_sft_bottom_center_xyd_lora_enriched/`.
+
+Launch 4B LoRA training on eight GPUs:
+
+```bash
+conda activate brain
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+torchrun --standalone --nproc_per_node=8 \
+  baselines/robobrain2_5/finetune/train_lora.py \
+  --config configs/robobrain2_5_4b_sft_point_lora.yaml
+```
+
+Run the complete fixed test split with the selected 4B adapter:
+
+```bash
+conda activate brain
+CUDA_VISIBLE_DEVICES=0 python baselines/robobrain2_5/run_zero_shot_test.py \
+  --config configs/lc_bgplacenet_stage2_enriched.yaml \
+  --model-variant 4b \
+  --adapter-dir outputs/robobrain2_5_4b_sft_bottom_center_xyd_lora_enriched/checkpoints/best_adapter \
+  --prompt-variant enriched_label_bottom_center_xyd \
+  --output-dir outputs/robobrain2_5_4b_sft_bottom_center_xyd_lora_enriched/inference_test \
+  --max-new-tokens 32
+```
+
+Evaluate the 4B predictions with the same official Top-1 protocol:
+
+```bash
+conda activate spatial
+python baselines/robobrain2_5/benchmark_zero_shot.py \
+  --config configs/lc_bgplacenet_stage2_enriched.yaml \
+  --predictions outputs/robobrain2_5_4b_sft_bottom_center_xyd_lora_enriched/inference_test/predictions.jsonl \
+  --output-dir outputs/robobrain2_5_4b_sft_bottom_center_xyd_lora_enriched/benchmark_official_top1_oracle_geometry \
+  --model-label RoboBrain2.5-4B-LoRA-Bottom-Center-XYD-SFT-Enriched \
+  --training-protocol lora_sft \
+  --prediction-format xyd
+```
 
 ## Official quantitative benchmark
 

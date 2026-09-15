@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -54,3 +55,25 @@ def test_enriched_prompt_preserves_label_without_relation_rewrite() -> None:
     assert "vacant space" not in prompt
     assert "the front left of Krauter Sauce Box" not in prompt
     assert "[(x, y, d)]" in prompt
+
+
+def test_4b_sft_config_matches_8b_data_and_training_protocol() -> None:
+    config_paths = {
+        variant: PROJECT_ROOT / path
+        for variant, path in {
+            "4b": "configs/robobrain2_5_4b_sft_point_lora.yaml",
+            "8b": "configs/robobrain2_5_sft_point_lora.yaml",
+        }.items()
+    }
+    configs = {}
+    for variant, path in config_paths.items():
+        with path.open("r", encoding="utf-8") as handle:
+            configs[variant] = yaml.safe_load(handle)
+
+    assert configs["4b"]["data"] == configs["8b"]["data"]
+    assert configs["4b"]["training"] | {"output_dir": None} == configs["8b"]["training"] | {
+        "output_dir": None
+    }
+    assert configs["4b"]["model"]["lora"] == configs["8b"]["model"]["lora"]
+    assert configs["4b"]["model"]["base_model"].endswith("RoboBrain2.5-4B")
+    assert configs["4b"]["training"]["output_dir"] != configs["8b"]["training"]["output_dir"]

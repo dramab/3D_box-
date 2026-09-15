@@ -43,13 +43,52 @@ class DirectBox1QStage2(LCBGPlaceNetStage1):
         self.center_head = nn.Linear(hidden_dim, 3)
         self.yaw_head = nn.Linear(hidden_dim, NUM_YAW_BINS)
 
+    def _refine_placement(
+        self,
+        *,
+        batch: dict[str, Any],
+        fused_features: torch.Tensor,
+        source_out: dict[str, torch.Tensor],
+        text_tokens: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        placement_feature: torch.Tensor,
+        bottom_centers: torch.Tensor,
+        yaw_logits: torch.Tensor,
+        query_valid_mask: torch.Tensor,
+        collect_diagnostics: bool,
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        list[dict[str, torch.Tensor]],
+        dict[str, torch.Tensor],
+    ]:
+        """Return the unrefined Direct-Box pose; subclasses may add a refiner."""
+        del (
+            batch,
+            fused_features,
+            source_out,
+            text_tokens,
+            text_attention_mask,
+            placement_feature,
+            collect_diagnostics,
+        )
+        return (
+            {
+                "pred_bottom_centers": bottom_centers,
+                "pred_yaw_logits": yaw_logits,
+                "pred_yaw_indices": torch.argmax(yaw_logits, dim=-1),
+                # A single always-valid query has no meaningful ranking target.
+                "pred_logits": bottom_centers.new_full(query_valid_mask.shape, 20.0),
+            },
+            [],
+            {},
+        )
+
     def forward(
         self,
         batch: dict[str, Any],
         collect_diagnostics: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Run shared source grounding followed by one direct placement query."""
-        del collect_diagnostics
         batch_size = int(batch["batch_size"])
         backbone_batch = self._prepare_backbone_batch(batch)
         voxel_features = self.backbone(backbone_batch)
@@ -91,22 +130,35 @@ class DirectBox1QStage2(LCBGPlaceNetStage1):
             batch["scene_max"] - batch["scene_min"]
         ).clamp_min(1e-4)[:, None]
         yaw_logits = self.yaw_head(placement_feature)
-        yaw_bins = torch.argmax(yaw_logits, dim=-1)
         source_box = source_out["source_box"]
-        raw_boxes = boxes_from_bottom_centers(
-            bottom_centers,
-            source_box[:, 3:6].clamp_min(1e-4),
-            yaw_bins,
-        )
         query_valid_mask = torch.ones(
-            (batch_size, 1), dtype=torch.bool, device=raw_boxes.device
+            (batch_size, 1), dtype=torch.bool, device=bottom_centers.device
         )
-        # A single query is always emitted; yaw confidence is retained as its score.
-        placement_logits = raw_boxes.new_full((batch_size, 1), 20.0)
+        final, auxiliary_outputs, sampling_logs = self._refine_placement(
+            batch=batch,
+            fused_features=fused_features,
+            source_out=source_out,
+            text_tokens=text_tokens,
+            text_attention_mask=text_attention_mask,
+            placement_feature=placement_feature,
+            bottom_centers=bottom_centers,
+            yaw_logits=yaw_logits,
+            query_valid_mask=query_valid_mask,
+            collect_diagnostics=collect_diagnostics,
+        )
+        final_bottom_centers = final["pred_bottom_centers"]
+        final_yaw_logits = final["pred_yaw_logits"]
+        final_yaw_bins = final["pred_yaw_indices"]
+        placement_logits = final["pred_logits"]
+        raw_boxes = boxes_from_bottom_centers(
+            final_bottom_centers,
+            source_box[:, 3:6].clamp_min(1e-4),
+            final_yaw_bins,
+        )
         predictions = pose_nms(
             raw_boxes,
             placement_logits,
-            yaw_logits,
+            final_yaw_logits,
             query_valid_mask,
             max_outputs=1,
         )
@@ -116,9 +168,12 @@ class DirectBox1QStage2(LCBGPlaceNetStage1):
             "query_valid_mask": query_valid_mask,
             "raw_place_boxes": raw_boxes,
             "raw_place_logits": placement_logits,
-            "raw_yaw_logits": yaw_logits,
-            "raw_yaw_bins": yaw_bins,
-            "pred_bottom_centers": bottom_centers,
-            "decoder_aux_outputs": [],
+            "raw_yaw_logits": final_yaw_logits,
+            "raw_yaw_bins": final_yaw_bins,
+            "pred_bottom_centers": final_bottom_centers,
+            "initial_bottom_centers": bottom_centers,
+            "initial_yaw_logits": yaw_logits,
+            "decoder_aux_outputs": auxiliary_outputs,
+            "sampling_logs": sampling_logs,
             **predictions,
         }

@@ -9,7 +9,8 @@ Train a configured LC-BGPlaceNet Stage 2 placement model.
 
      torchrun --nproc_per_node=4 tools/train_lc_bgplacenet_stage2.py \
         --config configs/lc_bgplacenet_stage2.yaml \
-        --stage1-checkpoint outputs/lc_bgplacenet_stage1_support/best.pt
+        --stage1-checkpoint outputs/lc_bgplacenet_stage1_support/best.pt \
+        --output-dir outputs/lc_bgplacenet_stage2_new_run
 
      python tools/train_lc_bgplacenet_stage2.py \
         --config configs/lc_bgplacenet_stage2.yaml \
@@ -43,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True, help="Stage 2 YAML config path.")
     parser.add_argument("--stage1-checkpoint", type=Path, default=None, help="Stage 1 checkpoint for initialization.")
     parser.add_argument("--resume", type=Path, default=None, help="Resume training from a Stage 2 checkpoint.")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Override training.output_dir from the config.")
     parser.add_argument("--max-steps", type=int, default=None, help="Stop after N optimizer steps for smoke tests.")
     parser.add_argument("--max-train-samples", type=int, default=None, help="Limit train samples for smoke tests.")
     parser.add_argument("--max-val-samples", type=int, default=None, help="Limit validation samples for smoke tests.")
@@ -53,6 +55,8 @@ def main() -> None:
     """Load config and start Stage 2 training."""
     args = parse_args()
     cfg = load_config(args.config)
+    if args.output_dir is not None:
+        cfg["training"]["output_dir"] = os.fspath(args.output_dir)
     try:
         train_stage2(
             cfg,

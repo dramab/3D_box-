@@ -638,7 +638,13 @@ class FactorizedFusion(nn.Module):
 class SPACEFormerDecoderLayer(nn.Module):
     """One iterative size-prompted placement refinement layer."""
 
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        predict_placement_score: bool = True,
+    ) -> None:
         super().__init__()
         self.self_attention = QuerySelfAttention(hidden_dim, num_heads, dropout)
         self.geometry = GeometricRouting(hidden_dim, num_heads, dropout)
@@ -648,16 +654,31 @@ class SPACEFormerDecoderLayer(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 3)
         )
         self.yaw_head = nn.Linear(hidden_dim, NUM_YAW_BINS)
-        self.placement_head = nn.Linear(hidden_dim, 1)
+        self.placement_head = nn.Linear(hidden_dim, 1) if predict_placement_score else None
 
 
 class SPACEFormerDecoder(nn.Module):
     """Four-layer iterative rotated multi-scale decoder."""
 
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float, num_layers: int = 4) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        num_layers: int = 4,
+        predict_placement_score: bool = True,
+    ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            [SPACEFormerDecoderLayer(hidden_dim, num_heads, dropout) for _ in range(num_layers)]
+            [
+                SPACEFormerDecoderLayer(
+                    hidden_dim,
+                    num_heads,
+                    dropout,
+                    predict_placement_score=predict_placement_score,
+                )
+                for _ in range(num_layers)
+            ]
         )
 
     def forward(
@@ -673,16 +694,20 @@ class SPACEFormerDecoder(nn.Module):
         text_tokens: torch.Tensor,
         text_attention_mask: torch.Tensor,
         collect_diagnostics: bool = True,
+        initial_yaw_logits: torch.Tensor | None = None,
     ) -> tuple[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
         batch_size, num_queries, _ = query.shape
-        current_rotation = torch.eye(3, device=query.device, dtype=query.dtype)[None, None].expand(
-            batch_size, num_queries, -1, -1
-        )
+        if initial_yaw_logits is None:
+            current_rotation = torch.eye(3, device=query.device, dtype=query.dtype)[None, None].expand(
+                batch_size, num_queries, -1, -1
+            )
+        else:
+            current_rotation, _ = straight_through_yaw(initial_yaw_logits)
         layer_outputs = []
         log_totals: dict[str, torch.Tensor] = {}
         for layer_index, layer in enumerate(self.layers):
             query = layer.self_attention(query, query_valid_mask)
-            if layer_index == 0:
+            if layer_index == 0 and initial_yaw_logits is None:
                 local_offsets_single, normalized_single, is_bottom = build_cylinder_template(source_size, voxel_size_cm)
             else:
                 local_offsets_single, normalized_single, is_bottom = build_box_surface_template(source_size, voxel_size_cm)
@@ -749,8 +774,11 @@ class SPACEFormerDecoder(nn.Module):
             world_residual = torch.einsum("bnij,bnj->bni", current_rotation, local_residual)
             bottom_centers = (bottom_centers + world_residual) * query_valid_mask[..., None]
             yaw_logits = layer.yaw_head(query)
-            placement_logits = layer.placement_head(query).squeeze(-1)
-            placement_logits = placement_logits.masked_fill(~query_valid_mask, -20.0)
+            if layer.placement_head is None:
+                placement_logits = query.new_full(query_valid_mask.shape, 20.0)
+            else:
+                placement_logits = layer.placement_head(query).squeeze(-1)
+                placement_logits = placement_logits.masked_fill(~query_valid_mask, -20.0)
             current_rotation, yaw_indices = straight_through_yaw(yaw_logits)
             layer_outputs.append(
                 {

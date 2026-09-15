@@ -13,6 +13,8 @@ Direct-Box 1Q是完整模型的单解直接回归baseline。它复用Stage 1的C
 
 模型不使用Heatmap、LMPQ、Hungarian集合匹配、PABR或物理后处理。因为只有一个Placement Query，`Placement Success@5`与`Placement Success@1`相同。
 
+在相同单Query粗预测上增加PABR的独立消融模型见`docs/lc_bgplacenet_stage2_direct_box_pabr_training.md`；纯Direct-Box配置和输出目录保持不变。
+
 ## 数据划分
 
 配置固定读取：

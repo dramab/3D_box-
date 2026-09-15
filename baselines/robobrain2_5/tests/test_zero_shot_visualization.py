@@ -21,6 +21,7 @@ from baselines.robobrain2_5.zero_shot_visualization import (
     upright_box_corners,
 )
 from baselines.robobrain2_5.run_zero_shot_test import (
+    MODEL_VARIANTS,
     OFFICIAL_POINTING_SUFFIX,
     load_ground_truth_placement,
     load_sources,
@@ -144,3 +145,12 @@ def test_ground_truth_placement_matches_fixed_split_label() -> None:
     ground_truth = load_ground_truth_placement(item, load_sources(config_path)[str(item["source_name"])])
     assert np.asarray(ground_truth["corners"]).shape == (8, 3)
     assert np.isclose(np.asarray(ground_truth["bottom_center_world"])[2], 0.5)
+
+
+def test_4b_uses_the_same_runner_with_isolated_paths() -> None:
+    four_b = MODEL_VARIANTS["4b"]
+    eight_b = MODEL_VARIANTS["8b-nv"]
+
+    assert four_b["model_dir"].name == "RoboBrain2.5-4B"
+    assert four_b["model_dir"] != eight_b["model_dir"]
+    assert four_b["output_dir"] != eight_b["output_dir"]

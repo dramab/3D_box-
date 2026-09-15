@@ -2,9 +2,9 @@
 """Run RoboBrain2.5 zero-shot point prediction and render every fixed test item.
 
 Usage:
-    conda activate vlm_qwen
+    conda activate brain
     python baselines/robobrain2_5/run_zero_shot_test.py \
-        --model-dir baselines/robobrain2_5/hf_cache/RoboBrain2.5-8B-NV
+        --model-variant 4b
 """
 
 from __future__ import annotations
@@ -44,8 +44,19 @@ from src.datasets.canonical import load_sample_record
 
 
 DEFAULT_CONFIG = PROJECT_ROOT / "configs/lc_bgplacenet_stage2.yaml"
-DEFAULT_MODEL_DIR = PROJECT_ROOT / "baselines/robobrain2_5/hf_cache/RoboBrain2.5-8B-NV"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs/robobrain2_5_front_behind_swapped"
+MODEL_VARIANTS = {
+    "8b-nv": {
+        "model_dir": Path("baselines/robobrain2_5/hf_cache/RoboBrain2.5-8B-NV"),
+        "output_dir": Path("outputs/robobrain2_5_front_behind_swapped"),
+    },
+    "4b": {
+        "model_dir": Path("baselines/robobrain2_5/hf_cache/RoboBrain2.5-4B"),
+        "output_dir": Path("outputs/robobrain2_5_4b_front_behind_swapped"),
+    },
+}
+DEFAULT_MODEL_VARIANT = "8b-nv"
+DEFAULT_MODEL_DIR = PROJECT_ROOT / MODEL_VARIANTS[DEFAULT_MODEL_VARIANT]["model_dir"]
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / MODEL_VARIANTS[DEFAULT_MODEL_VARIANT]["output_dir"]
 ENRICHED_BOTTOM_CENTER_XYD_PROMPT_VARIANT = "enriched_label_bottom_center_xyd"
 
 
@@ -98,14 +109,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run RoboBrain2.5 point prediction on the fixed test split.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--split", choices=("test",), default="test")
-    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    parser.add_argument(
+        "--model-variant",
+        choices=tuple(MODEL_VARIANTS),
+        default=DEFAULT_MODEL_VARIANT,
+        help="Select the checkpoint and isolated output defaults.",
+    )
+    parser.add_argument("--model-dir", type=Path, default=None, help="Override the selected checkpoint directory.")
     parser.add_argument("--adapter-dir", type=Path, default=None, help="Optional local PEFT/LoRA adapter directory.")
     parser.add_argument(
         "--prompt-variant",
         choices=("official_vacant_space_front_behind_swapped", ENRICHED_BOTTOM_CENTER_XYD_PROMPT_VARIANT),
         default="official_vacant_space_front_behind_swapped",
     )
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", type=Path, default=None, help="Override the selected isolated output directory.")
     parser.add_argument("--max-new-tokens", type=int, default=768)
     parser.add_argument("--max-samples", type=int, default=None, help="Only for a smoke run; omit for all fixed test items.")
     parser.add_argument("--no-resume", action="store_true", help="Fail if result rows already exist instead of resuming.")
@@ -242,7 +259,7 @@ class RoboBrainPointModel:
 
         if not torch.cuda.is_available():
             raise RuntimeError(
-                "RoboBrain2.5-8B-NV inference requires a CUDA-visible GPU; refusing an impractical CPU fallback."
+                "RoboBrain2.5 inference requires a CUDA-visible GPU; refusing an impractical CPU fallback."
             )
         self.torch = torch
         self.process_vision_info = process_vision_info
@@ -356,8 +373,9 @@ def finalize(output_dir: Path) -> None:
 
 def main() -> None:
     args = parse_args()
+    model_variant = MODEL_VARIANTS[args.model_variant]
     config_path = resolve_path(args.config)
-    output_dir = resolve_path(args.output_dir)
+    output_dir = resolve_path(args.output_dir or model_variant["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = output_dir / "predictions.jsonl"
     if args.finalize_only:
@@ -370,12 +388,12 @@ def main() -> None:
     if args.max_samples is not None:
         items = items[: int(args.max_samples)]
     completed = {str(row["item_id"]) for row in load_jsonl(predictions_path)}
-    model_dir = resolve_path(args.model_dir)
+    model_dir = resolve_path(args.model_dir or model_variant["model_dir"])
     if not (model_dir / "config.json").exists():
         raise FileNotFoundError(f"RoboBrain checkpoint is incomplete: {model_dir}")
     adapter_dir = resolve_path(args.adapter_dir) if args.adapter_dir is not None else None
     if adapter_dir is not None:
-        if output_dir == DEFAULT_OUTPUT_DIR:
+        if args.output_dir is None:
             raise ValueError("A fine-tuned adapter requires a distinct --output-dir; refusing to mix zero-shot results.")
         if not (adapter_dir / "adapter_config.json").exists():
             raise FileNotFoundError(f"RoboBrain LoRA adapter is incomplete: {adapter_dir}")

@@ -196,4 +196,15 @@ python tools/render_lc_bgplacenet_stage2_point_boxes.py \
 
 两张图均使用完整 1 cm RGB 体素点云、`24 pt²` 点面积和 `35°` 目标俯仰角，并采用相同的白底、原相机方位、紧凑裁剪与无坐标轴样式。第一张仅显示橙色虚线原物体框；第二张同时显示橙色虚线原物体框和紫色实线预测放置框。PNG 与同名矢量 PDF 会同时生成。
 
+如需用单个发光点展示 point-based placement，可直接复用无框稀疏体素图作为底图：
+
+```bash
+python tools/render_glowing_placement_point.py \
+    --input-image outputs/visualizations/hope__scene_0000__0005_sparse_voxels_oblique_3d.png \
+    --output-path outputs/visualizations/hope__scene_0000__0005_glowing_point.png \
+    --point-x 390 --point-y 411
+```
+
+该工具只绘制一个蓝色发光点，不读取模型 heatmap。`point-x` 与 `point-y` 是最终图像中的像素坐标；输出图保持输入图的尺寸、视角和 RGB 点云样式，并同时生成同名 PDF。
+
 如需论文中独立展示 Stage-2 P3 响应，可在 `render_lc_bgplacenet_stage2_point_mask.py` 中增加 `--heatmap-only` 并提供 `--support-mask`。该模式绘制完整 1 cm 环境体素点阵：支撑面以 `1.25 cm` 高度容差判定，其上的点继承所属 P3 cell 响应并使用蓝—青—黄—红热力色；非支撑面点统一使用不透明中性灰 `#6B7280`，两类点均使用相同点面积。输出删除 RGB 颜色、坐标轴、网格、标签和 3D box，保持样本原相机方位，默认使用 `24 pt²` 点面积和 `35°` 斜俯视角；后两者可分别通过 `--heatmap-only-point-size` 和 `--heatmap-only-view-elev` 调整，同时导出同名 PNG 与 PDF。

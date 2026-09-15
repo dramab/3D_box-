@@ -1,8 +1,8 @@
 """
 LC-BGPlaceNet Stage 2 training utilities.
 
-Stage 2 trains either SPACE-Former set prediction or the Direct-Box 1Q baseline
-from canonical active voxels, language and free_bbox center/yaw supervision.
+Stage 2 trains SPACE-Former set prediction, Direct-Box 1Q, or Direct-Box 1Q
+with PABR from canonical active voxels, language and free_bbox supervision.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from src.annotation.free_bbox.geometry import get_bbox_corners, transform_points
 from src.annotation.free_bbox.io_utils import load_ply
 from src.datasets.canonical import CameraParams, load_sample_record
 from src.models.lc_bgplacenet.direct_box import DirectBox1QStage2
+from src.models.lc_bgplacenet.direct_box_pabr import DirectBox1QPABRStage2
 from src.models.lc_bgplacenet.stage2 import (
     NUM_QUERIES,
     NUM_YAW_BINS,
@@ -72,6 +73,8 @@ from src.training.lc_bgplacenet_stage1 import (
 
 BOX_COLLISION_EPS_CM = 1e-6
 DIRECT_BOX_MODEL_TYPE = "direct_box_1q"
+DIRECT_BOX_PABR_MODEL_TYPE = "direct_box_1q_pabr"
+DIRECT_BOX_MODEL_TYPES = frozenset((DIRECT_BOX_MODEL_TYPE, DIRECT_BOX_PABR_MODEL_TYPE))
 
 
 def build_stage2_model(model_cfg: dict[str, Any]) -> torch.nn.Module:
@@ -81,6 +84,8 @@ def build_stage2_model(model_cfg: dict[str, Any]) -> torch.nn.Module:
         return SPACEFormerStage2(model_cfg)
     if model_type == DIRECT_BOX_MODEL_TYPE:
         return DirectBox1QStage2(model_cfg)
+    if model_type == DIRECT_BOX_PABR_MODEL_TYPE:
+        return DirectBox1QPABRStage2(model_cfg)
     raise ValueError(f"Unsupported Stage 2 model type: {model_type}")
 
 
@@ -740,6 +745,46 @@ def build_dense_heatmap_targets(
     return targets * support_masks.to(dtype=targets.dtype)
 
 
+def build_p3_direction_valid_mask(
+    region_coords: torch.Tensor,
+    region_spatial_shape: list[int],
+    voxel_origins: torch.Tensor,
+    positive_points: torch.Tensor,
+    positive_batch_indices: torch.Tensor,
+    voxel_size_cm: float,
+) -> torch.Tensor:
+    """Mark P3 cells containing at least one direction-valid positive point."""
+    spatial_shape = torch.as_tensor(
+        region_spatial_shape,
+        device=region_coords.device,
+        dtype=torch.long,
+    )
+    positive_coords = torch.floor(
+        (
+            positive_points
+            - voxel_origins[positive_batch_indices.long()]
+        )
+        / (4.0 * float(voxel_size_cm))
+    ).long()
+    in_bounds = ((positive_coords >= 0) & (positive_coords < spatial_shape)).all(dim=-1)
+    positive_sparse_coords = torch.cat(
+        [positive_batch_indices[:, None].long(), positive_coords],
+        dim=1,
+    )[in_bounds]
+
+    def linear_key(coords: torch.Tensor) -> torch.Tensor:
+        return (
+            ((coords[:, 0] * spatial_shape[0] + coords[:, 1]) * spatial_shape[1] + coords[:, 2])
+            * spatial_shape[2]
+            + coords[:, 3]
+        )
+
+    return torch.isin(
+        linear_key(region_coords.long()),
+        linear_key(positive_sparse_coords),
+    )
+
+
 def focal_loss_with_logits(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -993,20 +1038,15 @@ def select_nearest_direct_box_targets(
     )
 
 
-def compute_direct_box_1q_loss(
-    outputs: dict[str, torch.Tensor],
-    batch: dict[str, torch.Tensor],
-    cfg: dict[str, Any],
-) -> dict[str, torch.Tensor]:
-    """Compute nearest-valid-center, multi-yaw, corner and source losses."""
-    loss_cfg = cfg["loss"]
-    pred_center = outputs["pred_bottom_centers"][:, 0]
-    pred_yaw_logits = outputs["raw_yaw_logits"][:, 0]
-    nearest_indices, target_center, target_yaw_mask = select_nearest_direct_box_targets(
-        pred_center, batch
-    )
-    target_size = batch["source_box_gt"][:, 3:6].clamp_min(1e-4)
-    pred_size = outputs["source_box"][:, 3:6].clamp_min(1e-4)
+def _direct_box_pose_losses(
+    pred_center: torch.Tensor,
+    pred_yaw_logits: torch.Tensor,
+    pred_size: torch.Tensor,
+    target_center: torch.Tensor,
+    target_yaw_mask: torch.Tensor,
+    target_size: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute center, multi-yaw and corner losses for one fixed target per sample."""
     center_loss = F.smooth_l1_loss(
         (pred_center - target_center) / target_size,
         torch.zeros_like(pred_center),
@@ -1023,6 +1063,51 @@ def compute_direct_box_1q_loss(
         target_size,
         target_yaw_mask,
     )
+    return center_loss, yaw_loss, corner_loss
+
+
+def compute_direct_box_1q_loss(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    cfg: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Compute nearest-valid-center, multi-yaw, corner and source losses."""
+    loss_cfg = cfg["loss"]
+    pred_center = outputs["pred_bottom_centers"][:, 0]
+    pred_yaw_logits = outputs["raw_yaw_logits"][:, 0]
+    nearest_indices, target_center, target_yaw_mask = select_nearest_direct_box_targets(
+        pred_center, batch
+    )
+    target_size = batch["source_box_gt"][:, 3:6].clamp_min(1e-4)
+    pred_size = outputs["source_box"][:, 3:6].clamp_min(1e-4)
+    center_loss, yaw_loss, corner_loss = _direct_box_pose_losses(
+        pred_center,
+        pred_yaw_logits,
+        pred_size,
+        target_center,
+        target_yaw_mask,
+        target_size,
+    )
+    auxiliary_terms = []
+    for prediction in outputs.get("decoder_aux_outputs", []):
+        aux_center, aux_yaw, aux_corner = _direct_box_pose_losses(
+            prediction["pred_bottom_centers"][:, 0],
+            prediction["pred_yaw_logits"][:, 0],
+            pred_size,
+            target_center,
+            target_yaw_mask,
+            target_size,
+        )
+        auxiliary_terms.append(
+            float(loss_cfg.get("lambda_center", 5.0)) * aux_center
+            + float(loss_cfg.get("lambda_yaw", 0.5)) * aux_yaw
+            + float(loss_cfg.get("lambda_corner", 0.5)) * aux_corner
+        )
+    auxiliary = (
+        torch.stack(auxiliary_terms).mean()
+        if auxiliary_terms
+        else pred_center.sum() * 0.0
+    )
     source_cfg = loss_cfg["source"]
     source_loss, source_terms = source_box_loss(
         outputs["source_box"],
@@ -1036,6 +1121,7 @@ def compute_direct_box_1q_loss(
         + float(loss_cfg.get("lambda_yaw", 0.5)) * yaw_loss
         + float(loss_cfg.get("lambda_corner", 0.5)) * corner_loss
         + float(loss_cfg.get("lambda_src", 0.5)) * source_loss
+        + float(loss_cfg.get("lambda_aux", 0.0)) * auxiliary
     )
     sample_count = pred_center.new_tensor(float(len(pred_center)))
     terms = {
@@ -1043,6 +1129,7 @@ def compute_direct_box_1q_loss(
         "loss_center": center_loss.detach(),
         "loss_yaw": yaw_loss.detach(),
         "loss_corner": corner_loss.detach(),
+        "loss_aux": auxiliary.detach(),
         "loss_src": source_loss.detach(),
         "valid_query_count": sample_count,
         "matched_query_count": sample_count,
@@ -1050,6 +1137,8 @@ def compute_direct_box_1q_loss(
         "padded_query_count": sample_count.new_zeros(()),
         "nearest_target_index_mean": nearest_indices.float().mean().detach(),
     }
+    for key, value in outputs.get("sampling_logs", {}).items():
+        terms[key] = value.detach()
     terms.update(source_terms)
     return terms
 
@@ -1061,7 +1150,7 @@ def compute_stage2_loss(
     compute_diagnostics: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Compute the configured Stage 2 architecture loss."""
-    if str(cfg.get("model", {}).get("type", "space_former")).lower() == DIRECT_BOX_MODEL_TYPE:
+    if str(cfg.get("model", {}).get("type", "space_former")).lower() in DIRECT_BOX_MODEL_TYPES:
         return compute_direct_box_1q_loss(outputs, batch, cfg)
     loss_cfg = cfg["loss"]
     focal_cfg = loss_cfg.get("focal", {})
@@ -1075,12 +1164,22 @@ def compute_stage2_loss(
         outputs["region_spatial_shape"],
         stride=4,
     )
+    region_direction_mask = build_p3_direction_valid_mask(
+        outputs["region_sparse_coords"],
+        outputs["region_spatial_shape"],
+        outputs["voxel_origins"],
+        batch["heatmap_positive_points"],
+        batch["heatmap_positive_batch_indices"],
+        float(cfg["data"]["voxel_size_cm"]),
+    )
     region_target = build_dense_heatmap_targets(
         world_coords=outputs["region_world_coords"],
         batch_indices=outputs["region_batch_indices"],
         positive_points=batch["heatmap_positive_points"],
         positive_batch_indices=batch["heatmap_positive_batch_indices"],
-        support_masks=region_support_mask,
+        # Gaussian supervision may smooth within direction-valid P3 cells but
+        # must never leak into a cell containing only another relation.
+        support_masks=region_support_mask & region_direction_mask,
         batch_size=int(batch["batch_size"]),
         sigma=sigma,
     )

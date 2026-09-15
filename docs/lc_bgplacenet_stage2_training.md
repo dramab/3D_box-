@@ -2,7 +2,7 @@
 
 Stage 2 使用 `SPACE-Former`（Size-Prompted Affordance and Collision Explorer）完成有界集合预测。模型复用并联合训练 Stage 1 的 Backbone、语言融合与 Source Grounding；CLIP 延续配置中的冻结状态。
 
-单Placement Query直接回归baseline使用独立配置`configs/lc_bgplacenet_stage2_direct_box_1q_enriched.yaml`，其结构、固定enriched划分和训练方法见`docs/lc_bgplacenet_stage2_direct_box_training.md`。
+单Placement Query直接回归baseline使用独立配置`configs/lc_bgplacenet_stage2_direct_box_1q_enriched.yaml`，其结构、固定enriched划分和训练方法见`docs/lc_bgplacenet_stage2_direct_box_training.md`。在该粗预测上增加PABR的消融配置为`configs/lc_bgplacenet_stage2_direct_box_1q_pabr_enriched.yaml`，训练方法见`docs/lc_bgplacenet_stage2_direct_box_pabr_training.md`。
 
 ## 数据与监督
 
@@ -40,7 +40,7 @@ yaw_bins         = 12
 max output       = 16
 ```
 
-P3 粗区域预测使用 P3 feature 和完整 `text_tokens`。每个有效 token 先查询 P3 memory，再与各 P3 cell 计算 compatibility，并通过带 attention mask 的 log-mean-exp 聚合，使方向词和对象词的强匹配能够主导区域分数。Cross Block 层数由 `model.space_former.region_cross_num_layers` 控制，当前为 4。Region target 由 `direction_filtered_heatmaps` 正点生成三维高斯分布，并在由 P1 active support 聚合得到的 P3 support 外置零；标准差为 `data.heatmap_sigma_voxels × data.voxel_size_cm`，当前为 8 cm。`space_former.num_region_cells` 控制 hard top-K，当前 top-8 P3 cell 展开到其覆盖的 P1 active voxel 后，最多 FPS 采样 48 个 Anchor；support 只约束训练标签，不作为推理输入。候选不足时不扩区，padding Query 由 `query_valid_mask` 屏蔽。
+P3 粗区域预测使用 P3 feature 和完整 `text_tokens`。每个有效 token 先查询 P3 memory，再与各 P3 cell 计算 compatibility，并通过带 attention mask 的 log-mean-exp 聚合，使方向词和对象词的强匹配能够主导区域分数。Cross Block 层数由 `model.space_former.region_cross_num_layers` 控制，当前为 4。Region target 由 `direction_filtered_heatmaps` 正点生成三维高斯分布，并同时受 P1 active support 聚合得到的 P3 support mask 和方向合法 P3 mask 约束：不含任何方向合法正点的 P3 cell 目标严格为零，避免高斯跨越语言关系边界；边界 P3 cell 只要包含合法正点仍予保留。标准差为 `data.heatmap_sigma_voxels × data.voxel_size_cm`，当前为 8 cm。`space_former.num_region_cells` 控制 hard top-K，当前 top-8 P3 cell 展开到其覆盖的 P1 active voxel 后，最多 FPS 采样 48 个 Anchor；support 只约束训练标签，不作为推理输入。候选不足时不扩区，padding Query 由 `query_valid_mask` 屏蔽。
 
 第 0 个 Decoder 层使用 64 点外接圆柱模板；后 3 层使用上一层 yaw 构建 64 点定向 Box Surface。P1/P2/P3 将采样点量化到同格 sparse voxel key 后执行精确 hash lookup。未命中的零特征 token 不会被 Attention 删除，其 `sample_valid_mask=0` 仍携带“踩空/净空”含义。
 
@@ -172,4 +172,4 @@ python tools/render_lc_bgplacenet_stage2_point_mask.py \
 pytest -q tests/test_lc_bgplacenet_stage2.py
 ```
 
-测试覆盖 top-8 区域展开及不足 8 个 cell、P3 GT 覆盖率宏平均、Query padding、64 点模板、缓存 active lookup、Hungarian 匹配、训练 NMS 跳过、学习率恢复与平台衰减、多 yaw 合并、集合输出和 Source 联合反向传播。
+测试覆盖完整有效文本 token 参与 Region Predictor 且 padding token 被屏蔽、方向合法 P3 mask 阻断高斯跨关系边界、top-8 区域展开及不足 8 个 cell、P3 GT 覆盖率宏平均、Query padding、64 点模板、缓存 active lookup、Hungarian 匹配、训练 NMS 跳过、学习率恢复与平台衰减、多 yaw 合并、集合输出和 Source 联合反向传播。

@@ -1380,7 +1380,7 @@ z
     <text style="font-weight: 700; font-size: 10.5px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; text-anchor: middle; fill: #17324d" x="560.1744" y="602.799661" transform="rotate(-0 560.1744 602.799661)">Text-Guided Region</text>
    </g>
    <g id="text_55">
-    <text style="font-size: 8.2px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(512.502931 624.238611)">text_global(Q) ↔ P3(K/V)</text>
+    <text style="font-size: 8.2px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(512.502931 624.238611)">text_tokens(Q) ↔ P3(K/V)</text>
     <text style="font-size: 8.2px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(518.7439 634.44697)">4-layer Cross Encoder</text>
    </g>
    <g id="text_56">
@@ -1393,11 +1393,11 @@ z
     <text style="font-weight: 700; font-size: 10.5px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; text-anchor: middle; fill: #17324d" x="876.2256" y="602.878411" transform="rotate(-0 876.2256 602.878411)">P1 展开 + FPS</text>
    </g>
    <g id="text_59">
-    <text style="font-size: 8.2px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(846.2546 623.978998)">最多 32 anchors</text>
+    <text style="font-size: 8.2px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(846.2546 623.978998)">最多 48 anchors</text>
     <text style="font-size: 8.2px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(847.131616 634.39524)">不足则 padding</text>
    </g>
    <g id="text_60">
-    <text style="font-weight: 700; font-size: 10.5px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; text-anchor: middle; fill: #17324d" x="1038.2688" y="604.489636" transform="rotate(-0 1038.2688 604.489636)">32 Queries</text>
+    <text style="font-weight: 700; font-size: 10.5px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; text-anchor: middle; fill: #17324d" x="1038.2688" y="604.489636" transform="rotate(-0 1038.2688 604.489636)">48 Queries</text>
    </g>
    <g id="text_61">
     <text style="font-size: 8.2px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; text-anchor: middle; fill: #5c6b78" x="1038.2688" y="623.399788" transform="rotate(-0 1038.2688 623.399788)">bottom centers</text>
@@ -1440,7 +1440,7 @@ z
     <text style="font-weight: 700; font-size: 9.3px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; text-anchor: middle; fill: #17324d" x="1465.4736" y="603.828005" transform="rotate(-0 1465.4736 603.828005)">Raw Set</text>
    </g>
    <g id="text_74">
-    <text style="font-size: 7.5px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(1441.016569 625.78399)">boxes [B,32,7]</text>
+    <text style="font-size: 7.5px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(1441.016569 625.78399)">boxes [B,48,7]</text>
     <text style="font-size: 7.5px; font-family: 'Noto Sans CJK JP', 'DejaVu Sans', sans-serif; fill: #5c6b78" transform="translate(1434.57653 634.963873)">size = source_size</text>
    </g>
    <g id="text_75">
